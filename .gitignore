@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Private working notes (kept local + pCloud backup only)
+HANDOFF.md
+history/

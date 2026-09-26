@@ -1,0 +1,273 @@
+"""Headless tests for OmaSkins' data layer. No display or network needed.
+
+Everything runs against a fake home (HOME, XDG_CONFIG_HOME, XDG_STATE_HOME,
+XDG_CACHE_HOME all point into a temp dir) and a fake OMARCHY_PATH, and the
+suite refuses to start if any of them still points at the real home.
+
+    python3 -m unittest discover -s tests -v
+"""
+
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+REAL_HOME = Path.home()
+SANDBOX = Path(tempfile.mkdtemp(prefix="omaskins-test-"))
+for var, sub in (("HOME", "home"), ("XDG_CONFIG_HOME", "home/.config"), ("XDG_STATE_HOME", "home/.local/state"),
+                 ("XDG_CACHE_HOME", "home/.cache"), ("OMARCHY_PATH", "omarchy")):
+    os.environ[var] = str(SANDBOX / sub)
+    (SANDBOX / sub).mkdir(parents=True, exist_ok=True)
+for var in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+    if os.environ[var].startswith(str(REAL_HOME) + "/") or os.environ[var] == str(REAL_HOME):
+        sys.exit(f"refusing to run: {var} points into the real home")
+
+sys.path.insert(0, str(ROOT))
+from omaskins import data  # noqa: E402
+
+HOME = SANDBOX / "home"
+OMARCHY = SANDBOX / "omarchy"
+
+PAGE = """<ul>
+<li><a href="https://github.com/bjarneo/omarchy-aura-theme" class="group"><img src="/assets/themes/aura.webp" alt="Aura theme screenshot" width="1200"/><span class="mt-2.5">Aura</span></a></li>
+<li><a href="https://github.com/guilhermetk/omarchy-all-hallows-eve-theme" class="group"><img src="/assets/themes/all-hallow-s-eve.webp"/><span>All Hallow&#x27;s Eve</span></a></li>
+<li><a href="https://github.com/bjarneo/omarchy-aura-theme" class="group"><img src="/assets/themes/dupe.webp"/><span>Aura again</span></a></li>
+<li><a href="https://github.com/JJDizz1L/aetheria"><img src="https://cdn.example/a.webp"/><span>Aetheria</span></a></li>
+</ul>"""
+
+
+def write(path, text=""):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    return path
+
+
+def build_fixture():
+    shutil.rmtree(HOME, ignore_errors=True)
+    shutil.rmtree(OMARCHY, ignore_errors=True)
+    # built-ins
+    write(OMARCHY / "themes/tokyo-night/colors.toml", 'mode = "dark"\naccent = "#7aa2f7"\nbackground = "#1a1b26"\n')
+    write(OMARCHY / "themes/tokyo-night/preview.png")
+    write(OMARCHY / "themes/tokyo-night/backgrounds/1-b.jpg")
+    write(OMARCHY / "themes/tokyo-night/backgrounds/0-a.jpg")
+    write(OMARCHY / "themes/nord/backgrounds/n.png")
+    write(OMARCHY / "default/omarchy/omarchy-menu.jsonc",
+          '"install.style.font.fira": {"action":"omarchy-install-font \'Fira Code\' ttf-firacode-nerd \'FiraCode Nerd Font\'"},\n'
+          '"install.style.font.iosevka": {"action":"omarchy-install-font Iosevka ttf-iosevka-nerd \'Iosevka Nerd Font Mono\'"},\n')
+    # yours: one from the list, one not listed, one overriding a built-in name
+    aura = HOME / ".config/omarchy/themes/aura"
+    write(aura / ".git/config", '[core]\n\tbare = false\n[remote "origin"]\n\turl = https://github.com/bjarneo/omarchy-aura-theme.git\n')
+    write(aura / "colors.toml", 'accent = "#ff0000"\n')
+    write(aura / "backgrounds/aura-1.jpg")
+    write(HOME / ".config/omarchy/themes/secret/.git/config", '[remote "origin"]\n\turl = https://gitlab.com/me/secret.git\n')
+    write(HOME / ".config/omarchy/themes/nord/colors.toml", 'accent = "#88c0d0"\n')
+    # your own backgrounds
+    write(HOME / ".config/omarchy/backgrounds/tokyo-night/mine.png")
+    write(HOME / ".config/omarchy/backgrounds/tokyo-night/notes.txt")
+    # current state: tokyo-night, background = the state copy of 1-b.jpg
+    state = HOME / ".local/state/omarchy/current"
+    write(state / "theme.name", "tokyo-night\n")
+    write(state / "theme/backgrounds/1-b.jpg")
+    (state / "background").symlink_to(state / "theme/backgrounds/1-b.jpg")
+
+
+def snapshot(root):
+    return {str(p.relative_to(root)): (p.stat().st_size, p.stat().st_mtime_ns)
+            for p in sorted(root.rglob("*")) if p.is_file() and ".cache" not in p.parts}
+
+
+class Names(unittest.TestCase):
+    def test_install_name_matches_omarchy_theme_install(self):
+        cases = {
+            "https://github.com/bjarneo/omarchy-aura-theme": "aura",
+            "https://github.com/bjarneo/omarchy-aura-theme.git": "aura",
+            "git@github.com:Foo/omarchy-Blue-Theme.git": "blue-theme",  # -theme only stripped lowercase, then lowered
+            "https://github.com/ankur311sudo/black_arch": "black_arch",
+            "https://github.com/JJDizz1L/aetheria/": "aetheria",
+        }
+        for url, want in cases.items():
+            self.assertEqual(data.install_name_from_url(url), want, url)
+
+    def test_repo_key(self):
+        self.assertEqual(data.repo_key("https://github.com/Owner/Repo.git"), "owner/repo")
+        self.assertEqual(data.repo_key("git@github.com:Owner/Repo.git"), "owner/repo")
+        self.assertEqual(data.repo_key("https://gitlab.com/o/r"), "")
+
+    def test_display_name(self):
+        self.assertEqual(data.display_name("tokyo-night"), "Tokyo Night")
+        self.assertEqual(data.display_name("rose-pine"), "Rose Pine")
+
+
+class Community(unittest.TestCase):
+    def test_parse(self):
+        themes = data.parse_community(PAGE)
+        self.assertEqual([t.name for t in themes], ["Aura", "All Hallow's Eve", "Aetheria"])  # dupe dropped
+        self.assertEqual(themes[0].screenshot_url, "https://omarchy.org/assets/themes/aura.webp")
+        self.assertEqual(themes[2].screenshot_url, "https://cdn.example/a.webp")
+
+    def test_cached_page_used_offline(self):
+        build_fixture()
+        write(data.CACHE_DIR / "themes.html", PAGE)
+        # fresh cache: no network touched
+        self.assertEqual(len(data.community_themes()), 3)
+
+
+class Local(unittest.TestCase):
+    def setUp(self):
+        build_fixture()
+
+    def test_local_themes_and_override(self):
+        themes = {t.name: t for t in data.local_themes()}
+        self.assertEqual(sorted(themes), ["aura", "nord", "secret", "tokyo-night"])
+        self.assertFalse(themes["nord"].builtin, "a theme you added hides the built-in of the same name")
+        self.assertTrue(themes["tokyo-night"].builtin)
+        self.assertEqual(themes["tokyo-night"].preview.name, "preview.png")
+        self.assertEqual(themes["aura"].preview.name, "aura-1.jpg", "falls back to the first background")
+        self.assertEqual(themes["aura"].repo_url, "https://github.com/bjarneo/omarchy-aura-theme.git")
+        self.assertEqual(themes["tokyo-night"].colors["accent"], "#7aa2f7")
+
+    def test_match_installed(self):
+        community = data.parse_community(PAGE)
+        matched = data.match_installed(community, data.local_themes())
+        self.assertEqual({k: t.name for k, t in matched.items()}, {"bjarneo/omarchy-aura-theme": "aura"})
+
+    def test_backgrounds_and_current(self):
+        t = next(t for t in data.local_themes() if t.name == "tokyo-night")
+        bgs = data.backgrounds_for(t, data.current_theme_name(), data.current_background())
+        self.assertEqual([(b.path.name, b.yours) for b in bgs],
+                         [("0-a.jpg", False), ("1-b.jpg", False), ("mine.png", True)])
+        self.assertEqual([b.path.name for b in bgs if b.current], ["1-b.jpg"])
+
+    def test_current_background_yours(self):
+        state = HOME / ".local/state/omarchy/current"
+        mine = HOME / ".config/omarchy/backgrounds/tokyo-night/mine.png"
+        (state / "background").unlink()
+        (state / "background").symlink_to(mine)
+        t = next(t for t in data.local_themes() if t.name == "tokyo-night")
+        bgs = data.backgrounds_for(t, "tokyo-night", data.current_background())
+        self.assertEqual([b.path.name for b in bgs if b.current], ["mine.png"])
+
+    def test_no_current_mark_on_other_themes(self):
+        t = next(t for t in data.local_themes() if t.name == "aura")
+        self.assertFalse(any(b.current for b in data.backgrounds_for(t, "tokyo-night", data.current_background())))
+
+
+class Actions(unittest.TestCase):
+    def setUp(self):
+        build_fixture()
+        self.local = {t.name: t for t in data.local_themes()}
+        self.community = data.parse_community(PAGE)
+
+    def labels(self, acts):
+        return [a.label for a in acts]
+
+    def test_theme_actions(self):
+        self.assertEqual(self.labels(data.theme_actions(None, self.community[1], "tokyo-night")), ["Add"])
+        self.assertIn("omarchy-theme-install https://github.com/guilhermetk/omarchy-all-hallows-eve-theme.git",
+                      data.theme_actions(None, self.community[1])[0].command)
+        self.assertEqual(self.labels(data.theme_actions(self.local["tokyo-night"], None, "tokyo-night")), [],
+                         "current built-in: nothing to apply or remove")
+        self.assertEqual(self.labels(data.theme_actions(self.local["aura"], self.community[0], "tokyo-night")),
+                         ["Apply", "Remove"])
+
+    def test_quoting(self):
+        self.assertEqual(data.q("it's"), "'it'\\''s'")
+
+    def test_font_actions_protect_font_in_use(self):
+        cur = data.Font("JetBrainsMonoNL Nerd Font", "ttf-jetbrains-mono-nerd", True)
+        sibling = data.Font("JetBrainsMono Nerd Font", "ttf-jetbrains-mono-nerd", False)
+        system = data.Font("Liberation Mono", "ttf-liberation", False)
+        other = data.Font("FiraCode Nerd Font", "ttf-firacode-nerd", False)
+        pkg = "ttf-jetbrains-mono-nerd"
+        self.assertEqual(self.labels(data.font_actions(font=cur, current_package=pkg)), [])
+        self.assertEqual(self.labels(data.font_actions(font=sibling, current_package=pkg)), ["Use"],
+                         "same package as the font in use: no Remove")
+        self.assertEqual(self.labels(data.font_actions(font=system, current_package=pkg)), ["Use"])
+        self.assertEqual(self.labels(data.font_actions(font=other, current_package=pkg)), ["Use", "Remove"])
+        inst = data.FontPackage(pkg, "1", "", True)
+        self.assertEqual(self.labels(data.font_actions(package=inst, current_package=pkg)), [])
+        new = data.FontPackage("ttf-firacode-nerd", "1", "", False, "FiraCode Nerd Font")
+        acts = data.font_actions(package=new, current_package=pkg)
+        self.assertEqual(self.labels(acts), ["Add", "Add and use"])
+        self.assertEqual(acts[1].command,
+                         "omarchy-install-font 'FiraCode Nerd Font' ttf-firacode-nerd 'FiraCode Nerd Font'")
+
+    def test_font_picks_from_menu(self):
+        self.assertEqual(data.omarchy_font_picks(),
+                         {"ttf-firacode-nerd": "FiraCode Nerd Font", "ttf-iosevka-nerd": "Iosevka Nerd Font Mono"})
+
+    def test_normalized_size(self):
+        self.assertEqual(data.normalized_size(20, 0.5, 0.5), 20)
+        self.assertEqual(data.normalized_size(20, 0.4, 0.5), 25)
+        self.assertEqual(data.normalized_size(20, 0.1, 0.5), 28, "clamped at 140%")
+        self.assertEqual(data.normalized_size(20, 0, 0.5), 20, "unknown metric: unchanged")
+
+
+class Export(unittest.TestCase):
+    def setUp(self):
+        build_fixture()
+        self.local = {t.name: t for t in data.local_themes()}
+        self.community = data.parse_community(PAGE)
+
+    def test_listed_theme_travels_as_link(self):
+        items = data.export_plan(self.local["aura"], self.community, None, None)
+        self.assertEqual([(i.kind, i.how) for i in items], [("Theme", "link")])
+        self.assertIn("omarchy-aura-theme.git", items[0].detail)
+
+    def test_unlisted_theme_and_own_background_are_bundled(self):
+        mine = data.Background(Path("/x/mine.png"), "secret", True)
+        font = data.Font("Custom", "", True)
+        items = data.export_plan(self.local["secret"], self.community, mine, font)
+        self.assertEqual([(i.kind, i.how) for i in items], [("Theme", "bundle"), ("Background", "bundle"),
+                                                             ("Font", "bundle")])
+
+    def test_builtin_and_package_font_are_links(self):
+        b = data.Background(Path("/x/1-b.jpg"), "tokyo-night", False, True)
+        font = data.Font("FiraCode Nerd Font", "ttf-firacode-nerd", True)
+        items = data.export_plan(self.local["tokyo-night"], self.community, b, font)
+        self.assertEqual([i.how for i in items], ["link", "link", "link"])
+        self.assertIn('"format": "omaskins-share/1"', data.export_summary_json(items))
+
+
+class PrototypeChangesNothing(unittest.TestCase):
+    def test_reading_everything_leaves_home_untouched(self):
+        build_fixture()
+        before = snapshot(HOME)
+        community = data.parse_community(PAGE)
+        local = data.local_themes()
+        data.match_installed(community, local)
+        for t in local:
+            data.backgrounds_for(t, data.current_theme_name(), data.current_background())
+            data.theme_actions(t, None, "x")
+        data.export_plan(local[0], community, None, None)
+        self.assertEqual(snapshot(HOME), before)
+
+    def test_app_never_runs_commands(self):
+        # The UI's only action path shows a toast; it must not spawn anything.
+        src = (ROOT / "omaskins/app.py").read_text()
+        for bad in ("subprocess", "os.system", "Popen", "spawn_async"):
+            self.assertNotIn(bad, src, f"app.py must not use {bad} in the prototype")
+
+
+class Thumbnails(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("magick"), "ImageMagick not installed")
+    def test_thumbnail_cached(self):
+        src = SANDBOX / "big.png"
+        subprocess.run(["magick", "-size", "1600x900", "xc:#336699", str(src)], check=True)
+        t1 = data.thumbnail(src, 320)
+        self.assertTrue(str(t1).startswith(str(data.CACHE_DIR)))
+        out = subprocess.run(["magick", "identify", "-format", "%w", str(t1)], capture_output=True, text=True)
+        self.assertEqual(out.stdout, "320")
+        self.assertEqual(data.thumbnail(src, 320), t1)
+
+
+def tearDownModule():
+    shutil.rmtree(SANDBOX, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    unittest.main()
