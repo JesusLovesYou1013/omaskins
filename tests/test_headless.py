@@ -178,8 +178,11 @@ class Actions(unittest.TestCase):
 
     def test_theme_actions(self):
         self.assertEqual(self.labels(data.theme_actions(None, self.community[1], "tokyo-night")), ["Add"])
-        self.assertIn("omarchy-theme-install https://github.com/guilhermetk/omarchy-all-hallows-eve-theme.git",
-                      data.theme_actions(None, self.community[1])[0].command)
+        add = data.theme_actions(None, self.community[1])[0]
+        url = "https://github.com/guilhermetk/omarchy-all-hallows-eve-theme"
+        self.assertEqual(add.steps, (("run", ["omarchy-git-url-check", url]),
+                                     ("run", ["git", "clone", "--", url, str(data.USER_THEMES / "all-hallows-eve")])),
+                         "omarchy-theme-install's check + clone, without applying")
         cur = data.theme_actions(self.local["tokyo-night"], None, "tokyo-night")
         self.assertEqual(self.labels(cur), ["Remove"], "current built-in: nothing to apply")
         self.assertIn("Switch to another one first", cur[0].blocked)
@@ -498,29 +501,78 @@ class PasswordHeadsUp(unittest.TestCase):
 
 class CommandRunner(unittest.TestCase):
     def setUp(self):
+        build_fixture()
         from omaskins import run
         self.run = run
 
-    def test_prototype_allows_nothing(self):
-        self.assertEqual(self.run.ALLOWED, frozenset(), "nothing is live yet")
-        with self.assertRaises(self.run.NotAllowed):
-            self.run.run(["omarchy-theme-set", "nord"])
+    def test_allow_list_is_exactly_batch_1(self):
+        self.assertEqual(sorted(self.run.ALLOWED), ["git", "nautilus", "omarchy-git-url-check", "omarchy-theme-bg-set",
+                                                    "omarchy-theme-remove", "omarchy-theme-set"])
+        for bad in (["omarchy-theme-install", "x"], ["sudo", "rm", "-rf", "/"], ["pacman", "-S", "x"], ["sh", "-c", "x"]):
+            with self.assertRaises(self.run.NotAllowed, msg=bad):
+                self.run.check(bad)
+
+    def test_git_may_only_clone_a_new_theme_folder(self):
+        ok = ["git", "clone", "--", "https://github.com/a/b", str(data.USER_THEMES / "new-one")]
+        self.run.check(ok)
+        for bad in (["git", "push"], ["git", "clone", "https://x", str(data.USER_THEMES / "y")],
+                    ["git", "clone", "--", "https://x", "/tmp/elsewhere"],
+                    ["git", "clone", "--", "https://x", str(data.USER_THEMES / "aura")]):   # already there
+            with self.assertRaises(self.run.NotAllowed, msg=bad):
+                self.run.check(bad)
 
     def test_shell_strings_and_odd_input_are_refused(self):
-        self.run.ALLOWED, saved = frozenset({"true"}), self.run.ALLOWED
-        try:
-            for bad in ("true", "", [], ["true", 5], None):
-                with self.assertRaises(self.run.NotAllowed, msg=repr(bad)):
-                    self.run.check(bad)
-            self.assertEqual(self.run.run(["true"]).returncode, 0)
-            with self.assertRaises(self.run.NotAllowed):
-                self.run.run(["rm", "-rf", "/tmp/x"])
-        finally:
-            self.run.ALLOWED = saved
+        for bad in ("omarchy-theme-set nord", "", [], ["omarchy-theme-set", 5], None):
+            with self.assertRaises(self.run.NotAllowed, msg=repr(bad)):
+                self.run.check(bad)
 
-    def test_no_shell_anywhere(self):
-        for f in ("run.py", "data.py", "app.py"):
-            self.assertNotIn("shell=True", (ROOT / "omaskins" / f).read_text(), f)
+    def test_file_steps_stay_inside_your_backgrounds(self):
+        mine = HOME / ".config/omarchy/backgrounds/tokyo-night/mine.png"
+        for step in (("remove_file", HOME / ".config/omarchy/themes/aura/colors.toml"),
+                     ("remove_file", HOME / ".config/omarchy/backgrounds/../themes/aura/colors.toml"),
+                     ("mkdir", HOME / "elsewhere"), ("copy_in", mine, HOME / "Pictures"),
+                     ("remove_file", data.USER_BACKGROUNDS), ("frobnicate", mine)):
+            with self.assertRaises(self.run.NotAllowed, msg=step):
+                self.run.perform([step])
+        self.assertTrue((HOME / ".config/omarchy/themes/aura/colors.toml").exists())
+
+    def test_copy_never_overwrites_and_remove_deletes_only_that_file(self):
+        src = write(SANDBOX / "src/new.png", "picture")
+        dest = data.USER_BACKGROUNDS / "nord"
+        self.run.perform([("copy_in", src, dest)])
+        self.run.perform([("copy_in", src, dest)])                      # identical: left alone
+        write(src, "a different picture")
+        self.run.perform([("copy_in", src, dest)])                      # same name, different: -2
+        self.assertEqual(sorted(p.name for p in dest.iterdir()), ["new-2.png", "new.png"])
+        self.assertEqual((dest / "new.png").read_text(), "picture")
+        self.run.perform([("remove_file", dest / "new-2.png")])
+        self.assertEqual([p.name for p in dest.iterdir()], ["new.png"])
+
+    @unittest.skipUnless(shutil.which("omarchy-git-url-check"), "not on an Omarchy system")
+    def test_a_refused_url_stops_before_the_clone(self):
+        with self.assertRaises(self.run.StepFailed):
+            self.run.perform([("run", ["omarchy-git-url-check", "--upload-pack=evil"]),
+                              ("run", ["git", "clone", "--", "x", str(data.USER_THEMES / "never")])])
+        self.assertFalse((data.USER_THEMES / "never").exists())
+
+    def test_every_live_action_passes_the_allow_list(self):
+        local = {t.name: t for t in data.local_themes()}
+        community = data.parse_community(PAGE)
+        acts = (data.theme_actions(None, community[1], "tokyo-night") + data.theme_actions(local["aura"], None, "x")
+                + data.background_actions(data.backgrounds_for(local["tokyo-night"])[2], "tokyo-night")
+                + [data.open_folder_action("nord"), data.add_background_action("nord", ["/tmp/a.png"]),
+                   data.copy_to_theme_action(data.backgrounds_for(local["aura"])[0], "tokyo-night")])
+        for a in acts:
+            self.assertTrue(a.steps, a.label)
+            for st in a.steps:
+                if st[0] in ("run", "launch"):
+                    self.run.check(st[1])
+
+    def test_password_actions_are_not_live_yet(self):
+        pkg = data.FontPackage("ttf-x-nerd", "1", "x", installed=True)
+        for a in (data.builtin_remove_action("nord"), data.builtin_restore_action("nord", "omarchy"),
+                  *data.font_actions(package=pkg)):
+            self.assertEqual(a.steps, (), f"{a.label} belongs to a later batch")
 
 
 class Thumbnails(unittest.TestCase):

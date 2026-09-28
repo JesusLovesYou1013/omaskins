@@ -19,13 +19,14 @@ gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
 
-from . import data, theme  # noqa: E402
+from . import data, run, theme  # noqa: E402
 
 APP_ID = "io.github.jesuslovesyou1013.omaskins"
 TITLE = "OmaSkins Manager"
 CHECK = "\U000f012c"  # nf-md-check — a plain mark, never a checkbox (same as OmaPlugs)
 CARD_W, CARD_H = 272, 153  # 16:9, the shape of omarchy.org screenshots
-PROTOTYPE_NOTE = "PROTOTYPE: buttons only show what they would do. Nothing on your system is changed."
+PROTOTYPE_NOTE = ("PARTLY LIVE: theme and background actions really run. Fonts, rounded corners, removing "
+                  "built-in themes, rotation and Share still only show what they would do.")
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -335,8 +336,7 @@ class BackgroundCard(Gtk.FlowBoxChild):
         box.append(row)
         acts = Gtk.Box(spacing=6)
         for a in data.background_actions(bgd, bgd.theme):
-            acts.append(button(a.label, "danger" if a.label == "Remove" else "",
-                               lambda _b, a=a: win.do_action(a)))
+            acts.append(win.action_button(a))
         box.append(acts)
         self.set_child(box)
 
@@ -1034,6 +1034,7 @@ class Window(Adw.ApplicationWindow):
         self.builtin_pkg, self.removed_builtins = "", []
         self.current_theme = data.current_theme_name()
         self._last_bg, self._theme_changed_at = data.current_background(), 0
+        self._own_change_until, self._running = 0, set()
         self.current_font = ""
         self.font_base = 12
         self.search_text = ""
@@ -1146,10 +1147,9 @@ class Window(Adw.ApplicationWindow):
         tools.add_css_class("toolbar")
         self.bg_title = label("", "plugin-name", hexpand=True)
         tools.append(self.bg_title)
-        tools.append(button("Add backgrounds…", "", lambda *_: self.bg_theme and self.do_action(
-            data.add_background_action(self.bg_theme.name))))
+        tools.append(button("Add backgrounds…", "", lambda *_: self.bg_theme and self._pick_backgrounds()))
         tools.append(button("Open folder", "flat", lambda *_: self.bg_theme and self.do_action(
-            data.Action("Open folder", f"nautilus {data.q(data.USER_BACKGROUNDS / self.bg_theme.name)}"))))
+            data.open_folder_action(self.bg_theme.name))))
         right.append(tools)
         self.bg_flow = flow()
         self.bg_flow.set_filter_func(lambda c: not self.search_text or self.search_text in c.bgd.path.name.lower())
@@ -1186,6 +1186,25 @@ class Window(Adw.ApplicationWindow):
         # Wait until the +/- clicking settles, then (prototype) show what would run.
         self._debounce("corners", 700, lambda: self.do_action(
             data.corners_action(self.corners["on"], self.corners["px"])))
+
+    def _pick_backgrounds(self):
+        theme_name = self.bg_theme.name
+        images = Gtk.FileFilter(name="Images")
+        for ext in data.IMAGE_EXT:
+            images.add_suffix(ext.lstrip("."))
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(images)
+        dlg = Gtk.FileDialog(title=f"Add backgrounds to {data.display_name(theme_name)}", filters=filters)
+
+        def chosen(d, res):
+            try:
+                files = d.open_multiple_finish(res)
+            except GLib.Error:
+                return  # cancelled
+            paths = [f.get_path() for f in files if f.get_path()]
+            if paths:
+                self.do_action(data.add_background_action(theme_name, paths))
+        dlg.open_multiple(self, None, chosen)
 
     def _build_fonts(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1428,6 +1447,9 @@ class Window(Adw.ApplicationWindow):
 
     def do_action(self, a, on_done=None, confirm=True):
         def show():
+            if a.steps:
+                self._perform(a, on_done)
+                return
             self.toasts.add_toast(Adw.Toast(title=f"Prototype, nothing changed. Would run: {a.command}", timeout=6))
             if on_done:
                 on_done()
@@ -1445,8 +1467,9 @@ class Window(Adw.ApplicationWindow):
             d.present(self)
         elif a.label == "Remove" and confirm:
             note = f"{a.note}\n\n" if a.note else ""
-            d = Adw.AlertDialog(heading="Remove?", body=f"{note}This would run:\n\n{a.command}\n\n"
-                                "(Prototype: nothing will actually be removed.)")
+            tail = "" if a.steps else "\n\n(Prototype: nothing will actually be removed.)"
+            d = Adw.AlertDialog(heading="Remove?", body=f"{note}This {'will' if a.steps else 'would'} run:\n\n"
+                                                         f"{a.command}{tail}")
             d.add_response("cancel", "Cancel")
             d.add_response("ok", "Remove")
             d.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE)
@@ -1456,6 +1479,33 @@ class Window(Adw.ApplicationWindow):
             d.present(self)
         else:
             show()
+
+    def _perform(self, a, on_done=None):
+        """Run a live action's steps off the UI thread; say what's happening, then how it went."""
+        if a.command in self._running:
+            return  # a double-click shouldn't run it twice
+        self._running.add(a.command)
+        busy = None
+        if a.busy:
+            busy = Adw.Toast(title=a.busy, timeout=0)
+            self.toasts.add_toast(busy)
+        if any(st[0] == "run" and st[1][0] in ("omarchy-theme-set", "omarchy-theme-bg-set") for st in a.steps):
+            # OmaSkins' own change: not a manual pick, so it mustn't reset the rotation timers.
+            self._own_change_until = GLib.get_monotonic_time() + 15_000_000
+
+        def finished(err):
+            self._running.discard(a.command)
+            if busy:
+                busy.dismiss()
+            if err:
+                self.toasts.add_toast(Adw.Toast(title=f"{a.label} didn't work: {err}", timeout=8))
+                return
+            if a.done or a.label not in ("Open folder",):
+                self.toasts.add_toast(Adw.Toast(title=a.done or f"{a.label}: done.", timeout=4))
+            if on_done:
+                on_done()
+            self._debounce("local", 300, self.load)  # lists, counts and ✓ marks follow the change
+        bg(lambda: run.perform(a.steps), finished)
 
     # ---- live theme
     def set_status(self, text):
@@ -1497,6 +1547,8 @@ class Window(Adw.ApplicationWindow):
         rotation timers start over. A theme change's own new background, landing a moment after
         the theme, belongs to that change and doesn't get a second message."""
         now = GLib.get_monotonic_time()
+        if now < self._own_change_until:
+            return  # OmaSkins made this change itself
         if theme_changed:
             self._theme_changed_at = now
         elif bg_changed and now - self._theme_changed_at < 5_000_000:

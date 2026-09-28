@@ -66,6 +66,9 @@ class Action:
     note: str = ""        # extra line for the confirmation dialog
     blocked: str = ""     # set = the button is greyed out, and this says why
     password: str = ""    # set = it asks for your password, and this says why (always confirmed first)
+    steps: tuple = ()     # set = LIVE: what run.perform() really does; empty = prototype, shown only
+    busy: str = ""        # shown while a live action runs, e.g. "Applying Nord…"
+    done: str = ""        # shown when it worked (default: "<label>: done")
 
 
 @dataclass
@@ -431,18 +434,39 @@ def q(s):
 def theme_actions(local=None, community=None, current=""):
     acts = []
     if community and not local:
-        acts.append(Action("Add", f"omarchy-theme-install {community.repo_url}.git"))
+        acts.append(add_theme_action(community))
     if local:
         if local.name != current:
-            acts.append(Action("Apply", f"omarchy-theme-set {q(local.title)}"))
+            acts.append(Action("Apply", f"omarchy-theme-set {q(local.name)}",
+                               steps=(("run", ["omarchy-theme-set", local.name]),),
+                               busy=f"Applying {local.title}…", done=f"{local.title} applied."))
         if local.builtin:
             rm = builtin_remove_action(local.name)
         else:
-            rm = Action("Remove", f"omarchy-theme-remove {q(local.name)}")
+            rm = Action("Remove", f"omarchy-theme-remove {q(local.name)}",
+                        steps=(("run", ["omarchy-theme-remove", local.name]),), busy=f"Removing {local.title}…",
+                        done=f"{local.title} removed. You can add it again from Browse.")
         if local.name == current:
             rm.blocked = "This is your current theme. Switch to another one first."
         acts.append(rm)
     return acts
+
+
+THEME_NAME_OK = re.compile(r"[a-z0-9_][a-z0-9._+-]*")  # omarchy-theme-install's own rule
+
+
+def add_theme_action(community):
+    """Download a theme the way omarchy-theme-install does (its URL check, then the same git clone
+    into the same folder) but WITHOUT applying it: right-click Add through a list would otherwise
+    switch the whole desktop for every theme."""
+    url, name = community.repo_url, install_name_from_url(community.repo_url)
+    dest = USER_THEMES / name
+    cmd = f"omarchy-git-url-check {q(url)} && git clone -- {q(url)} {q(dest)}"
+    if not THEME_NAME_OK.fullmatch(name):
+        return Action("Add", cmd, blocked="This repository's name doesn't make a usable theme folder name.")
+    return Action("Add", cmd, busy=f"Adding {community.name}…",
+                  done=f"{community.name} added. Apply it whenever you like.",
+                  steps=(("run", ["omarchy-git-url-check", url]), ("run", ["git", "clone", "--", url, str(dest)])))
 
 
 # The owner doesn't want password prompts for everyday adding/removing. The few actions that can't
@@ -501,9 +525,13 @@ def builtin_restore_action(name, package):
 def background_actions(bg, theme_name):
     acts = []
     if not bg.current:
-        acts.append(Action("Set as background", f"omarchy-theme-bg-set {q(bg.path)}"))
+        acts.append(Action("Set as background", f"omarchy-theme-bg-set {q(bg.path)}",
+                           steps=(("run", ["omarchy-theme-bg-set", str(bg.path)]),), done="Background set."))
     if bg.yours:
-        acts.append(Action("Remove", f"rm {q(bg.path)}"))
+        rm = Action("Remove", f"rm {q(bg.path)}", steps=(("remove_file", bg.path),), done=f"{bg.path.name} removed.")
+        if bg.current:
+            rm.blocked = "This is your current background. Set another one first."
+        acts.append(rm)
     return acts
 
 
@@ -530,12 +558,23 @@ def copy_to_theme_action(bg, current_theme):
     kept apart from that theme's own (so it shows as "Yours" and can be removed). None if not offered."""
     if not current_theme or bg.theme == current_theme:
         return None
-    return Action("Copy to current theme's backgrounds",
-                  f"cp -n {q(bg.path)} {q(USER_BACKGROUNDS / current_theme)}/")
+    dest = USER_BACKGROUNDS / current_theme
+    return Action("Copy to current theme's backgrounds", f"cp -n {q(bg.path)} {q(dest)}/",
+                  steps=(("copy_in", bg.path, dest),), done=f"Copied into your {display_name(current_theme)} backgrounds.")
 
 
-def add_background_action(theme_name):
-    return Action("Add backgrounds…", f"cp <chosen images> {q(USER_BACKGROUNDS / theme_name)}/")
+def add_background_action(theme_name, files):
+    """Copy the images chosen in the file picker into your backgrounds for this theme (never overwriting)."""
+    dest = USER_BACKGROUNDS / theme_name
+    return Action("Add backgrounds…", f"cp -n {' '.join(q(f) for f in files)} {q(dest)}/",
+                  steps=tuple(("copy_in", Path(f), dest) for f in files),
+                  done=f"Added {len(files)} background{'s' if len(files) != 1 else ''} to {display_name(theme_name)}.")
+
+
+def open_folder_action(theme_name):
+    dest = USER_BACKGROUNDS / theme_name
+    return Action("Open folder", f"mkdir -p {q(dest)} && nautilus {q(dest)}",
+                  steps=(("mkdir", dest), ("launch", ["nautilus", str(dest)])))
 
 
 def font_actions(font=None, package=None, current_package=""):
