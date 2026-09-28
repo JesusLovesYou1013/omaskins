@@ -36,6 +36,10 @@ USER_THEMES = HOME / ".config/omarchy/themes"
 USER_BACKGROUNDS = HOME / ".config/omarchy/backgrounds"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy" / "current"
 MENU_DEFAULTS = OMARCHY_PATH / "default/omarchy/omarchy-menu.jsonc"
+HYPR_DIR = HOME / ".config/hypr"          # Omarchy's hyprland.lua requires "hypr.<name>" from here
+CORNERS_FILE = HYPR_DIR / "omaskins.lua"  # OmaSkins' own file: rounded corners for every theme
+CORNERS_REQUIRE = 'require("hypr.omaskins")'
+CORNERS_DEFAULT, CORNERS_MAX = 8, 40      # 8 = the example value in Omarchy's own looknfeel.lua
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omaskins"
 
 THEMES_PAGE = "https://omarchy.org/themes/"
@@ -688,3 +692,51 @@ class RotationPlan:
         for p in self.PERIODS:
             self.checked[p] = [n for n in self.checked[p] if n in names]
         self.theme_picks = {n: s for n, s in self.theme_picks.items() if n in names}
+
+
+# --------------------------------------------------------------------------- global rounded corners
+#
+# One number rounds everything: Hyprland's decoration.rounding (px) shapes windows, and the Omarchy
+# shell reads the same value (hyprctl getoption) for its menus, popups and bar. Load order is
+# Omarchy defaults (0) -> current theme's hyprland.lua (Solitude sets 6) -> ~/.config/hypr files,
+# so a value set in the user's files wins for every theme. OmaSkins keeps it in its own file,
+# required from the end of looknfeel.lua: that is still before Omarchy's toggles, so the "no gaps"
+# toggle can keep squaring corners. Switching off leaves the file with no override (the require
+# must keep finding it), and each theme's own rounding comes back. The shell only re-reads the
+# value at startup or on a theme change, hence the restart.
+
+def current_rounding():
+    """Hyprland's live decoration.rounding, or None when it can't be asked."""
+    try:
+        return int(json.loads(_run(["hyprctl", "-j", "getoption", "decoration:rounding"], 5) or "{}")["int"])
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def corners_setting():
+    """(on, px) as saved in OmaSkins' file; (False, None) when it has no override."""
+    try:
+        m = re.search(r"rounding\s*=\s*(\d+)", CORNERS_FILE.read_text())
+    except OSError:
+        return False, None
+    return (True, int(m.group(1))) if m else (False, None)
+
+
+def corners_file_text(on, px):
+    lines = ["-- Written by OmaSkins Manager: rounded corners for every theme."]
+    if on:
+        lines.append(f"hl.config({{ decoration = {{ rounding = {int(px)} }} }})")
+    else:
+        lines.append("-- Global Rounded Corners is off: each theme's own rounding applies.")
+    return "\n".join(lines) + "\n"
+
+
+def corners_action(on, px):
+    px = max(0, min(CORNERS_MAX, int(px)))
+    looknfeel = HYPR_DIR / "looknfeel.lua"
+    text = corners_file_text(on, px).replace("'", "'\\''")
+    cmd = (f"printf '%s' '{text}' > {q(CORNERS_FILE)} && "
+           f"(grep -qxF {q(CORNERS_REQUIRE)} {q(looknfeel)} || echo {q(CORNERS_REQUIRE)} >> {q(looknfeel)}) && "
+           "omarchy restart shell")
+    return Action("Round corners" if on else "Square corners", cmd)
+

@@ -567,7 +567,11 @@ ROT_HINTS = {
 
 
 def minutes_spin(value, on_change):
-    s = Gtk.SpinButton.new_with_range(1, 1440, 1)
+    return number_spin(value, 1, 1440, on_change)
+
+
+def number_spin(value, lo, hi, on_change):
+    s = Gtk.SpinButton.new_with_range(lo, hi, 1)
     s.set_value(value)
     s.set_valign(Gtk.Align.CENTER)
     s.connect("value-changed", lambda w: on_change(int(w.get_value())))
@@ -960,6 +964,7 @@ class Window(Adw.ApplicationWindow):
     def _build_themes(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         bar, self.theme_counts, self.theme_sub_btns = sub_tabs(("Browse", "Installed"), self._on_theme_sub)
+        bar.append(self._build_corners())
         box.append(bar)
         self.theme_stack = Gtk.Stack(vexpand=True)
         self.theme_flows = {}
@@ -997,6 +1002,36 @@ class Window(Adw.ApplicationWindow):
         right.append(scrolled(self.bg_flow))
         pane.append(right)
         return pane
+
+    def _build_corners(self):
+        """Global Rounded Corners: one radius for windows, menus and popups, whatever the theme."""
+        on, px = data.corners_setting()
+        live = data.current_rounding()
+        self.corners = {"on": on, "px": px or (live if live else data.CORNERS_DEFAULT)}
+        box = Gtk.Box(spacing=10, margin_start=24, valign=Gtk.Align.CENTER,
+                      tooltip_text="Round the corners of windows, menus and popups for every theme, "
+                                   "rotating or not. Off = each theme's own corners.")
+        box.append(label("Global Rounded Corners", valign=Gtk.Align.CENTER))
+        sw = Gtk.Switch(active=on, valign=Gtk.Align.CENTER)
+        box.append(sw)
+        # Greyed, never hidden, while off (no-layout-shift rule).
+        self.corner_size = Gtk.Box(spacing=8, sensitive=on)
+        self.corner_size.append(number_spin(self.corners["px"], 0, data.CORNERS_MAX,
+                                            lambda v: self._on_corners(px=v)))
+        self.corner_size.append(label("px", "dim", valign=Gtk.Align.CENTER))
+        box.append(self.corner_size)
+        sw.connect("notify::active", lambda w, _p: self._on_corners(on=w.get_active()))
+        return box
+
+    def _on_corners(self, on=None, px=None):
+        if on is not None:
+            self.corners["on"] = on
+            self.corner_size.set_sensitive(on)
+        if px is not None:
+            self.corners["px"] = px
+        # Wait until the +/- clicking settles, then (prototype) show what would run.
+        self._debounce("corners", 700, lambda: self.do_action(
+            data.corners_action(self.corners["on"], self.corners["px"])))
 
     def _build_fonts(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)

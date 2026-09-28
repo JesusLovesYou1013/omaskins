@@ -388,6 +388,41 @@ class BuiltinRemoval(unittest.TestCase):
         self.assertFalse(plan.in_rotation("aura"))
 
 
+class GlobalCorners(unittest.TestCase):
+    def setUp(self):
+        build_fixture()
+        write(HOME / ".config/hypr/looknfeel.lua", "-- your look and feel\n")
+
+    def run_action(self, on, px):
+        cmd = data.corners_action(on, px).command
+        self.assertTrue(cmd.endswith(" && omarchy restart shell"), "the shell only re-reads rounding on restart")
+        subprocess.run(["sh", "-c", cmd.removesuffix(" && omarchy restart shell")], check=True)
+
+    def test_on_writes_its_own_file_and_requires_it_once(self):
+        self.assertEqual(data.corners_setting(), (False, None))
+        self.run_action(True, 12)
+        self.run_action(True, 16)
+        self.assertEqual(data.corners_setting(), (True, 16))
+        self.assertEqual((HOME / ".config/hypr/looknfeel.lua").read_text().count(data.CORNERS_REQUIRE), 1)
+
+    def test_off_keeps_the_file_but_drops_the_override(self):
+        self.run_action(True, 12)
+        self.run_action(False, 12)
+        self.assertEqual(data.corners_setting(), (False, None))
+        self.assertTrue(data.CORNERS_FILE.exists(), "looknfeel.lua still requires it")
+
+    def test_radius_is_clamped(self):
+        self.run_action(True, 999)
+        self.assertEqual(data.corners_setting(), (True, data.CORNERS_MAX))
+
+    @unittest.skipUnless(shutil.which("luac"), "luac not installed")
+    def test_file_is_valid_lua(self):
+        for on in (True, False):
+            f = SANDBOX / "corners.lua"
+            f.write_text(data.corners_file_text(on, 10))
+            subprocess.run(["luac", "-p", str(f)], check=True)
+
+
 class PrototypeChangesNothing(unittest.TestCase):
     def test_reading_everything_leaves_home_untouched(self):
         build_fixture()
