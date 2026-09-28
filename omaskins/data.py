@@ -626,6 +626,12 @@ def thumbnail(src, width=480):
 
 # --------------------------------------------------------------------------- rotation (prototype: in memory only)
 
+def minutes_text(m):
+    """10 -> '10 min', 60 -> '1 h', 90 -> '1 h 30 min'."""
+    h, m = divmod(int(m), 60)
+    return " ".join(p for p in (f"{h} h" if h else "", f"{m} min" if m or not h else "") if p)
+
+
 class RotationPlan:
     """What the Rotation tab has chosen. Nothing here runs or is saved yet.
 
@@ -705,6 +711,22 @@ class RotationPlan:
     def picked_count(self, name, backgrounds):
         paths = {b.path for b in backgrounds}
         return len(paths & self._picks(name, backgrounds))
+
+    def manual_change(self, theme_changed, bg_changed):
+        """Omarchy's own theme/background picker was used. It keeps working as normal; the matching
+        rotation timers just start over so the pick gets a full turn. Omarchy's theme change always
+        brings a new background too, so it restarts the background timer as well.
+        Returns (timers restarted, message for the notification), or ([], "") if nothing is rotating."""
+        resets = []
+        if self.themes and theme_changed:
+            resets.append(("theme", self.theme_minutes))
+        if self.backgrounds and (bg_changed or theme_changed):
+            resets.append(("background", self.bg_minutes))
+        if not resets:
+            return [], ""
+        which = "timers" if len(resets) > 1 else "timer"
+        return ([what for what, _m in resets],
+                f"Rotation {which} reset: " + " and ".join(f"next {what} in {minutes_text(m)}" for what, m in resets) + ".")
 
     def in_rotation(self, name):
         return any(name in names for names in self.checked.values())

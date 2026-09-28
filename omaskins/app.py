@@ -1036,6 +1036,7 @@ class Window(Adw.ApplicationWindow):
         self.community, self.local, self.fonts, self.font_pkgs = [], [], [], []
         self.builtin_pkg, self.removed_builtins = "", []
         self.current_theme = data.current_theme_name()
+        self._last_bg, self._theme_changed_at = data.current_background(), 0
         self.current_font = ""
         self.font_base = 12
         self.search_text = ""
@@ -1476,9 +1477,24 @@ class Window(Adw.ApplicationWindow):
         # Themes are swapped in several steps (rm + mv + hooks): settle, then re-read.
         def apply():
             self.reload_theme()
-            self.current_theme = data.current_theme_name()
+            old_theme, old_bg = self.current_theme, self._last_bg
+            self.current_theme, self._last_bg = data.current_theme_name(), data.current_background()
             self.rebuild()  # the current theme and background marks may both have moved
+            self._manual_change(self.current_theme != old_theme, self._last_bg != old_bg)
         self._debounce("state", 400, apply)
+
+    def _manual_change(self, theme_changed, bg_changed):
+        """Omarchy's own picker was used (in the prototype nothing else changes these): the matching
+        rotation timers start over. A theme change's own new background, landing a moment after
+        the theme, belongs to that change and doesn't get a second message."""
+        now = GLib.get_monotonic_time()
+        if theme_changed:
+            self._theme_changed_at = now
+        elif bg_changed and now - self._theme_changed_at < 5_000_000:
+            return
+        _timers, msg = self.rotation.plan.manual_change(theme_changed, bg_changed)
+        if msg:
+            self.toasts.add_toast(Adw.Toast(title=f"Prototype: {msg}", timeout=6))
 
     def _watch(self, path, cb):
         try:

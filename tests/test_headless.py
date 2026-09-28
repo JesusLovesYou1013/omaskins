@@ -344,6 +344,27 @@ class Rotation(unittest.TestCase):
         p.period = "Dusk"
         self.assertFalse(p.is_checked("aura"))
 
+    def test_stock_picker_restarts_the_matching_timers(self):
+        p = self.plan
+        self.assertEqual(p.manual_change(True, True), ([], ""), "nothing rotating: nothing to say")
+        p.themes = True
+        self.assertEqual(p.manual_change(True, True),
+                         (["theme"], "Rotation timer reset: next theme in 1 h."))
+        self.assertEqual(p.manual_change(False, True), ([], ""), "background picks don't touch the theme timer")
+        p.backgrounds = True
+        self.assertEqual(p.manual_change(True, True),
+                         (["theme", "background"],
+                          "Rotation timers reset: next theme in 1 h and next background in 10 min."))
+        self.assertEqual(p.manual_change(False, True),
+                         (["background"], "Rotation timer reset: next background in 10 min."))
+        p.themes = False
+        self.assertEqual(p.manual_change(True, True)[0], ["background"],
+                         "a theme change brings a new background, so that timer restarts too")
+
+    def test_minutes_text(self):
+        self.assertEqual([data.minutes_text(m) for m in (1, 10, 60, 90, 1440)],
+                         ["1 min", "10 min", "1 h", "1 h 30 min", "24 h"])
+
     def test_removed_themes_are_forgotten(self):
         p = self.plan
         p.set_checked("aura", True, self.bgs["aura"])
