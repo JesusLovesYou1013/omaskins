@@ -1431,7 +1431,19 @@ class Window(Adw.ApplicationWindow):
             self.toasts.add_toast(Adw.Toast(title=f"Prototype, nothing changed. Would run: {a.command}", timeout=6))
             if on_done:
                 on_done()
-        if a.label == "Remove" and confirm:
+        if a.password:  # always asked, even from right-click: say why a password will come up
+            d = Adw.AlertDialog(heading="This one needs your password",
+                                body=f"{a.password}\n\n{a.note + chr(10) * 2 if a.note else ''}This would run:\n\n"
+                                     f"{a.command}\n\n(Prototype: nothing will actually change.)")
+            d.add_response("cancel", "Cancel")
+            d.add_response("ok", a.label)
+            d.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE if a.label == "Remove"
+                                      else Adw.ResponseAppearance.SUGGESTED)
+            d.set_default_response("cancel")
+            d.set_close_response("cancel")
+            d.connect("response", lambda _d, r: r == "ok" and show())
+            d.present(self)
+        elif a.label == "Remove" and confirm:
             note = f"{a.note}\n\n" if a.note else ""
             d = Adw.AlertDialog(heading="Remove?", body=f"{note}This would run:\n\n{a.command}\n\n"
                                 "(Prototype: nothing will actually be removed.)")

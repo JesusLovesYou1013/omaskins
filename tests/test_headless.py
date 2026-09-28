@@ -472,11 +472,55 @@ class PrototypeChangesNothing(unittest.TestCase):
         data.export_plan(local[0], community, None, None)
         self.assertEqual(snapshot(HOME), before)
 
-    def test_app_never_runs_commands(self):
-        # The UI's only action path shows a toast; it must not spawn anything.
+    def test_app_never_runs_commands_itself(self):
+        # Real actions may only go through omaskins/run.py and its allow-list.
         src = (ROOT / "omaskins/app.py").read_text()
         for bad in ("subprocess", "os.system", "Popen", "spawn_async"):
-            self.assertNotIn(bad, src, f"app.py must not use {bad} in the prototype")
+            self.assertNotIn(bad, src, f"app.py must not use {bad}: go through run.py")
+
+
+class PasswordHeadsUp(unittest.TestCase):
+    def test_only_system_package_actions_say_they_need_a_password(self):
+        build_fixture()
+        local = {t.name: t for t in data.local_themes()}
+        community = data.parse_community(PAGE)
+        everyday = (data.theme_actions(None, community[1], "tokyo-night")                 # Add
+                    + data.theme_actions(local["aura"], community[0], "tokyo-night"))     # Apply, Remove yours
+        self.assertEqual([a.label for a in everyday], ["Add", "Apply", "Remove"])
+        self.assertFalse(any(a.password for a in everyday), "adding/removing your own themes never asks")
+        for a in (data.builtin_remove_action("nord"), data.builtin_restore_action("nord", "omarchy")):
+            self.assertIn("Built-in themes are part of Omarchy's own system package", a.password)
+        pkg = data.FontPackage("ttf-x-nerd", "1", "x", installed=False, omarchy_pick="X Nerd Font")
+        self.assertTrue(all(a.password for a in data.font_actions(package=pkg)))
+        use = data.font_actions(font=data.Font("X Nerd Font", "ttf-x-nerd"), current_package="other")
+        self.assertEqual([a.password for a in use if a.label == "Use"], [""], "switching fonts never asks")
+
+
+class CommandRunner(unittest.TestCase):
+    def setUp(self):
+        from omaskins import run
+        self.run = run
+
+    def test_prototype_allows_nothing(self):
+        self.assertEqual(self.run.ALLOWED, frozenset(), "nothing is live yet")
+        with self.assertRaises(self.run.NotAllowed):
+            self.run.run(["omarchy-theme-set", "nord"])
+
+    def test_shell_strings_and_odd_input_are_refused(self):
+        self.run.ALLOWED, saved = frozenset({"true"}), self.run.ALLOWED
+        try:
+            for bad in ("true", "", [], ["true", 5], None):
+                with self.assertRaises(self.run.NotAllowed, msg=repr(bad)):
+                    self.run.check(bad)
+            self.assertEqual(self.run.run(["true"]).returncode, 0)
+            with self.assertRaises(self.run.NotAllowed):
+                self.run.run(["rm", "-rf", "/tmp/x"])
+        finally:
+            self.run.ALLOWED = saved
+
+    def test_no_shell_anywhere(self):
+        for f in ("run.py", "data.py", "app.py"):
+            self.assertNotIn("shell=True", (ROOT / "omaskins" / f).read_text(), f)
 
 
 class Thumbnails(unittest.TestCase):

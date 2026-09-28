@@ -65,6 +65,7 @@ class Action:
     command: str
     note: str = ""        # extra line for the confirmation dialog
     blocked: str = ""     # set = the button is greyed out, and this says why
+    password: str = ""    # set = it asks for your password, and this says why (always confirmed first)
 
 
 @dataclass
@@ -444,6 +445,13 @@ def theme_actions(local=None, community=None, current=""):
     return acts
 
 
+# The owner doesn't want password prompts for everyday adding/removing. The few actions that can't
+# avoid one (they change system packages) always confirm first and say why.
+PASSWORD_BUILTIN = ("Built-in themes are part of Omarchy's own system package, so removing or restoring one "
+                    "asks for your password. Themes you added never do.")
+PASSWORD_FONT = ("Fonts are system packages, so adding or removing one asks for your password. "
+                 "Switching between installed fonts never does.")
+
 # Built-in themes belong to Omarchy's package, so omarchy-theme-remove won't touch them and an
 # update would bring a deleted one back. Removing = delete the folder as root + a NoExtract rule
 # (it must sit in pacman.conf's [options] section). Restoring = drop the rule, reinstall the package.
@@ -481,12 +489,13 @@ def builtin_remove_action(name):
     return Action("Remove", f"sudo rm -rf {q(BUILTIN_THEMES / name)} && "
                             f"sudo sed -i '/^\\[options\\]/a {_no_extract(name)}' /etc/pacman.conf",
                   note="It's built into Omarchy: it will stay listed under Browse, marked Built-in, "
-                       "with a Restore button.")
+                       "with a Restore button.", password=PASSWORD_BUILTIN)
 
 
 def builtin_restore_action(name, package):
     rule = _no_extract(name).replace("*", "\\*")
-    return Action("Restore", f"sudo sed -i '\\|^{rule}$|d' /etc/pacman.conf && sudo pacman -S --noconfirm {q(package)}")
+    return Action("Restore", f"sudo sed -i '\\|^{rule}$|d' /etc/pacman.conf && sudo pacman -S --noconfirm {q(package)}",
+                  password=PASSWORD_BUILTIN)
 
 
 def background_actions(bg, theme_name):
@@ -535,17 +544,18 @@ def font_actions(font=None, package=None, current_package=""):
         if package.installed:
             if package.package == current_package:
                 return []
-            return [Action("Remove", f"omarchy-pkg-remove {package.package}")]
+            return [Action("Remove", f"omarchy-pkg-remove {package.package}", password=PASSWORD_FONT)]
         fam = package.omarchy_pick or "<its family name>"
-        return [Action("Add", f"omarchy-pkg-add {package.package}"),
-                Action("Add and use", f"omarchy-install-font {q(fam)} {package.package} {q(fam)}")]
+        return [Action("Add", f"omarchy-pkg-add {package.package}", password=PASSWORD_FONT),
+                Action("Add and use", f"omarchy-install-font {q(fam)} {package.package} {q(fam)}",
+                       password=PASSWORD_FONT)]
     acts = []
     if font and not font.current:
         acts.append(Action("Use", f"omarchy-font-set {q(font.family)}"))
     # Only Nerd Font packages are offered for removal: others (adwaita-fonts, ttf-liberation)
     # are pulled in by the system, and the font in use is never removable.
     if font and font.package != current_package and re.search(r"-nerd(-|$)", font.package):
-        acts.append(Action("Remove", f"omarchy-pkg-remove {font.package}"))
+        acts.append(Action("Remove", f"omarchy-pkg-remove {font.package}", password=PASSWORD_FONT))
     return acts
 
 
