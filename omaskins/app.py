@@ -1043,6 +1043,7 @@ class Window(Adw.ApplicationWindow):
         self.current_theme = data.current_theme_name()
         self._last_bg, self._theme_changed_at = data.current_background(), 0
         self._own_change_until, self._running = 0, set()
+        self._quiet_until, self._pending = 0, set()
         self.current_font = ""
         self.font_base = 12
         self.search_text = ""
@@ -1385,6 +1386,7 @@ class Window(Adw.ApplicationWindow):
         if old:
             self.stack.remove(old)
         self.page = ThemePage(self, entry, start)
+        self.page.state = self._page_state(entry)  # what it showed when built, to compare after reloads
         self.stack.add_named(self.page, "theme")
         if not animate:
             self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
@@ -1402,6 +1404,14 @@ class Window(Adw.ApplicationWindow):
             keys.add(("folder", name))
         return keys
 
+    def _page_state(self, e):
+        """Everything a theme page shows that a reload can change; equal = no need to redraw it."""
+        local = e.local
+        return (e.installed, e.removed, local.name if local else None, local.builtin if local else None,
+                bool(local) and local.name == self.current_theme, bool(local) and data.theme_has_files(local.path),
+                len(data.backgrounds_for(local)) if local else None, self.rotation.plan.themes,
+                self.rotation.plan.backgrounds, self.rotation.plan.in_rotation(local.name) if local else None)
+
     def _refresh_page(self):
         """An open theme page follows the reloaded data (Add turns into Apply, Apply marks it current,
         ...), staying on the same flip-book picture. If the theme is gone from every list, go back."""
@@ -1412,7 +1422,10 @@ class Window(Adw.ApplicationWindow):
             i = 0
             while (c := self.theme_flows[name].get_child_at_index(i)):
                 if self._entry_keys(c.entry) & keys:
-                    self.show_theme(c.entry, self.page.flipbook.current_name(), animate=False)
+                    if self._page_state(c.entry) != self.page.state:
+                        self.show_theme(c.entry, self.page.flipbook.current_name(), animate=False)
+                    else:
+                        self.page.entry = c.entry  # same look: keep the page as it is, no redraw
                     return
                 i += 1
         self.go_back()
@@ -1542,8 +1555,24 @@ class Window(Adw.ApplicationWindow):
                 self.toasts.add_toast(Adw.Toast(title=a.done or f"{a.label}: done.", timeout=4))
             if on_done:
                 on_done()
-            self._debounce("local", 300, self.load)  # lists, counts and ✓ marks follow the change
-        bg(lambda: run.perform(a.steps), finished)
+            self._pending.add("local")  # lists, counts and ✓ marks follow the change, in one refresh
+        def finished_then_settle(err):
+            finished(err)
+            # Omarchy's last touches (background link, caches) land just after; refresh once they have.
+            self._quiet_until = GLib.get_monotonic_time() + 1_500_000
+            self._debounce("settle", 1600, self._settle)
+        bg(lambda: run.perform(a.steps), finished_then_settle)
+
+    def _settle(self):
+        """The single refresh after OmaSkins' own action(s): recolour once, rebuild once."""
+        if self._running:
+            return  # another action is still going; its own settle will do it
+        pending, self._pending = self._pending, set()
+        if "state" in pending:
+            self.reload_theme()
+            self.current_theme, self._last_bg = data.current_theme_name(), data.current_background()
+        if pending:
+            self.load()
 
     # ---- live theme
     def set_status(self, text):
@@ -1578,7 +1607,8 @@ class Window(Adw.ApplicationWindow):
             self.current_theme, self._last_bg = data.current_theme_name(), data.current_background()
             self.rebuild()  # the current theme and background marks may both have moved
             self._manual_change(self.current_theme != old_theme, self._last_bg != old_bg)
-        self._debounce("state", 400, apply)
+        # omarchy-theme-set touches these files several times over a few seconds: wait until they settle.
+        self._debounce("state", 1000, apply)
 
     def _manual_change(self, theme_changed, bg_changed):
         """Omarchy's own picker was used (in the prototype nothing else changes these): the matching
@@ -1604,10 +1634,21 @@ class Window(Adw.ApplicationWindow):
         self._monitors.append(mon)
 
     def _watch_files(self):
-        self._watch(data.STATE_DIR, self._state_changed)
-        self._watch(data.USER_THEMES, lambda: self._debounce("local", 600, self.load))
-        self._watch(data.USER_BACKGROUNDS, lambda: self._debounce("local", 600, self.load))
-        self._watch(Path.home() / ".config/fontconfig", lambda: self._debounce("local", 600, self.load))
+        self._watch(data.STATE_DIR, lambda: self._on_files_changed("state"))
+        self._watch(data.USER_THEMES, lambda: self._on_files_changed("local"))
+        self._watch(data.USER_BACKGROUNDS, lambda: self._on_files_changed("local"))
+        self._watch(Path.home() / ".config/fontconfig", lambda: self._on_files_changed("local"))
+
+    def _on_files_changed(self, kind):
+        """Omarchy's files changed. While OmaSkins' own action is still running (and briefly after),
+        just note it: one refresh at the end beats redrawing the window at every step of a theme
+        switch, which made the UI flash and jump."""
+        if self._running or GLib.get_monotonic_time() < self._quiet_until:
+            self._pending.add(kind)
+        elif kind == "state":
+            self._state_changed()
+        else:
+            self._debounce("local", 600, self.load)
 
 
 class App(Adw.Application):
