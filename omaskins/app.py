@@ -91,6 +91,13 @@ def blocked(widget, tip):
     return wrap
 
 
+def popup_at(menu, x, y):
+    rect = Gdk.Rectangle()
+    rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+    menu.set_pointing_to(rect)
+    menu.popup()
+
+
 def open_url(url):
     Gtk.UriLauncher.new(url).launch(None, None, None, None)
 
@@ -266,7 +273,7 @@ def scrolled(child):
 
 
 class ThemeCard(Gtk.FlowBoxChild):
-    def __init__(self, entry, current):
+    def __init__(self, win, entry, current):
         super().__init__()
         self.entry = entry
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.CENTER, width_request=CARD_W)
@@ -291,6 +298,23 @@ class ThemeCard(Gtk.FlowBoxChild):
         box.append(row)
         self.set_child(box)
         self.set_tooltip_text(entry.title)
+
+        # Right-click: Add / Remove / Restore straight from the grid, for working through a long list.
+        a = win.quick_theme_action(entry)
+        if a:
+            group = Gio.SimpleActionGroup()
+            act = Gio.SimpleAction.new("do", None)
+            act.set_enabled(not a.blocked)
+            act.connect("activate", lambda *_: win.quick_theme(entry, a))
+            group.add_action(act)
+            self.insert_action_group("theme", group)
+            menu = Gio.Menu()
+            menu.append(f"{a.label} (it's your current theme)" if a.blocked else a.label, "theme.do")
+            self.menu = Gtk.PopoverMenu(menu_model=menu, has_arrow=False, halign=Gtk.Align.START)
+            self.menu.set_parent(self)
+            click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+            click.connect("pressed", lambda _g, _n, x, y: popup_at(self.menu, x, y))
+            self.add_controller(click)
 
 
 class BackgroundCard(Gtk.FlowBoxChild):
@@ -337,10 +361,7 @@ class BackgroundCard(Gtk.FlowBoxChild):
         self.add_controller(click)
 
     def _on_right_click(self, _gesture, _n, x, y):
-        rect = Gdk.Rectangle()
-        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
-        self.menu.set_pointing_to(rect)
-        self.menu.popup()
+        popup_at(self.menu, x, y)
 
 
 class FontRow(Gtk.ListBoxRow):
@@ -1236,7 +1257,7 @@ class Window(Adw.ApplicationWindow):
             fb = self.theme_flows[name]
             fb.remove_all()
             for e in entries:
-                fb.append(ThemeCard(e, self.current_theme))
+                fb.append(ThemeCard(self, e, self.current_theme))
             self.theme_counts[name].set_text(str(len(entries)))
         self._rebuild_bg_sidebar()
         self._rebuild_fonts()
@@ -1390,12 +1411,29 @@ class Window(Adw.ApplicationWindow):
         bg(lambda: data.save_to_pictures(bgd.path, pictures), done)
 
     # ---- the prototype's one "action"
-    def do_action(self, a, on_done=None):
+    def quick_theme_action(self, entry):
+        """The one thing a theme card's right-click menu offers: Add, Remove or Restore."""
+        if entry.removed:
+            return data.builtin_restore_action(entry.removed, self.builtin_pkg)
+        acts = data.theme_actions(entry.local, entry.community, self.current_theme)
+        return next((a for a in acts if a.label in ("Add", "Remove")), None)
+
+    def quick_theme(self, entry, a):
+        """Right-click Add/Remove/Restore: no confirmation dialog, it's for speed (and each one can be
+        undone from Browse). Removing a rotating theme also takes it out of the rotation."""
+        done = None
+        if a.label == "Remove" and self.rotation.plan.in_rotation(entry.local.name):
+            def done(name=entry.local.name):
+                self.rotation.drop(name)
+                self.toasts.add_toast(Adw.Toast(title=f"{entry.title} was also taken out of the rotation.", timeout=4))
+        self.do_action(a, done, confirm=False)
+
+    def do_action(self, a, on_done=None, confirm=True):
         def show():
             self.toasts.add_toast(Adw.Toast(title=f"Prototype, nothing changed. Would run: {a.command}", timeout=6))
             if on_done:
                 on_done()
-        if a.label == "Remove":
+        if a.label == "Remove" and confirm:
             note = f"{a.note}\n\n" if a.note else ""
             d = Adw.AlertDialog(heading="Remove?", body=f"{note}This would run:\n\n{a.command}\n\n"
                                 "(Prototype: nothing will actually be removed.)")
