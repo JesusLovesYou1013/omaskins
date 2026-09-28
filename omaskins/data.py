@@ -49,6 +49,7 @@ USER_AGENT = "OmaSkins/0.1 (+prototype)"
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
 PREVIEW_NAMES = ("preview.png", "preview.jpg", "preview.jpeg", "preview.webp", "preview.gif", "preview.bmp")
 MAX_DOWNLOAD = 8 * 1024 * 1024  # a screenshot or colors.toml; anything bigger is refused
+MAX_IMAGE = 40 * 1024 * 1024    # a background can be a big 4K PNG
 
 # The palette keys shown on a theme page, in Omarchy's own order.
 SWATCH_KEYS = ("background", "foreground", "accent", "selection", "red", "yellow", "orange",
@@ -165,13 +166,13 @@ def download(url, dest, max_bytes=MAX_DOWNLOAD):
     return dest
 
 
-def cached_download(url, name, ttl=None):
+def cached_download(url, name, ttl=None, max_bytes=MAX_DOWNLOAD):
     """Download once into the cache (re-fetch after `ttl` seconds, if given)."""
     dest = _cache(name)
     if dest.exists() and (ttl is None or time.time() - dest.stat().st_mtime < ttl):
         return dest
     try:
-        return download(url, dest)
+        return download(url, dest, max_bytes)
     except Exception:
         if dest.exists():  # offline: an old copy beats nothing
             return dest
@@ -219,6 +220,33 @@ def remote_colors(theme):
         return read_toml(path)
     except Exception:
         return {}
+
+
+def parse_background_listing(text):
+    """Image download URLs from a GitHub contents-API listing, sorted by name like Omarchy's own."""
+    try:
+        items = json.loads(text)
+    except ValueError:
+        return []
+    if not isinstance(items, list):
+        return []
+    files = [(i.get("name", ""), i.get("download_url")) for i in items
+             if isinstance(i, dict) and i.get("type") == "file" and i.get("download_url")]
+    return [url for name, url in sorted(files) if name.lower().endswith(IMAGE_EXT)]
+
+
+def remote_backgrounds(theme):
+    """A not-yet-installed theme's backgrounds, listed from its GitHub repo (cached a week).
+    Only the list is fetched here; each image downloads when it's first shown."""
+    key = theme.key
+    if not key:
+        return []
+    url = f"https://api.github.com/repos/{key}/contents/backgrounds"
+    try:
+        path = cached_download(url, f"bglists/{key.replace('/', '__')}.json", ttl=7 * 24 * 3600)
+        return parse_background_listing(path.read_text())
+    except Exception:  # no backgrounds folder, offline, or GitHub's hourly limit
+        return []
 
 
 # --------------------------------------------------------------------------- local themes

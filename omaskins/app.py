@@ -9,6 +9,7 @@ import queue
 import sys
 import threading
 from pathlib import Path
+from urllib.parse import unquote
 
 import gi
 
@@ -114,7 +115,7 @@ class Images:
 
     def _load(self, src, width):
         if isinstance(src, str) and src.startswith("http"):
-            src = data.cached_download(src, data.url_cache_name(src, "shots"))
+            src = data.cached_download(src, data.url_cache_name(src, "shots"), max_bytes=data.MAX_IMAGE)
         path = data.thumbnail(src, width) if width else Path(src)
         return Gdk.Texture.new_from_filename(str(path)) if path else None
 
@@ -393,6 +394,111 @@ class FontPackageRow(Gtk.ListBoxRow):
         self.set_child(box)
 
 
+# --------------------------------------------------------------------------- flip book
+
+class FlipBook(Gtk.Box):
+    """A theme's cover and backgrounds as a deck: the current card in the middle, its neighbours
+    dimmed at the sides. Arrows, the side cards, or the Left/Right keys flip; it wraps around."""
+
+    MAIN_W, MAIN_H, SIDE_W, SIDE_H = 640, 360, 170, 96
+
+    def __init__(self, entry):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.START)
+        self.items, self.at, self.slot, self.note = [], 0, "a", ""
+        cover = entry.image
+        if cover:
+            self.items.append((cover, "Cover"))
+        row = Gtk.Box(spacing=10)
+        self.prev_btn = self._arrow("go-previous-symbolic", -1, "Previous (←)")
+        row.append(self.prev_btn)
+        self.left = self._side(-1)
+        row.append(self.left)
+        self.stack = Gtk.Stack(transition_duration=260, hhomogeneous=True, vhomogeneous=True)
+        self.stack.set_size_request(self.MAIN_W, self.MAIN_H)
+        for name in ("a", "b"):
+            self.stack.add_named(Gtk.Box(), name)
+        row.append(self.stack)
+        self.right = self._side(1)
+        row.append(self.right)
+        self.next_btn = self._arrow("go-next-symbolic", 1, "Next (→)")
+        row.append(self.next_btn)
+        self.append(row)
+        # Caption: always one line, so nothing below moves as names change.
+        cap = Gtk.Box(spacing=8, margin_start=self.SIDE_W + 58, width_request=self.MAIN_W, halign=Gtk.Align.START)
+        self.name = label("", "dim small", hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE)
+        cap.append(self.name)
+        self.count = label("", "dim small")
+        cap.append(self.count)
+        self.append(cap)
+        self._show(0)
+
+        if entry.local:
+            self.add_backgrounds([(b.path, b.path.name) for b in data.backgrounds_for(entry.local)])
+        elif entry.community:
+            self.note = "looking for backgrounds on GitHub…"
+            self._show(0)
+            bg(lambda: data.remote_backgrounds(entry.community),
+               lambda urls: self.add_backgrounds([(u, unquote(u.rsplit("/", 1)[-1])) for u in (urls or [])]
+                                                 if not isinstance(urls, Exception) else []))
+
+    def _arrow(self, icon, step, tip):
+        b = Gtk.Button(icon_name=icon, tooltip_text=tip, valign=Gtk.Align.CENTER)
+        b.add_css_class("icon-btn")
+        b.connect("clicked", lambda *_: self.flip(step))
+        return b
+
+    def _side(self, step):
+        box = Gtk.Box(width_request=self.SIDE_W, height_request=self.SIDE_H, valign=Gtk.Align.CENTER)
+        box.add_css_class("flip-side")
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: self.flip(step))
+        box.add_controller(click)
+        return box
+
+    def add_backgrounds(self, found):
+        self.note = "" if found else "no backgrounds found"
+        seen = {str(src) for src, _n in self.items}
+        # An installed theme with no preview uses its first background as the cover: don't show it twice.
+        self.items += [(src, n) for src, n in found if str(src) not in seen]
+        self._show(self.at, animate=False)
+
+    def flip(self, step):
+        if len(self.items) > 1:
+            self._show((self.at + step) % len(self.items), step)
+
+    def _show(self, at, step=0, animate=True):
+        n = len(self.items)
+        self.at = at
+        if not n:
+            self.name.set_text("No images for this theme")
+            self.count.set_text("")
+            return
+        src, name = self.items[at]
+        self.slot = "b" if self.slot == "a" else "a"
+        old = self.stack.get_child_by_name(self.slot)
+        self.stack.remove(old)
+        self.stack.add_named(picture(self.MAIN_W, self.MAIN_H, src, width=1280, priority=-1), self.slot)
+        self.stack.set_transition_type(Gtk.StackTransitionType.NONE if not (animate and step) else
+                                       Gtk.StackTransitionType.SLIDE_LEFT if step > 0 else
+                                       Gtk.StackTransitionType.SLIDE_RIGHT)
+        self.stack.set_visible_child_name(self.slot)
+        self.name.set_text(f"{name} · {self.note}" if self.note else name)
+        self.count.set_text(f"{at + 1} / {n}")
+        many = n > 1
+        for side, d in ((self.left, -1), (self.right, 1)):
+            clear(side)
+            if many:
+                side.append(picture(self.SIDE_W, self.SIDE_H, self.items[(at + d) % n][0], priority=0))
+            side.set_opacity(1 if many else 0)  # keep the space either way (no layout shift)
+            side.set_can_target(many)
+        self.prev_btn.set_sensitive(many)
+        self.next_btn.set_sensitive(many)
+        # Load the neighbours' full-size images now, so the next flip slides in a finished picture.
+        for d in (-1, 1):
+            if many:
+                IMAGES.get(self.items[(at + d) % n][0], 1280, lambda _t: None, priority=0)
+
+
 # --------------------------------------------------------------------------- theme page
 
 class ThemePage(Gtk.Box):
@@ -407,8 +513,8 @@ class ThemePage(Gtk.Box):
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_start=18, margin_end=18,
                        margin_bottom=18)
-        big = picture(720, 405, entry.image, width=1280, priority=-1)
-        body.append(big)
+        self.flipbook = FlipBook(entry)
+        body.append(self.flipbook)
 
         # actions
         acts = Gtk.Box(spacing=8)
@@ -1226,6 +1332,9 @@ class Window(Adw.ApplicationWindow):
         ExportDialog(self, entry).present(self)
 
     def _on_key(self, _ctl, keyval, _code, state):
+        if self.page and self.stack.get_visible_child_name() == "theme" and keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
+            self.page.flipbook.flip(-1 if keyval == Gdk.KEY_Left else 1)
+            return True
         if keyval == Gdk.KEY_Escape:
             if self.stack.get_visible_child_name() == "theme":
                 self.go_back()

@@ -384,4 +384,8 @@ gridview > child:focus-visible {{ outline: 1px solid {sel_border}; outline-offse
 .sidebar row.unchecked label {{ color: {rgba(fg, 0.4)}; }}
 .sidebar row.unchecked:hover {{ background: none; }}
 .toolbar :disabled label {{ color: {rgba(fg, 0.35)}; }}
+
+/* theme page flip book: the neighbouring cards sit dimmed at the sides and brighten on hover */
+.flip-side {{ opacity: 0.45; transition: opacity 150ms; }}
+.flip-side:hover {{ opacity: 0.9; }}
 """

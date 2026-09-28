@@ -388,6 +388,21 @@ class BuiltinRemoval(unittest.TestCase):
         self.assertFalse(plan.in_rotation("aura"))
 
 
+class RemoteBackgrounds(unittest.TestCase):
+    def test_listing_keeps_images_sorted_by_name(self):
+        listing = """[
+          {"name": "2-b.png", "type": "file", "download_url": "https://raw.example/2-b.png"},
+          {"name": "README.md", "type": "file", "download_url": "https://raw.example/README.md"},
+          {"name": "old", "type": "dir", "download_url": null},
+          {"name": "1-a.JPG", "type": "file", "download_url": "https://raw.example/1-a.JPG"}]"""
+        self.assertEqual(data.parse_background_listing(listing),
+                         ["https://raw.example/1-a.JPG", "https://raw.example/2-b.png"])
+
+    def test_errors_and_rate_limits_give_nothing(self):
+        self.assertEqual(data.parse_background_listing('{"message": "API rate limit exceeded"}'), [])
+        self.assertEqual(data.parse_background_listing("not json"), [])
+
+
 class GlobalCorners(unittest.TestCase):
     def setUp(self):
         build_fixture()
