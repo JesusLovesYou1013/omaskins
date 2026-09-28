@@ -3,7 +3,8 @@
 An `Action` (data.py) describes its work as `steps`; `perform()` carries them out. Commands are
 argument lists (never shell strings, so nothing in a theme name, path or URL can be read as extra
 shell syntax) and only programs in ALLOWED may run, some with a stricter shape check. File steps
-may only touch your own backgrounds folder. Everything else in the app just reads.
+may only touch your own backgrounds folder, and theme downloads (cloned into a holding folder, then
+moved into ~/.config/omarchy/themes in one step once complete). Everything else in the app just reads.
 
 Live so far: batch 1, everyday actions that never ask for a password (themes: apply, add, remove
 yours; backgrounds: set, add, copy, remove yours, open folder).
@@ -20,9 +21,10 @@ from . import data
 
 
 def _git_clone_only(argv):
-    # git clone -- <url> <folder in ~/.config/omarchy/themes>, the same clone omarchy-theme-install does
+    # git clone -- <url> <new folder in the partial area>: the clone omarchy-theme-install does, but
+    # into a holding folder that is moved into ~/.config/omarchy/themes only once it is complete.
     return (len(argv) == 5 and argv[1:3] == ["clone", "--"]
-            and Path(argv[4]).parent == data.USER_THEMES and not Path(argv[4]).exists())
+            and Path(argv[4]).parent == data.PARTIAL_THEMES and not Path(argv[4]).exists())
 
 
 ALLOWED = {
@@ -93,8 +95,26 @@ def copy_in(src, dest_dir):
     return dest, False
 
 
+def _partial(path):
+    p = Path(path)
+    if p.parent != data.PARTIAL_THEMES or not p.name or p.name.startswith("."):
+        raise NotAllowed(f"{path} is not a download holding folder")
+    return p
+
+
 def perform(steps):
-    """Carry out an action's steps in order; stop at the first failure (StepFailed says why)."""
+    """Carry out an action's steps in order; stop at the first failure (StepFailed says why).
+    A failed or refused theme download never leaves its half-finished folder behind."""
+    try:
+        _perform(steps)
+    except Exception:
+        for step in steps:
+            if step[0] == "clear_partial":
+                shutil.rmtree(_partial(step[1]), ignore_errors=True)
+        raise
+
+
+def _perform(steps):
     for step in steps:
         kind, args = step[0], step[1:]
         if kind == "run":
@@ -108,6 +128,18 @@ def perform(steps):
             _own_backgrounds(args[0]).mkdir(parents=True, exist_ok=True)
         elif kind == "copy_in":
             copy_in(args[0], args[1])
+        elif kind == "clear_partial":  # a leftover from an interrupted earlier download
+            p = _partial(args[0])
+            shutil.rmtree(p, ignore_errors=True)
+            p.parent.mkdir(parents=True, exist_ok=True)
+        elif kind == "move_in":  # a finished download into ~/.config/omarchy/themes, in one step
+            src, dest = _partial(args[0]), Path(args[1])
+            if dest.parent != data.USER_THEMES or dest.exists():
+                raise NotAllowed(f"won't move a download onto {dest}")
+            if not data.theme_has_files(src):
+                raise StepFailed("the download came out empty")
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(dest)
         elif kind == "remove_file":
             p = _own_backgrounds(args[0])
             if not p.is_file():

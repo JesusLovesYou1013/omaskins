@@ -34,6 +34,9 @@ OMARCHY_PATH = Path(os.environ.get("OMARCHY_PATH", "/usr/share/omarchy"))
 BUILTIN_THEMES = OMARCHY_PATH / "themes"
 USER_THEMES = HOME / ".config/omarchy/themes"
 USER_BACKGROUNDS = HOME / ".config/omarchy/backgrounds"
+# Downloads land here first and move into USER_THEMES in one step once complete, so neither this app
+# nor Omarchy's own menu ever sees (or applies) a half-downloaded theme. Same filesystem = atomic move.
+PARTIAL_THEMES = HOME / ".config/omarchy/.omaskins-partial"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy" / "current"
 MENU_DEFAULTS = OMARCHY_PATH / "default/omarchy/omarchy-menu.jsonc"
 HYPR_DIR = HOME / ".config/hypr"          # Omarchy's hyprland.lua requires "hypr.<name>" from here
@@ -437,9 +440,13 @@ def theme_actions(local=None, community=None, current=""):
         acts.append(add_theme_action(community))
     if local:
         if local.name != current:
-            acts.append(Action("Apply", f"omarchy-theme-set {q(local.name)}",
-                               steps=(("run", ["omarchy-theme-set", local.name]),),
-                               busy=f"Applying {local.title}…", done=f"{local.title} applied."))
+            apply = Action("Apply", f"omarchy-theme-set {q(local.name)}",
+                           steps=(("run", ["omarchy-theme-set", local.name]),),
+                           busy=f"Applying {local.title}…", done=f"{local.title} applied.")
+            if not local.builtin and not theme_has_files(local.path):
+                # Applying now would stage an empty theme (it happened once, mid-download).
+                apply.blocked = "Still downloading, or this theme folder is empty."
+            acts.append(apply)
         if local.builtin:
             rm = builtin_remove_action(local.name)
         else:
@@ -452,6 +459,14 @@ def theme_actions(local=None, community=None, current=""):
     return acts
 
 
+def theme_has_files(path):
+    """False for a folder holding nothing but dot-entries (.git): a clone still in progress, or broken."""
+    try:
+        return any(not p.name.startswith(".") for p in Path(path).iterdir())
+    except OSError:
+        return False
+
+
 THEME_NAME_OK = re.compile(r"[a-z0-9_][a-z0-9._+-]*")  # omarchy-theme-install's own rule
 
 
@@ -460,13 +475,14 @@ def add_theme_action(community):
     into the same folder) but WITHOUT applying it: right-click Add through a list would otherwise
     switch the whole desktop for every theme."""
     url, name = community.repo_url, install_name_from_url(community.repo_url)
-    dest = USER_THEMES / name
-    cmd = f"omarchy-git-url-check {q(url)} && git clone -- {q(url)} {q(dest)}"
+    dest, tmp = USER_THEMES / name, PARTIAL_THEMES / name
+    cmd = f"omarchy-git-url-check {q(url)} && git clone -- {q(url)} {q(tmp)} && mv {q(tmp)} {q(dest)}"
     if not THEME_NAME_OK.fullmatch(name):
         return Action("Add", cmd, blocked="This repository's name doesn't make a usable theme folder name.")
     return Action("Add", cmd, busy=f"Adding {community.name}…",
                   done=f"{community.name} added. Apply it whenever you like.",
-                  steps=(("run", ["omarchy-git-url-check", url]), ("run", ["git", "clone", "--", url, str(dest)])))
+                  steps=(("clear_partial", tmp), ("run", ["omarchy-git-url-check", url]),
+                         ("run", ["git", "clone", "--", url, str(tmp)]), ("move_in", tmp, dest)))
 
 
 # The owner doesn't want password prompts for everyday adding/removing. The few actions that can't

@@ -180,9 +180,11 @@ class Actions(unittest.TestCase):
         self.assertEqual(self.labels(data.theme_actions(None, self.community[1], "tokyo-night")), ["Add"])
         add = data.theme_actions(None, self.community[1])[0]
         url = "https://github.com/guilhermetk/omarchy-all-hallows-eve-theme"
-        self.assertEqual(add.steps, (("run", ["omarchy-git-url-check", url]),
-                                     ("run", ["git", "clone", "--", url, str(data.USER_THEMES / "all-hallows-eve")])),
-                         "omarchy-theme-install's check + clone, without applying")
+        tmp = data.PARTIAL_THEMES / "all-hallows-eve"
+        self.assertEqual(add.steps, (("clear_partial", tmp), ("run", ["omarchy-git-url-check", url]),
+                                     ("run", ["git", "clone", "--", url, str(tmp)]),
+                                     ("move_in", tmp, data.USER_THEMES / "all-hallows-eve")),
+                         "omarchy-theme-install's check + clone, into a holding folder, without applying")
         cur = data.theme_actions(self.local["tokyo-night"], None, "tokyo-night")
         self.assertEqual(self.labels(cur), ["Remove"], "current built-in: nothing to apply")
         self.assertIn("Switch to another one first", cur[0].blocked)
@@ -512,12 +514,12 @@ class CommandRunner(unittest.TestCase):
             with self.assertRaises(self.run.NotAllowed, msg=bad):
                 self.run.check(bad)
 
-    def test_git_may_only_clone_a_new_theme_folder(self):
-        ok = ["git", "clone", "--", "https://github.com/a/b", str(data.USER_THEMES / "new-one")]
+    def test_git_may_only_clone_into_the_holding_folder(self):
+        ok = ["git", "clone", "--", "https://github.com/a/b", str(data.PARTIAL_THEMES / "new-one")]
         self.run.check(ok)
-        for bad in (["git", "push"], ["git", "clone", "https://x", str(data.USER_THEMES / "y")],
+        for bad in (["git", "push"], ["git", "clone", "https://x", str(data.PARTIAL_THEMES / "y")],
                     ["git", "clone", "--", "https://x", "/tmp/elsewhere"],
-                    ["git", "clone", "--", "https://x", str(data.USER_THEMES / "aura")]):   # already there
+                    ["git", "clone", "--", "https://x", str(data.USER_THEMES / "y")]):   # straight into themes
             with self.assertRaises(self.run.NotAllowed, msg=bad):
                 self.run.check(bad)
 
@@ -554,6 +556,36 @@ class CommandRunner(unittest.TestCase):
             self.run.perform([("run", ["omarchy-git-url-check", "--upload-pack=evil"]),
                               ("run", ["git", "clone", "--", "x", str(data.USER_THEMES / "never")])])
         self.assertFalse((data.USER_THEMES / "never").exists())
+
+    def test_a_theme_only_appears_once_its_download_is_complete(self):
+        tmp, dest = data.PARTIAL_THEMES / "fresh", data.USER_THEMES / "fresh"
+        # Simulate the clone step: a finished download in the holding folder...
+        self.run.perform([("clear_partial", tmp)])
+        write(tmp / ".git/config", "")
+        write(tmp / "colors.toml", 'accent = "#123456"\n')
+        self.assertFalse(dest.exists(), "nothing shows in themes while downloading")
+        self.run.perform([("move_in", tmp, dest)])
+        self.assertTrue((dest / "colors.toml").exists())
+        self.assertFalse(tmp.exists())
+
+    def test_an_empty_or_failed_download_never_lands(self):
+        tmp, dest = data.PARTIAL_THEMES / "broken", data.USER_THEMES / "broken"
+        self.run.perform([("clear_partial", tmp)])
+        write(tmp / ".git/config", "")                     # only .git: checkout never happened
+        with self.assertRaises(self.run.StepFailed):
+            self.run.perform([("clear_partial", tmp), ("move_in", tmp, dest)])
+        self.assertFalse(dest.exists())
+        self.assertFalse(tmp.exists(), "the half-finished download is cleaned up")
+        for bad in (("move_in", tmp, HOME / "elsewhere"), ("move_in", HOME / "x", dest), ("clear_partial", HOME)):
+            with self.assertRaises(self.run.NotAllowed, msg=bad):
+                self.run.perform([bad])
+
+    def test_apply_is_greyed_for_an_empty_theme_folder(self):
+        half = write(data.USER_THEMES / "half/.git/config", "").parent.parent
+        t = data.LocalTheme(name="half", path=half, builtin=False)
+        apply = data.theme_actions(t, None, "tokyo-night")[0]
+        self.assertEqual(apply.label, "Apply")
+        self.assertIn("Still downloading", apply.blocked)
 
     def test_every_live_action_passes_the_allow_list(self):
         local = {t.name: t for t in data.local_themes()}
