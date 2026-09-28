@@ -592,25 +592,15 @@ class RotationPage(Gtk.Box):
 
         self.top = top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         top.add_css_class("toolbar")
-        row1 = Gtk.Box(spacing=24)
-        themes_sw, self.themes_switch = labelled_switch("Themes", p.themes, lambda on: self._on_switch("themes", on),
-                                       "Rotate through the checked themes")
-        bgs_sw, self.bgs_switch = labelled_switch("Backgrounds", p.backgrounds, lambda on: self._on_switch("backgrounds", on),
-                                    "Rotate through the bright backgrounds")
-        rotate = field("Rotate", themes_sw)
-        rotate.append(bgs_sw)
-        rotate.set_spacing(18)
-        row1.append(rotate)
-        self.bg_timer = Gtk.Box(spacing=8)
-        self.bg_timer.append(label("Next background every", "kv-key", valign=Gtk.Align.CENTER))
-        self.bg_timer.append(minutes_spin(p.bg_minutes, lambda v: setattr(p, "bg_minutes", v)))
-        self.bg_timer.append(label("min", "dim", valign=Gtk.Align.CENTER))
-        row1.append(self.bg_timer)
-        self.theme_timer = Gtk.Box(spacing=8)
-        self.theme_timer.append(label("Next theme every", "kv-key", valign=Gtk.Align.CENTER))
-        self.theme_timer.append(minutes_spin(p.theme_minutes, lambda v: setattr(p, "theme_minutes", v)))
-        self.theme_timer.append(label("min", "dim", valign=Gtk.Align.CENTER))
-        row1.append(self.theme_timer)
+        # Each switch has its timer right beside it; the wide gap between the pairs says which is which.
+        row1 = field("Rotate")
+        self.themes_switch, self.theme_timer, pair = self._switch_pair(
+            "Themes", "themes", "theme_minutes", "Rotate through the checked themes")
+        row1.append(pair)
+        self.bgs_switch, self.bg_timer, pair = self._switch_pair(
+            "Backgrounds", "backgrounds", "bg_minutes", "Rotate through the bright backgrounds")
+        pair.set_margin_start(48)
+        row1.append(pair)
         top.append(row1)
         self.row2 = Gtk.Box(spacing=12)
         dd, self.dd_switch = labelled_switch("", p.dawn_dusk, self._on_dawn_dusk, "Separate theme sets for day and night")
@@ -657,6 +647,18 @@ class RotationPage(Gtk.Box):
         pane.append(right)
         self.append(pane)
         self._sync_strips()
+
+    def _switch_pair(self, text, attr, minutes, tip):
+        p = self.plan
+        pair = Gtk.Box(spacing=14)
+        box, sw = labelled_switch(text, getattr(p, attr), lambda on: self._on_switch(attr, on), tip)
+        pair.append(box)
+        timer = Gtk.Box(spacing=8)
+        timer.append(label("every", "dim", valign=Gtk.Align.CENTER))
+        timer.append(minutes_spin(getattr(p, minutes), lambda v: setattr(p, minutes, v)))
+        timer.append(label("min", "dim", valign=Gtk.Align.CENTER))
+        pair.append(timer)
+        return sw, timer, pair
 
     # ---- data
     def _theme(self, name):

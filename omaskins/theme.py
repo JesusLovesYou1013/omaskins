@@ -348,6 +348,8 @@ button.subtab .count {{ color: {dim}; margin-left: 6px; }}
 /* cards (theme + background grids) */
 gridview, flowbox {{ background: none; }}
 flowboxchild {{ padding: 0; border-radius: 0; outline: none; }}
+/* no highlight on the grid cell itself: only the card under the pointer lights up (.tile:hover) */
+flowboxchild, flowboxchild:hover, flowboxchild:selected, flowboxchild:active {{ background: none; box-shadow: none; }}
 flowboxchild:focus-visible {{ outline: 1px solid {sel_border}; outline-offset: -2px; }}
 gridview > child {{ padding: 0; margin: 0; border-radius: 0; background: none; outline: none; }}
 gridview > child:focus-visible {{ outline: 1px solid {sel_border}; outline-offset: -2px; }}
