@@ -429,9 +429,11 @@ class FlipBook(Gtk.Box):
 
     MAIN_W, MAIN_H, SIDE_W, SIDE_H, FULL = 640, 360, 170, 96, 1280
 
-    def __init__(self, entry):
+    def __init__(self, entry, start=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.START)
         self.items, self.ready, self.failed = [], set(), set()   # items: (src, name); sets of indexes
+        # A rebuilt page keeps its picture, matched by name: after Add, the GitHub links become local files.
+        self.start = start
         self.at, self.slot, self.note = None, "a", ""
         row = Gtk.Box(spacing=10)
         self.prev_btn = self._arrow("go-previous-symbolic", -1, "Previous (←)")
@@ -499,10 +501,16 @@ class FlipBook(Gtk.Box):
 
     def _loaded(self, i, tex):
         (self.ready if tex else self.failed).add(i)
-        if self.at is None and tex:
+        if tex and self.start and self.items[i][1] == self.start:
+            self.start = None
+            self._show(i)
+        elif self.at is None and tex:
             self._show(i)
         else:
             self._refresh()
+
+    def current_name(self):
+        return self.items[self.at][1] if self.at is not None else None
 
     def _order(self):
         return sorted(self.ready)
@@ -552,7 +560,7 @@ class FlipBook(Gtk.Box):
 # --------------------------------------------------------------------------- theme page
 
 class ThemePage(Gtk.Box):
-    def __init__(self, win, entry):
+    def __init__(self, win, entry, start=None):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.win, self.entry = win, entry
         head = Gtk.Box(spacing=8, margin_start=18, margin_end=18, margin_top=12, margin_bottom=8)
@@ -563,7 +571,7 @@ class ThemePage(Gtk.Box):
 
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14, margin_start=18, margin_end=18,
                        margin_bottom=18)
-        self.flipbook = FlipBook(entry)
+        self.flipbook = FlipBook(entry, start)
         body.append(self.flipbook)
 
         # actions
@@ -1279,6 +1287,7 @@ class Window(Adw.ApplicationWindow):
         self._rebuild_bg_sidebar()
         self._rebuild_fonts()
         self.rotation.refresh()
+        self._refresh_page()
 
     def _rebuild_bg_sidebar(self):
         keep = self.bg_theme.name if self.bg_theme else self.current_theme
@@ -1370,14 +1379,43 @@ class Window(Adw.ApplicationWindow):
         for lb in self.font_lists.values():
             lb.invalidate_filter()
 
-    def show_theme(self, entry):
+    def show_theme(self, entry, start=None, animate=True):
         # A page still fading out after Back holds the "theme" name; clear it now or the new page won't add.
         old = self.stack.get_child_by_name("theme")
         if old:
             self.stack.remove(old)
-        self.page = ThemePage(self, entry)
+        self.page = ThemePage(self, entry, start)
         self.stack.add_named(self.page, "theme")
+        if not animate:
+            self.stack.set_transition_type(Gtk.StackTransitionType.NONE)
         self.stack.set_visible_child_name("theme")
+        self.stack.set_transition_type(Gtk.StackTransitionType.CROSSFADE)
+
+    @staticmethod
+    def _entry_keys(e):
+        """What identifies a theme across reloads: its omarchy.org repo and/or its folder name."""
+        keys = set()
+        if e.community:
+            keys.add(("repo", e.community.key))
+        name = e.local.name if e.local else e.removed
+        if name:
+            keys.add(("folder", name))
+        return keys
+
+    def _refresh_page(self):
+        """An open theme page follows the reloaded data (Add turns into Apply, Apply marks it current,
+        ...), staying on the same flip-book picture. If the theme is gone from every list, go back."""
+        if not self.page or self.stack.get_visible_child_name() != "theme":
+            return
+        keys = self._entry_keys(self.page.entry)
+        for name in ("Browse", "Installed"):
+            i = 0
+            while (c := self.theme_flows[name].get_child_at_index(i)):
+                if self._entry_keys(c.entry) & keys:
+                    self.show_theme(c.entry, self.page.flipbook.current_name(), animate=False)
+                    return
+                i += 1
+        self.go_back()
 
     def go_back(self):
         self.stack.set_visible_child_name("main")
