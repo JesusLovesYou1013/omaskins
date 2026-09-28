@@ -149,14 +149,17 @@ IMAGES = Images()
 
 
 def picture(w, h, src=None, width=480, priority=1):
-    """A w×h image. The clamp stops the loaded texture's own size from widening the
-    card, which would otherwise collapse the grid to a single column."""
+    """A w×h image, never bigger: the clamps stop the loaded texture's own size from widening the
+    card (which would collapse the grid to a single column) or, for a 4:3 or taller picture,
+    making it taller than its neighbours."""
     pic = Gtk.Picture(content_fit=Gtk.ContentFit.COVER, can_shrink=True)
     pic.set_size_request(w, h)
     pic.add_css_class("thumb")
     if src:
         IMAGES.get(src, width, lambda t: t and pic.set_paintable(t), priority)
-    return Adw.Clamp(child=pic, maximum_size=w, tightening_threshold=w, halign=Gtk.Align.START)
+    wide = Adw.Clamp(child=pic, maximum_size=w, tightening_threshold=w, halign=Gtk.Align.START)
+    return Adw.Clamp(child=wide, orientation=Gtk.Orientation.VERTICAL, maximum_size=h, tightening_threshold=h,
+                     valign=Gtk.Align.START)
 
 
 # --------------------------------------------------------------------------- font metrics
@@ -398,16 +401,17 @@ class FontPackageRow(Gtk.ListBoxRow):
 
 class FlipBook(Gtk.Box):
     """A theme's cover and backgrounds as a deck: the current card in the middle, its neighbours
-    dimmed at the sides. Arrows, the side cards, or the Left/Right keys flip; it wraps around."""
+    dimmed at the sides. Arrows, the side cards, or the Left/Right keys flip; it wraps around.
 
-    MAIN_W, MAIN_H, SIDE_W, SIDE_H = 640, 360, 170, 96
+    A card only joins the deck once its full-size picture has loaded, so nothing ever shows or
+    offers an empty box: the side cards fade in when there is a loaded neighbour to flip to."""
+
+    MAIN_W, MAIN_H, SIDE_W, SIDE_H, FULL = 640, 360, 170, 96, 1280
 
     def __init__(self, entry):
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=6, halign=Gtk.Align.START)
-        self.items, self.at, self.slot, self.note = [], 0, "a", ""
-        cover = entry.image
-        if cover:
-            self.items.append((cover, "Cover"))
+        self.items, self.ready, self.failed = [], set(), set()   # items: (src, name); sets of indexes
+        self.at, self.slot, self.note = None, "a", ""
         row = Gtk.Box(spacing=10)
         self.prev_btn = self._arrow("go-previous-symbolic", -1, "Previous (←)")
         row.append(self.prev_btn)
@@ -415,8 +419,8 @@ class FlipBook(Gtk.Box):
         row.append(self.left)
         self.stack = Gtk.Stack(transition_duration=260, hhomogeneous=True, vhomogeneous=True)
         self.stack.set_size_request(self.MAIN_W, self.MAIN_H)
-        for name in ("a", "b"):
-            self.stack.add_named(Gtk.Box(), name)
+        self.stack.add_named(label("Loading pictures…", "dim", xalign=0.5), "a")
+        self.stack.add_named(Gtk.Box(), "b")
         row.append(self.stack)
         self.right = self._side(1)
         row.append(self.right)
@@ -430,16 +434,15 @@ class FlipBook(Gtk.Box):
         self.count = label("", "dim small")
         cap.append(self.count)
         self.append(cap)
-        self._show(0)
 
+        if entry.image:
+            self._add([(entry.image, "Cover")])
         if entry.local:
-            self.add_backgrounds([(b.path, b.path.name) for b in data.backgrounds_for(entry.local)])
+            self._add([(b.path, b.path.name) for b in data.backgrounds_for(entry.local)])
         elif entry.community:
             self.note = "looking for backgrounds on GitHub…"
-            self._show(0)
-            bg(lambda: data.remote_backgrounds(entry.community),
-               lambda urls: self.add_backgrounds([(u, unquote(u.rsplit("/", 1)[-1])) for u in (urls or [])]
-                                                 if not isinstance(urls, Exception) else []))
+            bg(lambda: data.remote_backgrounds(entry.community), self._found_remote)
+        self._refresh()
 
     def _arrow(self, icon, step, tip):
         b = Gtk.Button(icon_name=icon, tooltip_text=tip, valign=Gtk.Align.CENTER)
@@ -455,48 +458,74 @@ class FlipBook(Gtk.Box):
         box.add_controller(click)
         return box
 
-    def add_backgrounds(self, found):
+    def _found_remote(self, urls):
+        found = [] if isinstance(urls, Exception) else (urls or [])
         self.note = "" if found else "no backgrounds found"
-        seen = {str(src) for src, _n in self.items}
+        self._add([(u, unquote(u.rsplit("/", 1)[-1])) for u in found])
+        self._refresh()
+
+    def _add(self, found):
         # An installed theme with no preview uses its first background as the cover: don't show it twice.
-        self.items += [(src, n) for src, n in found if str(src) not in seen]
-        self._show(self.at, animate=False)
+        seen = {str(src) for src, _n in self.items}
+        for src, name in found:
+            if str(src) in seen:
+                continue
+            seen.add(str(src))
+            i = len(self.items)
+            self.items.append((src, name))
+            # In deck order (the queue is first-come within a priority), each at full size.
+            IMAGES.get(src, self.FULL, lambda tex, i=i: self._loaded(i, tex), priority=-1)
+
+    def _loaded(self, i, tex):
+        (self.ready if tex else self.failed).add(i)
+        if self.at is None and tex:
+            self._show(i)
+        else:
+            self._refresh()
+
+    def _order(self):
+        return sorted(self.ready)
 
     def flip(self, step):
-        if len(self.items) > 1:
-            self._show((self.at + step) % len(self.items), step)
+        order = self._order()
+        if len(order) > 1 and self.at in order:
+            self._show(order[(order.index(self.at) + step) % len(order)], step)
 
-    def _show(self, at, step=0, animate=True):
-        n = len(self.items)
-        self.at = at
-        if not n:
-            self.name.set_text("No images for this theme")
-            self.count.set_text("")
-            return
-        src, name = self.items[at]
+    def _show(self, i, step=0):
+        self.at = i
         self.slot = "b" if self.slot == "a" else "a"
-        old = self.stack.get_child_by_name(self.slot)
-        self.stack.remove(old)
-        self.stack.add_named(picture(self.MAIN_W, self.MAIN_H, src, width=1280, priority=-1), self.slot)
-        self.stack.set_transition_type(Gtk.StackTransitionType.NONE if not (animate and step) else
+        self.stack.remove(self.stack.get_child_by_name(self.slot))
+        self.stack.add_named(picture(self.MAIN_W, self.MAIN_H, self.items[i][0], width=self.FULL), self.slot)
+        self.stack.set_transition_type(Gtk.StackTransitionType.NONE if not step else
                                        Gtk.StackTransitionType.SLIDE_LEFT if step > 0 else
                                        Gtk.StackTransitionType.SLIDE_RIGHT)
         self.stack.set_visible_child_name(self.slot)
-        self.name.set_text(f"{name} · {self.note}" if self.note else name)
-        self.count.set_text(f"{at + 1} / {n}")
-        many = n > 1
+        self._refresh()
+
+    def _refresh(self):
+        order = self._order()
+        pending = len(self.items) - len(self.ready) - len(self.failed)
+        if self.at is None:
+            self.name.set_text(self.note or ("" if pending else "No pictures for this theme"))
+            self.count.set_text("")
+        else:
+            name = self.items[self.at][1]
+            self.name.set_text(f"{name} · {self.note}" if self.note else name)
+            more = f" · {pending} more loading" if pending else ""
+            self.count.set_text(f"{order.index(self.at) + 1} / {len(order)}{more}")
+        many = self.at is not None and len(order) > 1
         for side, d in ((self.left, -1), (self.right, 1)):
-            clear(side)
-            if many:
-                side.append(picture(self.SIDE_W, self.SIDE_H, self.items[(at + d) % n][0], priority=0))
-            side.set_opacity(1 if many else 0)  # keep the space either way (no layout shift)
+            want = order[(order.index(self.at) + d) % len(order)] if many else None
+            if getattr(side, "shows", None) != want:
+                side.shows = want
+                clear(side)
+                if want is not None:  # already loaded, so the picture is there at once
+                    side.append(picture(self.SIDE_W, self.SIDE_H, self.items[want][0], width=self.FULL))
+            # Invisible and unclickable until there's a loaded card to flip to; its space is kept.
+            (side.remove_css_class if many else side.add_css_class)("empty")
             side.set_can_target(many)
         self.prev_btn.set_sensitive(many)
         self.next_btn.set_sensitive(many)
-        # Load the neighbours' full-size images now, so the next flip slides in a finished picture.
-        for d in (-1, 1):
-            if many:
-                IMAGES.get(self.items[(at + d) % n][0], 1280, lambda _t: None, priority=0)
 
 
 # --------------------------------------------------------------------------- theme page
