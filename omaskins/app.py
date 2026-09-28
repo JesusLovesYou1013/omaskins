@@ -524,8 +524,8 @@ class ExportDialog(Adw.Dialog):
 ROT_HINTS = {
     (False, False): "Rotation is off. Turn on Themes or Backgrounds above.",
     (True, False): "Backgrounds aren't rotating: your current background stays when the theme changes.",
-    (False, True): "Click a background to add or remove it. Picks can come from any theme.",
-    (True, True): "Click a background to add or remove it. This theme shows its bright ones.",
+    (False, True): "Click a background to add or remove it. Your theme stays; the bright ones take turns.",
+    (True, True): "Click a background to add or remove it. While this theme is on, its bright ones take turns.",
 }
 
 
