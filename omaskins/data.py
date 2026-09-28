@@ -538,3 +538,92 @@ def thumbnail(src, width=480):
     except (OSError, subprocess.SubprocessError):
         tmp.unlink(missing_ok=True)
         return src
+
+
+# --------------------------------------------------------------------------- rotation (prototype: in memory only)
+
+class RotationPlan:
+    """What the Rotation tab has chosen. Nothing here runs or is saved yet.
+
+    Two independent switches: `themes` rotates the checked themes, `backgrounds`
+    rotates the bright (picked) backgrounds. Both off = no rotation. Order is
+    always random. Themes on, backgrounds off = the current background stays.
+
+    Picks are kept per mode, so switching Themes off never floods the
+    background-only rotation with every background of every checked theme:
+    - themes on: each checked theme has its own picks, all of its backgrounds
+      the first time it's checked (unticking it later keeps them for next time);
+    - themes off: one pool, from any theme, seeded with the current theme's.
+    """
+
+    PERIODS = ("All day", "Dawn", "Dusk")
+
+    def __init__(self, current_theme=""):
+        self.themes = False
+        self.backgrounds = False
+        self.bg_minutes, self.theme_minutes = 10, 60
+        self.dawn_dusk, self.dawn, self.dusk = False, "07:00", "19:00"
+        self.period = "Dawn"
+        self.checked = {p: [] for p in self.PERIODS}   # theme names, in the order they were checked
+        self.theme_picks = {}                          # theme name -> set of background paths
+        self.solo_picks = None                         # set of paths; None = not seeded yet
+        self.current_theme = current_theme
+        if current_theme:
+            self.checked["All day"].append(current_theme)
+
+    def running(self):
+        return self.themes or self.backgrounds
+
+    def active_period(self):
+        return self.period if self.dawn_dusk else "All day"
+
+    def set_dawn_dusk(self, on):
+        self.dawn_dusk = on
+        if on and not self.checked["Dawn"] and not self.checked["Dusk"]:
+            self.checked["Dawn"] = list(self.checked["All day"])
+
+    def is_checked(self, name):
+        return name in self.checked[self.active_period()]
+
+    def set_checked(self, name, on, backgrounds=()):
+        """Tick or untick a theme; `backgrounds` = its Background list, used to seed first-time picks."""
+        names = self.checked[self.active_period()]
+        if on and name not in names:
+            names.append(name)
+            if name not in self.theme_picks:
+                self.theme_picks[name] = {b.path for b in backgrounds}
+        elif not on and name in names:
+            names.remove(name)
+
+    def can_open(self, name):
+        """Themes on: only checked themes open. Themes off: any theme does."""
+        return not self.themes or self.is_checked(name)
+
+    def _picks(self, name, backgrounds):
+        if self.themes:
+            return self.theme_picks.setdefault(name, {b.path for b in backgrounds})
+        if self.solo_picks is None:
+            self.solo_picks = set()
+        return self.solo_picks
+
+    def seed_solo(self, current_backgrounds):
+        if self.solo_picks is None:
+            self.solo_picks = {b.path for b in current_backgrounds}
+
+    def is_picked(self, name, bgd, backgrounds=()):
+        return bgd.path in self._picks(name, backgrounds)
+
+    def toggle(self, name, bgd, backgrounds=()):
+        picks = self._picks(name, backgrounds)
+        picks.symmetric_difference_update({bgd.path})
+        return bgd.path in picks
+
+    def picked_count(self, name, backgrounds):
+        paths = {b.path for b in backgrounds}
+        return len(paths & self._picks(name, backgrounds))
+
+    def forget_missing(self, names):
+        """Drop themes that are no longer installed."""
+        for p in self.PERIODS:
+            self.checked[p] = [n for n in self.checked[p] if n in names]
+        self.theme_picks = {n: s for n, s in self.theme_picks.items() if n in names}

@@ -11,7 +11,7 @@ from gi.repository import GLib, Gtk  # noqa: E402
 
 from omaskins import app  # noqa: E402
 
-OUT = Path(sys.argv[1] if len(sys.argv) > 1 else ".")  # add --share for just the Share dialog
+OUT = Path(sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith('--') else ".")  # add --share for just the Share dialog, --rotation for the Rotation tab
 OUT.mkdir(parents=True, exist_ok=True)
 
 
@@ -33,6 +33,20 @@ def steps(win):
     def fonts_browse(): (win.main_tabs["Fonts"].set_active(True), win.font_sub_btns["Browse"].set_active(True))
     def fonts_installed(): win.font_sub_btns["Installed"].set_active(True)
     def share(): win.show_export(None)
+    r = win.rotation
+
+    def rot(name, themes, bgs, dd=False):
+        def go():
+            win.main_tabs["Rotation"].set_active(True)
+            r.themes_switch.set_active(themes)
+            r.bgs_switch.set_active(bgs)
+            r.dd_switch.set_active(dd)
+            GLib.timeout_add(1500, lambda: print(name, "strip heights:", r.top.get_height(),
+                                                 r.period_bar.get_height()) and False)
+        return name, go
+    if "--rotation" in sys.argv:
+        return [rot("r1-off", False, False), rot("r2-backgrounds", False, True), rot("r3-themes", True, False),
+                rot("r4-both", True, True), rot("r5-dawn-dusk", True, True, True)]
     return [("7-share", share)] if "--share" in sys.argv else [("1-themes-browse", browse), ("2-themes-installed", installed), ("3-theme-page", theme_page),
             ("4-backgrounds", backgrounds), ("5-fonts-browse", fonts_browse), ("6-fonts-installed", fonts_installed)]
 

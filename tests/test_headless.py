@@ -281,6 +281,74 @@ class SaveToPictures(unittest.TestCase):
         self.assertEqual(dest2.read_bytes(), src.read_bytes())
 
 
+class Rotation(unittest.TestCase):
+    def setUp(self):
+        build_fixture()
+        self.themes = {t.name: t for t in data.local_themes()}
+        self.bgs = {n: data.backgrounds_for(t) for n, t in self.themes.items()}
+        self.plan = data.RotationPlan("tokyo-night")
+        self.plan.seed_solo(self.bgs["tokyo-night"])
+
+    def test_off_by_default_and_switches_are_independent(self):
+        p = self.plan
+        self.assertFalse(p.running())
+        p.backgrounds = True
+        self.assertTrue(p.running())
+        p.backgrounds, p.themes = False, True
+        self.assertTrue(p.running())
+
+    def test_checking_a_theme_starts_with_all_its_backgrounds(self):
+        p = self.plan
+        p.themes = True
+        self.assertTrue(p.is_checked("tokyo-night"))  # the current theme starts checked
+        self.assertFalse(p.is_checked("aura"))
+        p.set_checked("aura", True, self.bgs["aura"])
+        self.assertEqual(p.picked_count("aura", self.bgs["aura"]), len(self.bgs["aura"]))
+        # dim one, untick and re-tick: the pick is remembered, not reset to all
+        p.toggle("aura", self.bgs["aura"][0], self.bgs["aura"])
+        p.set_checked("aura", False)
+        p.set_checked("aura", True, self.bgs["aura"])
+        self.assertFalse(p.is_picked("aura", self.bgs["aura"][0], self.bgs["aura"]))
+
+    def test_only_checked_themes_open_while_themes_rotate(self):
+        p = self.plan
+        self.assertTrue(p.can_open("aura"))  # themes off: any theme opens
+        p.themes = True
+        self.assertFalse(p.can_open("aura"))
+        self.assertTrue(p.can_open("tokyo-night"))
+
+    def test_backgrounds_only_pool_starts_with_the_current_theme(self):
+        p = self.plan
+        tn, aura = self.bgs["tokyo-night"], self.bgs["aura"]
+        self.assertEqual(p.picked_count("tokyo-night", tn), len(tn))
+        self.assertEqual(p.picked_count("aura", aura), 0)  # other themes start dim
+        self.assertTrue(p.toggle("aura", aura[0], aura))
+        self.assertEqual(p.picked_count("aura", aura), 1)
+
+    def test_theme_picks_do_not_leak_into_the_backgrounds_only_pool(self):
+        p = self.plan
+        p.themes = True
+        p.set_checked("aura", True, self.bgs["aura"])
+        p.themes = False
+        self.assertEqual(p.picked_count("aura", self.bgs["aura"]), 0)
+
+    def test_dawn_and_dusk_have_their_own_theme_sets(self):
+        p = self.plan
+        p.themes = True
+        p.set_dawn_dusk(True)
+        self.assertTrue(p.is_checked("tokyo-night"))  # Dawn starts as a copy of the all-day set
+        p.set_checked("aura", True, self.bgs["aura"])
+        p.period = "Dusk"
+        self.assertFalse(p.is_checked("aura"))
+
+    def test_removed_themes_are_forgotten(self):
+        p = self.plan
+        p.set_checked("aura", True, self.bgs["aura"])
+        p.forget_missing({"tokyo-night"})
+        self.assertFalse(p.is_checked("aura"))
+        self.assertNotIn("aura", p.theme_picks)
+
+
 class PrototypeChangesNothing(unittest.TestCase):
     def test_reading_everything_leaves_home_untouched(self):
         build_fixture()

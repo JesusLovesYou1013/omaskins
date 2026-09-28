@@ -373,4 +373,13 @@ gridview > child:focus-visible {{ outline: 1px solid {sel_border}; outline-offse
 /* fonts: the name is drawn in its own face, so leave font-family to the row */
 .font-row {{ padding: 12px 18px; }}
 .export-list row {{ padding: 6px 4px; background: none; border-bottom: 1px solid {line}; }}
+
+/* Rotation: a background left out of the rotation is dimmed and greyed; picked = full colour */
+.tile.off .thumb {{ filter: grayscale(100%) brightness(45%); }}
+.tile.off label {{ color: {dim}; }}
+.rot-grid:disabled .tile {{ opacity: 0.55; }}
+/* themes left out while Themes rotation is on: greyed, and clicking them does nothing */
+.sidebar row.unchecked label {{ color: {rgba(fg, 0.4)}; }}
+.sidebar row.unchecked:hover {{ background: none; }}
+.toolbar :disabled label {{ color: {rgba(fg, 0.35)}; }}
 """
