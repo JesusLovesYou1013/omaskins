@@ -81,6 +81,15 @@ def mark(tip="Installed"):
     return label(CHECK, "installed-mark", xalign=0.5, tooltip_text=tip)
 
 
+def blocked(widget, tip):
+    """Grey `widget` out. The tooltip goes on a wrapper, because GTK passes the pointer
+    straight through an insensitive widget and would never show its own tooltip."""
+    widget.set_sensitive(False)
+    wrap = Gtk.Box(tooltip_text=tip, valign=Gtk.Align.CENTER)
+    wrap.append(widget)
+    return wrap
+
+
 def open_url(url):
     Gtk.UriLauncher.new(url).launch(None, None, None, None)
 
@@ -398,7 +407,8 @@ class ThemePage(Gtk.Box):
         for a in data.theme_actions(entry.local, entry.community, win.current_theme):
             acts.append(win.action_button(a))
         if entry.local:
-            acts.append(button("Backgrounds", "", lambda *_: win.show_backgrounds_for(entry.local.name)))
+            bgs = button("Backgrounds", "", lambda *_: win.show_backgrounds_for(entry.local.name))
+            acts.append(blocked(bgs, BGS_BLOCKED) if win.rotation.plan.backgrounds else bgs)
         acts.append(button("Share…", "", lambda *_: win.show_export(entry)))
         if entry.repo_url:
             acts.append(button("Open on GitHub", "flat", lambda *_: open_url(entry.repo_url)))
@@ -520,6 +530,9 @@ class ExportDialog(Adw.Dialog):
 # Layout rule (owner's, for every strip in the app): a strip is always as big as the
 # largest thing it can hold. Options that don't apply are greyed out in place, never
 # hidden, so nothing grows, shrinks or jumps when a switch is flipped.
+
+APPLY_BLOCKED = "Theme rotation is on. Add this theme to the rotation on the Rotation tab."
+BGS_BLOCKED = "Background rotation is on. Pick backgrounds on the Rotation tab."
 
 ROT_HINTS = {
     (False, False): "Rotation is off. Turn on Themes or Backgrounds above.",
@@ -749,6 +762,7 @@ class RotationPage(Gtk.Box):
         was = self.plan.running()
         setattr(self.plan, which, on)
         self._sync_strips()
+        self.win.rotation_changed()
         for row in self.rows.values():
             self._style_row(row)
         self._select(self.selected)
@@ -861,7 +875,12 @@ class Window(Adw.ApplicationWindow):
                 first = btn
                 btn.set_active(True)
             btn.connect("toggled", lambda b, n=name: b.get_active() and self._on_main_tab(n))
-            bar.append(btn)
+            if name == "Backgrounds":
+                self.bg_tab_wrap = Gtk.Box()
+                self.bg_tab_wrap.append(btn)
+                bar.append(self.bg_tab_wrap)
+            else:
+                bar.append(btn)
             self.main_tabs[name] = btn
         bar.append(Gtk.Box(hexpand=True))
         self.search = Gtk.SearchEntry(placeholder_text="Search themes…", valign=Gtk.Align.CENTER)
@@ -968,6 +987,8 @@ class Window(Adw.ApplicationWindow):
         css = "danger" if a.label == "Remove" else "primary" if a.label in ("Add", "Apply", "Use") else ""
         b = button(a.label, css, lambda *_: self.do_action(a))
         b.set_valign(Gtk.Align.CENTER)
+        if a.label == "Apply" and self.rotation.plan.themes:
+            return blocked(b, APPLY_BLOCKED)
         return b
 
     # ---- data
@@ -1076,6 +1097,15 @@ class Window(Adw.ApplicationWindow):
         self.search.set_placeholder_text({"Themes": "Search themes…", "Backgrounds": "Search backgrounds…",
                                           "Fonts": "Search fonts…", "Rotation": ""}[name])
         self._apply_search()
+
+    def rotation_changed(self):
+        """Background rotation on = the Backgrounds tab is greyed: rotation picks the background now."""
+        on = self.rotation.plan.backgrounds
+        tab = self.main_tabs["Backgrounds"]
+        if on and tab.get_active():
+            self.main_tabs["Rotation"].set_active(True)
+        tab.set_sensitive(not on)
+        self.bg_tab_wrap.set_tooltip_text(BGS_BLOCKED if on else None)
 
     def _on_theme_sub(self, name):
         self.theme_stack.set_visible_child_name(name)

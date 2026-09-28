@@ -46,7 +46,8 @@ def steps(win):
         return name, go
     if "--rotation" in sys.argv:
         return [rot("r1-off", False, False), rot("r2-backgrounds", False, True), rot("r3-themes", True, False),
-                rot("r4-both", True, True), rot("r5-dawn-dusk", True, True, True)]
+                rot("r4-both", True, True), rot("r5-dawn-dusk", True, True, True),
+                ("r6-theme-page", lambda: win.show_theme(win.theme_flows["Installed"].get_child_at_index(1).entry))]
     return [("7-share", share)] if "--share" in sys.argv else [("1-themes-browse", browse), ("2-themes-installed", installed), ("3-theme-page", theme_page),
             ("4-backgrounds", backgrounds), ("5-fonts-browse", fonts_browse), ("6-fonts-installed", fonts_installed)]
 
