@@ -314,9 +314,19 @@ listview > row:focus-visible {{ outline: 1px solid {sel_border}; outline-offset:
 link, label link, a {{ color: {accent}; text-decoration: none; }}
 label link:hover {{ text-decoration: underline; }}
 
-scrollbar slider {{ background: {rgba(fg, 0.28)}; border-radius: 0; min-width: 6px; min-height: 30px; }}
-scrollbar slider:hover {{ background: {rgba(fg, 0.5)}; }}
-scrollbar, scrollbar trough {{ background: none; border: none; }}
+/* slim overlay scrollbars: a 3px line that fades out when idle, 6px while hovered or dragged.
+   Both states are spelled out because this sheet outranks Adwaita's, whose thin state it replaced. */
+scrollbar, scrollbar trough {{ background: none; border: none; box-shadow: none; }}
+scrollbar slider {{
+  background: {rgba(fg, 0.3)}; border: none; border-radius: 0; margin: 2px;
+  min-width: 3px; min-height: 3px;
+}}
+scrollbar.vertical slider {{ min-height: 30px; }}
+scrollbar.horizontal slider {{ min-width: 30px; }}
+scrollbar.vertical.hovering slider, scrollbar.vertical.dragging slider {{ min-width: 6px; }}
+scrollbar.horizontal.hovering slider, scrollbar.horizontal.dragging slider {{ min-height: 6px; }}
+scrollbar.hovering slider, scrollbar.dragging slider {{ background: {rgba(fg, 0.5)}; }}
+scrollbar button {{ min-width: 0; min-height: 0; padding: 0; border: none; background: none; }}
 
 dialog, dialog.background, window.dialog {{ border-radius: 0; }}
 dialog .dialog-host, floating-sheet, dialog sheet {{ border-radius: 0; }}

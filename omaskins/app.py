@@ -241,7 +241,8 @@ def flow():
 
 
 def scrolled(child):
-    sw = Gtk.ScrolledWindow(vexpand=True, hexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+    sw = Gtk.ScrolledWindow(vexpand=True, hexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER,
+                            overlay_scrolling=True)
     sw.set_child(child)
     return sw
 
@@ -293,6 +294,32 @@ class BackgroundCard(Gtk.FlowBoxChild):
                                lambda _b, a=a: win.do_action(a)))
         box.append(acts)
         self.set_child(box)
+
+        # Right-click menu: "Save to Pictures", plus "Copy to current theme's backgrounds" on other themes.
+        group = Gio.SimpleActionGroup()
+        save = Gio.SimpleAction.new("save", None)
+        save.connect("activate", lambda *_: win.save_to_pictures(bgd))
+        group.add_action(save)
+        menu = Gio.Menu()
+        menu.append("Save to Pictures", "bg.save")
+        copy = data.copy_to_theme_action(bgd, win.current_theme)
+        if copy:
+            act = Gio.SimpleAction.new("copy", None)
+            act.connect("activate", lambda *_: win.do_action(copy))
+            group.add_action(act)
+            menu.append(copy.label, "bg.copy")
+        self.insert_action_group("bg", group)
+        self.menu = Gtk.PopoverMenu(menu_model=menu, has_arrow=False, halign=Gtk.Align.START)
+        self.menu.set_parent(self)
+        click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        click.connect("pressed", self._on_right_click)
+        self.add_controller(click)
+
+    def _on_right_click(self, _gesture, _n, x, y):
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        self.menu.set_pointing_to(rect)
+        self.menu.popup()
 
 
 class FontRow(Gtk.ListBoxRow):
@@ -488,6 +515,393 @@ class ExportDialog(Adw.Dialog):
         self.set_child(view)
 
 
+# --------------------------------------------------------------------------- rotation (prototype: in memory only)
+
+class RotTheme:
+    """One theme in a rotation, with its own background list, order and when to move on."""
+
+    def __init__(self, theme):
+        self.theme = theme            # data.LocalTheme
+        self.backgrounds = "All"      # "All" (its own, incl. added later) or "Chosen" (from any theme)
+        self.chosen = []              # data.Background, any theme
+        self.order = "Random"         # or "In order"
+        self.moves_on = "After list"  # or "Timer"
+        self.minutes = 60
+
+    def count(self):
+        return len(data.backgrounds_for(self.theme)) if self.backgrounds == "All" else len(self.chosen)
+
+    def summary(self, themes_mode):
+        parts = [f"{self.backgrounds} ({self.count()})", self.order.lower()]
+        if themes_mode:
+            parts.append("after list" if self.moves_on == "After list" else f"{self.minutes} min")
+        return " · ".join(parts)
+
+
+def segmented(options, active, on_change):
+    bar = Gtk.Box()
+    first = None
+    for opt in options:
+        btn = Gtk.ToggleButton(label=opt)
+        btn.add_css_class("subtab")
+        if first:
+            btn.set_group(first)
+        else:
+            first = btn
+        btn.set_active(opt == active)
+        btn.connect("toggled", lambda b, o=opt: b.get_active() and on_change(o))
+        bar.append(btn)
+    return bar
+
+
+def minutes_spin(value, on_change):
+    s = Gtk.SpinButton.new_with_range(1, 1440, 1)
+    s.set_value(value)
+    s.set_valign(Gtk.Align.CENTER)
+    s.connect("value-changed", lambda w: on_change(int(w.get_value())))
+    return s
+
+
+def field(name, *widgets):
+    row = Gtk.Box(spacing=10)
+    row.append(label(name, "kv-key", width_chars=12, valign=Gtk.Align.CENTER))
+    for w in widgets:
+        row.append(w)
+    return row
+
+
+def rot_card(bgd, from_title="", on_remove=None, picked=None):
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.CENTER, width_request=CARD_W)
+    box.add_css_class("tile")
+    if picked:
+        box.add_css_class("current")
+    box.append(picture(CARD_W, CARD_H, bgd.path, priority=0))
+    row = Gtk.Box(spacing=6)
+    row.append(label(bgd.path.name, "small", hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE))
+    if bgd.yours:
+        row.append(badge("Yours", "enabled"))
+    if picked:
+        row.append(mark("Chosen"))
+    box.append(row)
+    if from_title:
+        box.append(label(f"from {from_title}", "dim small"))
+    if on_remove:
+        box.append(button("Remove", "flat", lambda *_: on_remove()))
+    child = Gtk.FlowBoxChild(child=box)
+    child.bgd = bgd
+    return child
+
+
+class BackgroundPicker(Adw.Dialog):
+    """Pick a theme's rotation backgrounds from every installed theme's backgrounds."""
+
+    def __init__(self, win, rt, on_done):
+        super().__init__(title=f"Choose backgrounds for {rt.theme.title}", content_width=1060, content_height=680)
+        self.win, self.rt = win, rt
+        self.picked = {b.path: b for b in rt.chosen}
+        pane = Gtk.Box()
+        self.side = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.side.add_css_class("sidebar")
+        self.side.connect("row-selected", lambda _l, row: row and self._show(row.theme))
+        sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, width_request=230, overlay_scrolling=True)
+        sw.set_child(self.side)
+        sw.add_css_class("sidebar")
+        pane.append(sw)
+        right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
+        self.hint = label("", "dim small")
+        self.hint.set_margin_start(14)
+        self.hint.set_margin_top(8)
+        right.append(self.hint)
+        self.grid = flow()
+        self.grid.connect("child-activated", lambda _f, c: self._toggle(c))
+        right.append(scrolled(self.grid))
+        pane.append(right)
+        self.rows = {}
+        for t in sorted(win.local, key=lambda t: (t.name != rt.theme.name, t.title.lower())):
+            row = Gtk.ListBoxRow()
+            row.theme = t
+            box = Gtk.Box(spacing=8)
+            box.append(label(t.title, hexpand=True, ellipsize=Pango.EllipsizeMode.END))
+            n = label("", "dim small")
+            box.append(n)
+            row.set_child(box)
+            self.rows[t.name] = n
+            self.side.append(row)
+        self._counts()
+        self.side.select_row(self.side.get_row_at_index(0))
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        header.pack_end(button("Done", "primary", lambda *_: (on_done(list(self.picked.values())), self.close())))
+        view.add_top_bar(header)
+        view.set_content(pane)
+        self.set_child(view)
+
+    def _counts(self):
+        for name, lab in self.rows.items():
+            n = sum(1 for b in self.picked.values() if b.theme == name)
+            lab.set_text(f"{n} chosen" if n else "")
+        self.hint.set_text(f"{len(self.picked)} chosen in total. Click a background to add or remove it.")
+
+    def _show(self, theme):
+        self.theme = theme
+        self.grid.remove_all()
+        for b in data.backgrounds_for(theme):
+            self.grid.append(rot_card(b, picked=b.path in self.picked))
+
+    def _toggle(self, child):
+        bgd = child.bgd
+        if bgd.path in self.picked:
+            del self.picked[bgd.path]
+        else:
+            self.picked[bgd.path] = bgd
+        self._counts()
+        at = child.get_index()  # swap just this card, so the grid doesn't jump back to the top
+        self.grid.remove(child)
+        self.grid.insert(rot_card(bgd, picked=bgd.path in self.picked), at)
+
+
+class RotationPage(Gtk.Box):
+    """The Rotation tab. PROTOTYPE: settings live only while the window is open; nothing runs."""
+
+    def __init__(self, win):
+        super().__init__(orientation=Gtk.Orientation.VERTICAL)
+        self.win = win
+        self.mode = "Themes + backgrounds"
+        self.bg_minutes, self.theme_minutes = 10, 60
+        self.dawn_dusk, self.dawn, self.dusk = False, "07:00", "19:00"
+        self.sets = {"All day": [], "Dawn": [], "Dusk": []}
+        self.solo = None              # "Backgrounds only": the current theme's settings
+        self.period = "Dawn"
+        self.selected = None
+
+        top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        top.add_css_class("toolbar")
+        row1 = Gtk.Box(spacing=24)
+        row1.append(field("Rotate", segmented(("Backgrounds only", "Themes + backgrounds"), self.mode, self._on_mode)))
+        bgt = Gtk.Box(spacing=8)
+        bgt.append(label("Next background every", "kv-key", valign=Gtk.Align.CENTER))
+        bgt.append(minutes_spin(self.bg_minutes, lambda v: setattr(self, "bg_minutes", v)))
+        bgt.append(label("min", "dim", valign=Gtk.Align.CENTER))
+        row1.append(bgt)
+        self.theme_timer = Gtk.Box(spacing=8)
+        self.theme_timer.append(label("Theme timer default", "kv-key", valign=Gtk.Align.CENTER))
+        self.theme_timer.append(minutes_spin(self.theme_minutes, lambda v: setattr(self, "theme_minutes", v)))
+        self.theme_timer.append(label("min", "dim", valign=Gtk.Align.CENTER))
+        row1.append(self.theme_timer)
+        top.append(row1)
+        self.row2 = Gtk.Box(spacing=12)
+        self.row2.append(label("Dawn & Dusk", "kv-key", width_chars=12, valign=Gtk.Align.CENTER))
+        sw = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Separate theme sets for day and night")
+        sw.connect("notify::active", lambda s, _p: self._on_dawn_dusk(s.get_active()))
+        self.row2.append(sw)
+        self.times = Gtk.Box(spacing=8, visible=False)
+        for name, attr in (("Dawn starts", "dawn"), ("Dusk starts", "dusk")):
+            self.times.append(label(name, "dim", valign=Gtk.Align.CENTER, margin_start=12))
+            e = Gtk.Entry(text=getattr(self, attr), width_chars=5, max_width_chars=5, valign=Gtk.Align.CENTER)
+            e.connect("changed", lambda w, a=attr: setattr(self, a, w.get_text()))
+            self.times.append(e)
+        self.row2.append(self.times)
+        top.append(self.row2)
+        self.append(top)
+
+        self.period_bar, _c, self.period_btns = sub_tabs(("Dawn", "Dusk"), self._on_period)
+        self.period_bar.set_visible(False)
+        self.append(self.period_bar)
+
+        pane = Gtk.Box(vexpand=True)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, width_request=280)
+        left.add_css_class("sidebar")
+        self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.list.add_css_class("sidebar")
+        self.list.connect("row-selected", self._on_row)
+        sw = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER, overlay_scrolling=True)
+        sw.set_child(self.list)
+        left.append(sw)
+        self.add_btn = Gtk.MenuButton(label="Add theme…", margin_start=12, margin_end=12, margin_top=8,
+                                      margin_bottom=12)
+        self.add_btn.add_css_class("omarchy-btn")
+        self.add_pop = Gtk.Popover()
+        self.add_btn.set_popover(self.add_pop)
+        self.add_pop.connect("show", lambda *_: self._fill_add())
+        left.append(self.add_btn)
+        pane.append(left)
+        self.detail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_start=18, margin_end=18,
+                              margin_top=14, margin_bottom=14)
+        pane.append(scrolled(self.detail))
+        self.append(pane)
+
+    # ---- state
+    def themes_mode(self):
+        return self.mode != "Backgrounds only"
+
+    def current_set(self):
+        if not self.themes_mode():
+            return [self.solo] if self.solo else []
+        return self.sets[self.period if self.dawn_dusk else "All day"]
+
+    def refresh(self):
+        """Called when themes are (re)loaded: seed with the current theme, drop removed themes."""
+        cur = self.win.current_local()
+        names = {t.name for t in self.win.local}
+        for k in self.sets:
+            self.sets[k] = [rt for rt in self.sets[k] if rt.theme.name in names]
+        if cur and not self.sets["All day"]:
+            self.sets["All day"].append(RotTheme(cur))
+        if cur and (not self.solo or self.solo.theme.name != cur.name):
+            self.solo = RotTheme(cur)
+        self._rebuild()
+
+    def _rebuild(self, keep=None):
+        keep = keep or self.selected
+        self.theme_timer.set_visible(self.themes_mode())
+        self.row2.set_visible(self.themes_mode())
+        self.period_bar.set_visible(self.themes_mode() and self.dawn_dusk)
+        self.add_btn.set_visible(self.themes_mode())
+        self.list.remove_all()
+        select = None
+        for rt in self.current_set():
+            row = Gtk.ListBoxRow()
+            row.rt = rt
+            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            top = Gtk.Box(spacing=8)
+            top.append(label(rt.theme.title, hexpand=True, ellipsize=Pango.EllipsizeMode.END))
+            if rt.theme.name == self.win.current_theme:
+                top.append(mark("Current theme"))
+            col.append(top)
+            col.append(label(rt.summary(self.themes_mode()), "dim small"))
+            row.set_child(col)
+            self.list.append(row)
+            if rt is keep or select is None:
+                select = row
+        if select:
+            self.list.select_row(select)
+        else:
+            self.selected = None
+            self._show_detail()
+
+    # ---- handlers
+    def _on_mode(self, mode):
+        self.mode = mode
+        self.selected = None
+        self._rebuild()
+
+    def _on_dawn_dusk(self, on):
+        self.dawn_dusk = on
+        self.times.set_visible(on)
+        if on and not self.sets["Dawn"] and not self.sets["Dusk"]:
+            self.sets["Dawn"] = list(self.sets["All day"])
+        self.selected = None
+        self._rebuild()
+
+    def _on_period(self, name):
+        self.period = name
+        self.selected = None
+        self._rebuild()
+
+    def _on_row(self, _lb, row):
+        self.selected = row.rt if row else None
+        self._show_detail()
+
+    def _fill_add(self):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        have = {rt.theme.name for rt in self.current_set()}
+        lb = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        lb.add_css_class("sidebar")
+        for t in sorted(self.win.local, key=lambda t: t.title.lower()):
+            if t.name in have:
+                continue
+            b = Gtk.Button(label=t.title)
+            b.add_css_class("flat")
+            b.connect("clicked", lambda _b, t=t: self._add(t))
+            lb.append(b)
+        if not lb.get_first_child():
+            lb.append(label("Every installed theme is already in.", "dim"))
+        sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                                max_content_height=420, overlay_scrolling=True)
+        sw.set_child(lb)
+        box.append(sw)
+        self.add_pop.set_child(box)
+
+    def _add(self, theme):
+        self.add_pop.popdown()
+        rt = RotTheme(theme)
+        rt.minutes = self.theme_minutes
+        self.current_set().append(rt)
+        self._rebuild(keep=rt)
+
+    def _remove(self, rt):
+        self.current_set().remove(rt)
+        self.selected = None
+        self._rebuild()
+
+    def _set(self, rt, attr, value, redraw=True):
+        setattr(rt, attr, value)
+        if redraw:
+            self._rebuild(keep=rt)
+        else:
+            row = self.list.get_selected_row()
+            if row:
+                row.get_child().get_last_child().set_text(rt.summary(self.themes_mode()))
+
+    # ---- detail
+    def _show_detail(self):
+        clear(self.detail)
+        rt = self.selected
+        if not rt:
+            self.detail.append(label("Add a theme to the rotation to set it up.", "empty"))
+            return
+        tm = self.themes_mode()
+        head = Gtk.Box(spacing=8)
+        head.append(label(rt.theme.title, "plugin-name", hexpand=True))
+        if tm:
+            head.append(button("Remove from rotation", "danger", lambda *_: self._remove(rt)))
+        self.detail.append(head)
+        self.detail.append(field("Backgrounds", segmented(("All", "Chosen"), rt.backgrounds,
+                                                           lambda v: self._set(rt, "backgrounds", v))))
+        self.detail.append(field("Order", segmented(("Random", "In order"), rt.order,
+                                                     lambda v: self._set(rt, "order", v))))
+        if tm:
+            spin = minutes_spin(rt.minutes, lambda v: self._set(rt, "minutes", v, redraw=False))
+            spin.set_visible(rt.moves_on == "Timer")
+            mins = label("min", "dim", valign=Gtk.Align.CENTER, visible=rt.moves_on == "Timer")
+            self.detail.append(field("Next theme", segmented(("After list", "Timer"), rt.moves_on,
+                                                              lambda v: self._set(rt, "moves_on", v)), spin, mins))
+        hints = []
+        if rt.backgrounds == "All":
+            hints.append("Every background of this theme, including ones added later. "
+                         "A new one shows right away, then the list carries on.")
+        else:
+            hints.append("Hand-picked from any theme's backgrounds.")
+        hints.append("Random: each background shows once before any repeats." if rt.order == "Random"
+                     else "In order: by file name, like Omarchy's own next-background.")
+        if tm:
+            hints.append(f"Moves to the next theme once every background has shown once "
+                         f"({rt.count()} × {self.bg_minutes} min)." if rt.moves_on == "After list"
+                         else f"Moves to the next theme after {rt.minutes} min. Coming back later "
+                              "carries on where its list left off.")
+        self.detail.append(label(" ".join(hints), "dim small", wrap=True))
+
+        titles = {t.name: t.title for t in self.win.local}
+        grid = flow()
+        grid.set_margin_start(0)
+        grid.set_margin_end(0)
+        if rt.backgrounds == "All":
+            for b in data.backgrounds_for(rt.theme):
+                grid.append(rot_card(b))
+        else:
+            tools = Gtk.Box(spacing=8)
+            tools.append(label(f"{len(rt.chosen)} chosen", "section-title", hexpand=True))
+            tools.append(button("Choose backgrounds…", "primary", lambda *_: BackgroundPicker(
+                self.win, rt, lambda picked: self._set(rt, "chosen", picked)).present(self.win)))
+            self.detail.append(tools)
+            for b in rt.chosen:
+                grid.append(rot_card(b, titles.get(b.theme, b.theme) if b.theme != rt.theme.name else "",
+                                     on_remove=lambda b=b: self._set(rt, "chosen", [x for x in rt.chosen if x is not b])))
+        if not grid.get_first_child():
+            grid.append(Gtk.FlowBoxChild(child=label("No backgrounds yet.", "empty")))
+        self.detail.append(grid)
+
+
 # --------------------------------------------------------------------------- window
 
 class Window(Adw.ApplicationWindow):
@@ -515,7 +929,7 @@ class Window(Adw.ApplicationWindow):
         bar.add_css_class("tabbar")
         self.main_tabs = {}
         first = None
-        for name in ("Themes", "Backgrounds", "Fonts"):
+        for name in ("Themes", "Backgrounds", "Fonts", "Rotation"):
             btn = Gtk.ToggleButton(label=name)
             btn.add_css_class("tab")
             if first:
@@ -526,6 +940,12 @@ class Window(Adw.ApplicationWindow):
             btn.connect("toggled", lambda b, n=name: b.get_active() and self._on_main_tab(n))
             bar.append(btn)
             self.main_tabs[name] = btn
+        # Rotation: its tab stays greyed out until rotation is switched on.
+        self.main_tabs["Rotation"].set_sensitive(False)
+        self.rotation_switch = Gtk.Switch(valign=Gtk.Align.CENTER, margin_start=6,
+                                          tooltip_text="Turn background/theme rotation on or off")
+        self.rotation_switch.connect("notify::active", lambda s, _p: self._on_rotation_switch(s.get_active()))
+        bar.append(self.rotation_switch)
         bar.append(Gtk.Box(hexpand=True))
         self.search = Gtk.SearchEntry(placeholder_text="Search themes…", valign=Gtk.Align.CENTER)
         self.search.connect("search-changed", self._on_search)
@@ -546,6 +966,8 @@ class Window(Adw.ApplicationWindow):
         self.main_stack.add_named(self._build_themes(), "Themes")
         self.main_stack.add_named(self._build_backgrounds(), "Backgrounds")
         self.main_stack.add_named(self._build_fonts(), "Fonts")
+        self.rotation = RotationPage(self)
+        self.main_stack.add_named(self.rotation, "Rotation")
         main.append(self.main_stack)
 
         self.status = label("Loading…", "statusbar")
@@ -590,7 +1012,8 @@ class Window(Adw.ApplicationWindow):
         self.bg_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.bg_list.add_css_class("sidebar")
         self.bg_list.connect("row-selected", self._on_bg_theme)
-        side = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, width_request=230)
+        side = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, width_request=230,
+                                  overlay_scrolling=True)
         side.set_child(self.bg_list)
         side.add_css_class("sidebar")
         pane.append(side)
@@ -674,20 +1097,25 @@ class Window(Adw.ApplicationWindow):
             self.theme_counts[name].set_text(str(len(entries)))
         self._rebuild_bg_sidebar()
         self._rebuild_fonts()
+        self.rotation.refresh()
 
     def _rebuild_bg_sidebar(self):
         keep = self.bg_theme.name if self.bg_theme else self.current_theme
         self.bg_list.remove_all()
         ordered = sorted(self.local, key=lambda t: (t.name != self.current_theme, t.title.lower()))
+        cur_bg = data.current_background()
         select = None
         for t in ordered:
             row = Gtk.ListBoxRow()
             row.theme = t
             box = Gtk.Box(spacing=8)
             box.append(label(t.title, hexpand=True, ellipsize=Pango.EllipsizeMode.END))
-            box.append(label(str(len(data.backgrounds_for(t))), "dim small"))
+            bgs = data.backgrounds_for(t, self.current_theme, cur_bg)
+            box.append(label(str(len(bgs)), "dim small"))
             if t.name == self.current_theme:
                 box.append(mark("Current theme"))
+            elif any(b.current for b in bgs):
+                box.append(mark("The current background comes from this theme"))
             row.set_child(box)
             self.bg_list.append(row)
             if t.name == keep:
@@ -727,9 +1155,20 @@ class Window(Adw.ApplicationWindow):
     # ---- navigation
     def _on_main_tab(self, name):
         self.main_stack.set_visible_child_name(name)
+        self.search.set_sensitive(name != "Rotation")
         self.search.set_placeholder_text({"Themes": "Search themes…", "Backgrounds": "Search backgrounds…",
-                                          "Fonts": "Search fonts…"}[name])
+                                          "Fonts": "Search fonts…", "Rotation": ""}[name])
         self._apply_search()
+
+    def _on_rotation_switch(self, on):
+        tab = self.main_tabs["Rotation"]
+        tab.set_sensitive(on)
+        if on:
+            tab.set_active(True)
+        elif tab.get_active():
+            self.main_tabs["Themes"].set_active(True)
+        self.toasts.add_toast(Adw.Toast(title=f"Prototype, nothing changed. Rotation would {'start' if on else 'stop'}.",
+                                        timeout=4))
 
     def _on_theme_sub(self, name):
         self.theme_stack.set_visible_child_name(name)
@@ -790,6 +1229,18 @@ class Window(Adw.ApplicationWindow):
             self.search.grab_focus()
             return True
         return False
+
+    def save_to_pictures(self, bgd):
+        pictures = GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_PICTURES) or str(Path.home() / "Pictures")
+
+        def done(result):
+            if isinstance(result, Exception):
+                self.toasts.add_toast(Adw.Toast(title=f"Couldn't save {bgd.path.name}: {result}", timeout=6))
+                return
+            dest, already = result
+            text = f"Already in Pictures as {dest.name}" if already else f"Saved to Pictures as {dest.name}"
+            self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
+        bg(lambda: data.save_to_pictures(bgd.path, pictures), done)
 
     # ---- the prototype's one "action"
     def do_action(self, a):

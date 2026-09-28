@@ -151,6 +151,17 @@ class Local(unittest.TestCase):
         bgs = data.backgrounds_for(t, "tokyo-night", data.current_background())
         self.assertEqual([b.path.name for b in bgs if b.current], ["mine.png"])
 
+    def test_current_background_from_another_theme(self):
+        # tokyo-night applied, but the background was set from aura.
+        themes = {t.name: t for t in data.local_themes()}
+        state = HOME / ".local/state/omarchy/current"
+        (state / "background").unlink()
+        (state / "background").symlink_to(themes["aura"].path / "backgrounds/aura-1.jpg")
+        cur = data.current_background()
+        self.assertEqual([b.path.name for b in data.backgrounds_for(themes["aura"], "tokyo-night", cur)
+                          if b.current], ["aura-1.jpg"])
+        self.assertFalse(any(b.current for b in data.backgrounds_for(themes["tokyo-night"], "tokyo-night", cur)))
+
     def test_no_current_mark_on_other_themes(self):
         t = next(t for t in data.local_themes() if t.name == "aura")
         self.assertFalse(any(b.current for b in data.backgrounds_for(t, "tokyo-night", data.current_background())))
@@ -231,6 +242,43 @@ class Export(unittest.TestCase):
         items = data.export_plan(self.local["tokyo-night"], self.community, b, font)
         self.assertEqual([i.how for i in items], ["link", "link", "link"])
         self.assertIn('"format": "omaskins-share/1"', data.export_summary_json(items))
+
+
+class CopyToCurrentTheme(unittest.TestCase):
+    def test_offered_only_for_other_themes(self):
+        build_fixture()
+        themes = {t.name: t for t in data.local_themes()}
+        aura_bg = data.backgrounds_for(themes["aura"])[0]
+        a = data.copy_to_theme_action(aura_bg, "tokyo-night")
+        self.assertEqual(a.label, "Copy to current theme's backgrounds")
+        self.assertIn(str(aura_bg.path), a.command)
+        self.assertTrue(a.command.rstrip("/'").endswith(".config/omarchy/backgrounds/tokyo-night"), a.command)
+        for b in data.backgrounds_for(themes["tokyo-night"]):
+            self.assertIsNone(data.copy_to_theme_action(b, "tokyo-night"))
+
+
+class SaveToPictures(unittest.TestCase):
+    def test_copies_original_and_never_overwrites(self):
+        src = SANDBOX / "src" / "1-mountains.png"
+        src.parent.mkdir(parents=True, exist_ok=True)
+        src.write_bytes(b"\x89PNG original bytes")
+        pics = HOME / "Pictures"
+        shutil.rmtree(pics, ignore_errors=True)
+
+        dest, already = data.save_to_pictures(src, pics)
+        self.assertEqual((dest, already), (pics / "1-mountains.png", False))
+        self.assertEqual(dest.read_bytes(), src.read_bytes())
+
+        # Same file again: nothing new is written.
+        self.assertEqual(data.save_to_pictures(src, pics), (dest, True))
+        self.assertEqual(len(list(pics.iterdir())), 1)
+
+        # A different file already has the name: keep it, save as -2.
+        dest.write_bytes(b"someone else's picture")
+        dest2, already = data.save_to_pictures(src, pics)
+        self.assertEqual((dest2.name, already), ("1-mountains-2.png", False))
+        self.assertEqual(dest.read_bytes(), b"someone else's picture")
+        self.assertEqual(dest2.read_bytes(), src.read_bytes())
 
 
 class PrototypeChangesNothing(unittest.TestCase):

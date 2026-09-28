@@ -4,7 +4,8 @@ PROTOTYPE RULE: nothing in this module changes the system. It reads Omarchy's
 theme folders, asks fontconfig/pacman what is installed, and downloads public
 pages and screenshots into its own cache (~/.cache/omaskins). Every "action"
 only *describes* the Omarchy command it would run (see `Action`); the UI shows
-that text instead of running it.
+that text instead of running it. The one exception is `save_to_pictures`, which
+copies a background into ~/Pictures on request (never overwriting anything).
 
 Where things live (Omarchy 4.x):
     /usr/share/omarchy/themes/<name>/          built-in themes ($OMARCHY_PATH/themes)
@@ -302,12 +303,14 @@ def backgrounds_for(theme, current_theme="", current_bg=None):
     """The theme's own backgrounds, then yours from ~/.config/omarchy/backgrounds/<theme>/."""
     out = [Background(p, theme.name, False) for p in _images(theme.path / "backgrounds")]
     out += [Background(p, theme.name, True) for p in _images(USER_BACKGROUNDS / theme.name)]
-    if current_bg and theme.name == current_theme:
+    if current_bg:
         state_copy = STATE_DIR / "theme" / "backgrounds"
         for b in out:
-            # Omarchy copies the theme into state/current/theme, so the link usually points at that copy.
-            if b.path == current_bg or (current_bg.parent == state_copy and b.path.name == current_bg.name
-                                        and not b.yours):
+            # Any theme's background can be the current one (omarchy-theme-bg-set takes any image).
+            # For the current theme, Omarchy copies it into state/current/theme, so the link
+            # usually points at that copy instead.
+            if b.path == current_bg or (theme.name == current_theme and current_bg.parent == state_copy
+                                        and b.path.name == current_bg.name and not b.yours):
                 b.current = True
                 break
     return out
@@ -409,6 +412,33 @@ def background_actions(bg, theme_name):
     if bg.yours:
         acts.append(Action("Remove", f"rm {q(bg.path)}"))
     return acts
+
+
+def save_to_pictures(src, pictures):
+    """Copy a background's original file into `pictures`, byte for byte (full quality).
+
+    The one real action in the prototype (owner's request). Never overwrites: a different
+    file with the same name gets "-2", "-3"... Returns (destination, already_there).
+    """
+    src, pictures = Path(src), Path(pictures)
+    pictures.mkdir(parents=True, exist_ok=True)
+    dest, n = pictures / src.name, 1
+    while dest.exists():
+        if dest.stat().st_size == src.stat().st_size and dest.read_bytes() == src.read_bytes():
+            return dest, True
+        n += 1
+        dest = pictures / f"{src.stem}-{n}{src.suffix}"
+    shutil.copy2(src, dest)
+    return dest, False
+
+
+def copy_to_theme_action(bg, current_theme):
+    """Right-click on another theme's background: copy it into your backgrounds for the current theme,
+    kept apart from that theme's own (so it shows as "Yours" and can be removed). None if not offered."""
+    if not current_theme or bg.theme == current_theme:
+        return None
+    return Action("Copy to current theme's backgrounds",
+                  f"cp -n {q(bg.path)} {q(USER_BACKGROUNDS / current_theme)}/")
 
 
 def add_background_action(theme_name):
