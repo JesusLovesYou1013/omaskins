@@ -58,6 +58,8 @@ class Action:
     """What a button *would* do. The prototype shows `command` and runs nothing."""
     label: str
     command: str
+    note: str = ""        # extra line for the confirmation dialog
+    blocked: str = ""     # set = the button is greyed out, and this says why
 
 
 @dataclass
@@ -400,9 +402,59 @@ def theme_actions(local=None, community=None, current=""):
     if local:
         if local.name != current:
             acts.append(Action("Apply", f"omarchy-theme-set {q(local.title)}"))
-        if not local.builtin:
-            acts.append(Action("Remove", f"omarchy-theme-remove {q(local.name)}"))
+        if local.builtin:
+            rm = builtin_remove_action(local.name)
+        else:
+            rm = Action("Remove", f"omarchy-theme-remove {q(local.name)}")
+        if local.name == current:
+            rm.blocked = "This is your current theme. Switch to another one first."
+        acts.append(rm)
     return acts
+
+
+# Built-in themes belong to Omarchy's package, so omarchy-theme-remove won't touch them and an
+# update would bring a deleted one back. Removing = delete the folder as root + a NoExtract rule
+# (it must sit in pacman.conf's [options] section). Restoring = drop the rule, reinstall the package.
+
+def builtin_package():
+    """The pacman package that owns the built-in themes ('' if unknown)."""
+    return (_run(["pacman", "-Qqo", str(BUILTIN_THEMES)], 10).split() or [""])[0]
+
+
+def shipped_builtins(package):
+    """Every theme the package ships, whether or not its folder is still there."""
+    if not package:
+        return []
+    prefix = str(BUILTIN_THEMES) + "/"
+    names = set()
+    for line in _run(["pacman", "-Qlq", package], 15).splitlines():
+        rest = line[len(prefix):] if line.startswith(prefix) else ""
+        if rest.count("/") == 1 and rest.endswith("/"):
+            names.add(rest[:-1])
+    return sorted(names)
+
+
+def removed_builtins(shipped):
+    """Built-ins the package ships whose folder is gone (removed through OmaSkins)."""
+    return [n for n in shipped if not (BUILTIN_THEMES / n).is_dir()]
+
+
+def _no_extract(name):
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", name):
+        raise ValueError(f"unexpected theme folder name: {name!r}")
+    return f"NoExtract = {str(BUILTIN_THEMES / name).lstrip('/')}/*"
+
+
+def builtin_remove_action(name):
+    return Action("Remove", f"sudo rm -rf {q(BUILTIN_THEMES / name)} && "
+                            f"sudo sed -i '/^\\[options\\]/a {_no_extract(name)}' /etc/pacman.conf",
+                  note="It's built into Omarchy: it will stay listed under Browse, marked Built-in, "
+                       "with a Restore button.")
+
+
+def builtin_restore_action(name, package):
+    rule = _no_extract(name).replace("*", "\\*")
+    return Action("Restore", f"sudo sed -i '\\|^{rule}$|d' /etc/pacman.conf && sudo pacman -S --noconfirm {q(package)}")
 
 
 def background_actions(bg, theme_name):
@@ -621,6 +673,15 @@ class RotationPlan:
     def picked_count(self, name, backgrounds):
         paths = {b.path for b in backgrounds}
         return len(paths & self._picks(name, backgrounds))
+
+    def in_rotation(self, name):
+        return any(name in names for names in self.checked.values())
+
+    def drop(self, name):
+        """Take a theme out of every period (its picks are kept in case it comes back)."""
+        for p in self.PERIODS:
+            if name in self.checked[p]:
+                self.checked[p].remove(name)
 
     def forget_missing(self, names):
         """Drop themes that are no longer installed."""

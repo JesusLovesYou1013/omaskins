@@ -180,8 +180,11 @@ class Actions(unittest.TestCase):
         self.assertEqual(self.labels(data.theme_actions(None, self.community[1], "tokyo-night")), ["Add"])
         self.assertIn("omarchy-theme-install https://github.com/guilhermetk/omarchy-all-hallows-eve-theme.git",
                       data.theme_actions(None, self.community[1])[0].command)
-        self.assertEqual(self.labels(data.theme_actions(self.local["tokyo-night"], None, "tokyo-night")), [],
-                         "current built-in: nothing to apply or remove")
+        cur = data.theme_actions(self.local["tokyo-night"], None, "tokyo-night")
+        self.assertEqual(self.labels(cur), ["Remove"], "current built-in: nothing to apply")
+        self.assertIn("Switch to another one first", cur[0].blocked)
+        self.assertEqual(data.theme_actions(self.local["aura"], None, "aura")[0].blocked,
+                         cur[0].blocked, "no theme can be removed while it's the current one")
         self.assertEqual(self.labels(data.theme_actions(self.local["aura"], self.community[0], "tokyo-night")),
                          ["Apply", "Remove"])
 
@@ -347,6 +350,42 @@ class Rotation(unittest.TestCase):
         p.forget_missing({"tokyo-night"})
         self.assertFalse(p.is_checked("aura"))
         self.assertNotIn("aura", p.theme_picks)
+
+
+class BuiltinRemoval(unittest.TestCase):
+    def test_remove_deletes_folder_and_keeps_updates_from_restoring_it(self):
+        build_fixture()
+        a = data.builtin_remove_action("nord")
+        self.assertEqual(a.label, "Remove")
+        self.assertIn(f"sudo rm -rf '{OMARCHY}/themes/nord'", a.command)
+        self.assertIn(f"/^\\[options\\]/a NoExtract = {str(OMARCHY).lstrip('/')}/themes/nord/*", a.command)
+        self.assertIn("Restore", a.note)
+        self.assertEqual(data.theme_actions([t for t in data.local_themes() if t.name == "tokyo-night"][0],
+                                            None, "aura")[-1].command, data.builtin_remove_action("tokyo-night").command)
+
+    def test_restore_drops_exactly_that_rule_and_reinstalls(self):
+        c = data.builtin_restore_action("nord", "omarchy").command
+        self.assertIn("\\|^NoExtract = ", c)
+        self.assertIn("/themes/nord/\\*$|d", c)
+        self.assertTrue(c.endswith("sudo pacman -S --noconfirm 'omarchy'"), c)
+
+    def test_odd_folder_names_are_refused(self):
+        for bad in ("../etc", "a b", "x/y", "", ".hidden"):
+            with self.assertRaises(ValueError):
+                data.builtin_remove_action(bad)
+
+    def test_removed_builtins_are_shipped_ones_whose_folder_is_gone(self):
+        build_fixture()
+        self.assertEqual(data.removed_builtins(["nord", "tokyo-night", "white"]), ["white"])
+        self.assertEqual(data.shipped_builtins(""), [])
+
+    def test_removing_a_rotating_theme_takes_it_out_of_the_rotation(self):
+        plan = data.RotationPlan("tokyo-night")
+        plan.set_checked("aura", True)
+        plan.set_dawn_dusk(True)
+        self.assertTrue(plan.in_rotation("aura"))
+        plan.drop("aura")
+        self.assertFalse(plan.in_rotation("aura"))
 
 
 class PrototypeChangesNothing(unittest.TestCase):

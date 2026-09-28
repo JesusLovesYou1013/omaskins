@@ -191,11 +191,14 @@ def font_label(widget, family, reference, base_px):
 class ThemeEntry:
     """One theme card: a community listing, a local folder, or both."""
 
-    def __init__(self, community=None, local=None):
+    def __init__(self, community=None, local=None, removed=""):
         self.community, self.local = community, local
+        self.removed = removed    # folder name of a built-in removed through OmaSkins
 
     @property
     def title(self):
+        if self.removed:
+            return data.display_name(self.removed)
         return self.local.title if self.local else self.community.name
 
     @property
@@ -210,6 +213,8 @@ class ThemeEntry:
 
     @property
     def repo_url(self):
+        if self.removed:
+            return ""
         if self.community:
             return self.community.repo_url
         return self.local.repo_url if self.local else ""
@@ -268,7 +273,10 @@ class ThemeCard(Gtk.FlowBoxChild):
         box.append(picture(CARD_W, CARD_H, entry.image, priority=0 if entry.installed else 1))
         row = Gtk.Box(spacing=6)
         row.append(label(entry.title, "card-name", hexpand=True, ellipsize=Pango.EllipsizeMode.END))
-        if entry.local and entry.local.builtin:
+        if entry.removed:
+            row.append(badge("Built-in", "builtin"))
+            row.append(badge("Removed", "warn"))
+        elif entry.local and entry.local.builtin:
             row.append(badge("Built-in", "builtin"))
         elif entry.installed and entry.community is None:
             row.append(badge("Not listed", "warn"))
@@ -404,12 +412,21 @@ class ThemePage(Gtk.Box):
 
         # actions
         acts = Gtk.Box(spacing=8)
-        for a in data.theme_actions(entry.local, entry.community, win.current_theme):
-            acts.append(win.action_button(a))
+        if entry.removed:
+            theme_acts = [data.builtin_restore_action(entry.removed, win.builtin_pkg)]
+        else:
+            theme_acts = data.theme_actions(entry.local, entry.community, win.current_theme)
+        for a in theme_acts:
+            done = None
+            if a.label == "Remove" and win.rotation.plan.in_rotation(entry.local.name):
+                a.note = (a.note + " " if a.note else "") + "It will also be taken out of the rotation."
+                done = lambda name=entry.local.name: win.rotation.drop(name)
+            acts.append(win.action_button(a, done))
         if entry.local:
             bgs = button("Backgrounds", "", lambda *_: win.show_backgrounds_for(entry.local.name))
             acts.append(blocked(bgs, BGS_BLOCKED) if win.rotation.plan.backgrounds else bgs)
-        acts.append(button("Share…", "", lambda *_: win.show_export(entry)))
+        if not entry.removed:
+            acts.append(button("Share…", "", lambda *_: win.show_export(entry)))
         if entry.repo_url:
             acts.append(button("Open on GitHub", "flat", lambda *_: open_url(entry.repo_url)))
         body.append(acts)
@@ -419,7 +436,9 @@ class ThemePage(Gtk.Box):
         self.swatches = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=12,
                                     min_children_per_line=4, column_spacing=6, row_spacing=6)
         body.append(self.swatches)
-        if entry.local and entry.local.colors:
+        if entry.removed:
+            self.swatches.append(label("Removed from this system. Its colors come back when it's restored.", "dim"))
+        elif entry.local and entry.local.colors:
             self._fill_swatches(entry.local.colors)
         elif entry.community:
             self.swatches.append(label("Loading colors from GitHub…", "dim"))
@@ -433,6 +452,8 @@ class ThemePage(Gtk.Box):
         rows = [("Source", self._source())]
         if entry.repo_url:
             rows.append(("Repository", entry.repo_url))
+        if entry.removed:
+            rows.append(("Comes back from", f"the {win.builtin_pkg or 'Omarchy'} package"))
         if entry.local:
             rows.append(("Folder", str(entry.local.path)))
             n = len(data.backgrounds_for(entry.local))
@@ -449,6 +470,8 @@ class ThemePage(Gtk.Box):
 
     def _source(self):
         e = self.entry
+        if e.removed:
+            return "Built into Omarchy, removed. Restore brings back the original"
         if e.local and e.local.builtin:
             return "Built into Omarchy"
         if e.community and e.local:
@@ -757,6 +780,11 @@ class RotationPage(Gtk.Box):
             self.selected = None
             self._show_detail()
 
+    def drop(self, name):
+        """A theme is being removed: take it out of the rotation."""
+        self.plan.drop(name)
+        self._restyle()
+
     # ---- handlers
     def _on_switch(self, which, on):
         was = self.plan.running()
@@ -846,6 +874,7 @@ class Window(Adw.ApplicationWindow):
         super().__init__(application=app, title=TITLE, default_width=1180, default_height=820)
         self.add_css_class("omaskins")
         self.community, self.local, self.fonts, self.font_pkgs = [], [], [], []
+        self.builtin_pkg, self.removed_builtins = "", []
         self.current_theme = data.current_theme_name()
         self.current_font = ""
         self.font_base = 12
@@ -983,12 +1012,14 @@ class Window(Adw.ApplicationWindow):
         box.append(self.font_stack)
         return box
 
-    def action_button(self, a):
-        css = "danger" if a.label == "Remove" else "primary" if a.label in ("Add", "Apply", "Use") else ""
-        b = button(a.label, css, lambda *_: self.do_action(a))
+    def action_button(self, a, on_done=None):
+        css = "danger" if a.label == "Remove" else "primary" if a.label in ("Add", "Apply", "Use", "Restore") else ""
+        b = button(a.label, css, lambda *_: self.do_action(a, on_done))
         b.set_valign(Gtk.Align.CENTER)
         if a.label == "Apply" and self.rotation.plan.themes:
             return blocked(b, APPLY_BLOCKED)
+        if a.blocked:
+            return blocked(b, a.blocked)
         return b
 
     # ---- data
@@ -1001,15 +1032,17 @@ class Window(Adw.ApplicationWindow):
                 err = None
             except Exception as e:  # noqa: BLE001
                 community, err = [], e
+            pkg = data.builtin_package()
             return (community, err, data.local_themes(), data.installed_fonts(), data.repo_fonts(),
-                    data.current_font())
+                    data.current_font(), pkg, data.removed_builtins(data.shipped_builtins(pkg)))
         bg(work, self._on_loaded)
 
     def _on_loaded(self, res):
         if isinstance(res, Exception):
             self.set_status(f"Couldn't load: {res}")
             return
-        self.community, err, self.local, self.fonts, self.font_pkgs, self.current_font = res
+        (self.community, err, self.local, self.fonts, self.font_pkgs, self.current_font,
+         self.builtin_pkg, self.removed_builtins) = res
         self.current_theme = data.current_theme_name()
         self.rebuild()
         n_local = len(self.local)
@@ -1024,7 +1057,9 @@ class Window(Adw.ApplicationWindow):
     def rebuild(self):
         matched = data.match_installed(self.community, self.local)
         by_local = {t.name: c for c in self.community if (t := matched.get(c.key))}
-        browse = [ThemeEntry(c, matched.get(c.key)) for c in sorted(self.community, key=lambda c: c.name.lower())]
+        browse = [ThemeEntry(c, matched.get(c.key)) for c in self.community]
+        browse += [ThemeEntry(removed=n) for n in self.removed_builtins]  # restorable originals
+        browse.sort(key=lambda e: e.title.lower())
         installed = [ThemeEntry(by_local.get(t.name), t) for t in self.local]
         installed.sort(key=lambda e: (e.local.name != self.current_theme, e.local.builtin, e.title.lower()))
         for name, entries in (("Browse", browse), ("Installed", installed)):
@@ -1128,8 +1163,10 @@ class Window(Adw.ApplicationWindow):
             lb.invalidate_filter()
 
     def show_theme(self, entry):
-        if self.page:
-            self.stack.remove(self.page)
+        # A page still fading out after Back holds the "theme" name; clear it now or the new page won't add.
+        old = self.stack.get_child_by_name("theme")
+        if old:
+            self.stack.remove(old)
         self.page = ThemePage(self, entry)
         self.stack.add_named(self.page, "theme")
         self.stack.set_visible_child_name("theme")
@@ -1138,7 +1175,7 @@ class Window(Adw.ApplicationWindow):
         self.stack.set_visible_child_name("main")
         page, self.page = self.page, None
         if page:
-            GLib.timeout_add(250, lambda: (self.stack.remove(page), False)[1])
+            GLib.timeout_add(250, lambda: (page.get_parent() is self.stack and self.stack.remove(page), False)[1])
 
     def show_backgrounds_for(self, name):
         self.go_back()
@@ -1180,11 +1217,14 @@ class Window(Adw.ApplicationWindow):
         bg(lambda: data.save_to_pictures(bgd.path, pictures), done)
 
     # ---- the prototype's one "action"
-    def do_action(self, a):
+    def do_action(self, a, on_done=None):
         def show():
             self.toasts.add_toast(Adw.Toast(title=f"Prototype, nothing changed. Would run: {a.command}", timeout=6))
+            if on_done:
+                on_done()
         if a.label == "Remove":
-            d = Adw.AlertDialog(heading="Remove?", body=f"This would run:\n\n{a.command}\n\n"
+            note = f"{a.note}\n\n" if a.note else ""
+            d = Adw.AlertDialog(heading="Remove?", body=f"{note}This would run:\n\n{a.command}\n\n"
                                 "(Prototype: nothing will actually be removed.)")
             d.add_response("cancel", "Cancel")
             d.add_response("ok", "Remove")
