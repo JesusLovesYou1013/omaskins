@@ -524,7 +524,8 @@ class ExportDialog(Adw.Dialog):
 ROT_HINTS = {
     (False, False): "Rotation is off. Turn on Themes or Backgrounds above.",
     (True, False): "Backgrounds aren't rotating: your current background stays when the theme changes.",
-    (False, True): "Click a background to add or remove it. Your theme stays; the bright ones take turns.",
+    (False, True): ("Click a background to add or remove it. Your current theme stays, background changes "
+                      "and the bright ones take turns from any theme you like."),
     (True, True): "Click a background to add or remove it. While this theme is on, its bright ones take turns.",
 }
 
@@ -636,7 +637,8 @@ class RotationPage(Gtk.Box):
         self.count = label("", "dim", valign=Gtk.Align.CENTER)
         head.append(self.count)
         right.append(head)
-        self.hint = label("", "dim small", ellipsize=Pango.EllipsizeMode.END)
+        # Always two lines tall, whichever hint is showing, so the grid below never moves.
+        self.hint = label("", "dim small", wrap=True, lines=2, ellipsize=Pango.EllipsizeMode.END, yalign=0)
         right.append(self.hint)
         self.grid = flow()
         self.grid.add_css_class("rot-grid")
@@ -806,6 +808,7 @@ class RotationPage(Gtk.Box):
     def _show_detail(self):
         p, name = self.plan, self.selected
         self.hint.set_text(ROT_HINTS[(p.themes, p.backgrounds)])
+        self.hint.set_size_request(-1, self.hint.create_pango_layout("x\nx").get_pixel_size()[1])
         self.grid.set_sensitive(p.backgrounds)
         self.grid.remove_all()
         t = self._theme(name) if name else None
