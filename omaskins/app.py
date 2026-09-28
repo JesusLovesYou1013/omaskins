@@ -581,8 +581,6 @@ class ThemePage(Gtk.Box):
         if entry.local:
             bgs = button("Backgrounds", "", lambda *_: win.show_backgrounds_for(entry.local.name))
             acts.append(blocked(bgs, BGS_BLOCKED) if win.rotation.plan.backgrounds else bgs)
-        if not entry.removed:
-            acts.append(button("Share…", "", lambda *_: win.show_export(entry)))
         if entry.repo_url:
             acts.append(button("Open on GitHub", "flat", lambda *_: open_url(entry.repo_url)))
         body.append(acts)
@@ -659,20 +657,19 @@ class ThemePage(Gtk.Box):
 # --------------------------------------------------------------------------- export dialog
 
 class ExportDialog(Adw.Dialog):
-    def __init__(self, win, entry=None):
+    """The whole setup (top-right Share…). A single theme needs no zip: it's on omarchy.org by name."""
+
+    def __init__(self, win):
         super().__init__(title="Share your setup", content_width=620)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_start=18, margin_end=18,
                       margin_top=18, margin_bottom=18)
-        t = entry.local if entry else win.current_local()
-        community = win.community
+        t = win.current_local()
         cur_bg = None
-        if t and not entry:
+        if t:
             cur_bg = next((b for b in data.backgrounds_for(t, win.current_theme, data.current_background())
                            if b.current), None)
-        font = None if entry else next((f for f in win.fonts if f.current), None)
-        items = data.export_plan(t, community, cur_bg, font) if t else []
-        if entry and not t and entry.community:  # sharing a theme you haven't installed: just its link
-            items = [data.ExportItem("Theme", entry.title, "link", f"{entry.community.repo_url}.git")]
+        font = next((f for f in win.fonts if f.current), None)
+        items = data.export_plan(t, win.community, cur_bg, font) if t else []
 
         box.append(label("The zip would hold:" if items else "Nothing to share.", "section-title"))
         lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
@@ -1076,7 +1073,7 @@ class Window(Adw.ApplicationWindow):
         self.search = Gtk.SearchEntry(placeholder_text="Search themes…", valign=Gtk.Align.CENTER)
         self.search.connect("search-changed", self._on_search)
         bar.append(self.search)
-        share = button("Share…", "", lambda *_: self.show_export(None), tooltip="Export your current setup as a zip")
+        share = button("Share…", "", lambda *_: self.show_export(), tooltip="Export your current setup as a zip")
         share.set_valign(Gtk.Align.CENTER)
         share.set_margin_start(8)
         bar.append(share)
@@ -1379,8 +1376,8 @@ class Window(Adw.ApplicationWindow):
                 break
             row = row.get_next_sibling()
 
-    def show_export(self, entry):
-        ExportDialog(self, entry).present(self)
+    def show_export(self):
+        ExportDialog(self).present(self)
 
     def _on_key(self, _ctl, keyval, _code, state):
         if self.page and self.stack.get_visible_child_name() == "theme" and keyval in (Gdk.KEY_Left, Gdk.KEY_Right):

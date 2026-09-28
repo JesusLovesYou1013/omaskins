@@ -32,7 +32,7 @@ def steps(win):
     def backgrounds(): (win.go_back(), win.main_tabs["Backgrounds"].set_active(True))
     def fonts_browse(): (win.main_tabs["Fonts"].set_active(True), win.font_sub_btns["Browse"].set_active(True))
     def fonts_installed(): win.font_sub_btns["Installed"].set_active(True)
-    def share(): win.show_export(None)
+    def share(): win.show_export()
     r = win.rotation
 
     def rot(name, themes, bgs, dd=False):
