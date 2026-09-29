@@ -182,7 +182,7 @@ class Actions(unittest.TestCase):
         url = "https://github.com/guilhermetk/omarchy-all-hallows-eve-theme"
         tmp = data.PARTIAL_THEMES / "all-hallows-eve"
         self.assertEqual(add.steps, (("clear_partial", tmp), ("run", ["omarchy-git-url-check", url]),
-                                     ("run", ["git", "clone", "--", url, str(tmp)]),
+                                     ("run", ["git", "clone", "--progress", "--", url, str(tmp)]),
                                      ("move_in", tmp, data.USER_THEMES / "all-hallows-eve")),
                          "omarchy-theme-install's check + clone, into a holding folder, without applying")
         cur = data.theme_actions(self.local["tokyo-night"], None, "tokyo-night")
@@ -212,8 +212,18 @@ class Actions(unittest.TestCase):
         new = data.FontPackage("ttf-firacode-nerd", "1", "", False, "FiraCode Nerd Font")
         acts = data.font_actions(package=new, current_package=pkg)
         self.assertEqual(self.labels(acts), ["Add", "Add and use"])
-        self.assertEqual(acts[1].command,
-                         "omarchy-install-font 'FiraCode Nerd Font' ttf-firacode-nerd 'FiraCode Nerd Font'")
+        term = "echo 'Installing ttf-firacode-nerd...'; omarchy-pkg-add ttf-firacode-nerd"
+        self.assertEqual(acts[1].steps, (("terminal", term), ("wait_package", "ttf-firacode-nerd", True, term),
+                                         ("remember_text_size",), ("use_font", "ttf-firacode-nerd", "FiraCode Nerd Font")))
+        self.assertNotIn("use_font", [st[0] for st in acts[0].steps], "plain Add doesn't switch the font")
+        self.assertTrue(all(a.password for a in acts))
+        rm = data.font_actions(font=other, current_package=pkg)[1]
+        self.assertEqual(rm.steps[0], ("terminal", "echo 'Removing ttf-firacode-nerd...'; omarchy-pkg-drop ttf-firacode-nerd"))
+        self.assertEqual(data.font_actions(font=other, current_package=pkg)[0].steps,
+                         (("remember_text_size",), ("run", ["omarchy-font-set", "FiraCode Nerd Font"]),
+                          ("font_size", "FiraCode Nerd Font")))
+        odd = data.FontPackage("ttf-x-nerd;rm", "1", "", False)
+        self.assertEqual(data.font_actions(package=odd), [], "a package name a shell could misread gets no buttons")
 
     def test_font_picks_from_menu(self):
         self.assertEqual(data.omarchy_font_picks(),
@@ -508,20 +518,101 @@ class CommandRunner(unittest.TestCase):
         self.run = run
 
     def test_allow_list_is_exactly_batch_1(self):
-        self.assertEqual(sorted(self.run.ALLOWED), ["git", "nautilus", "omarchy-git-url-check", "omarchy-theme-bg-set",
-                                                    "omarchy-theme-remove", "omarchy-theme-set"])
+        self.assertEqual(sorted(self.run.ALLOWED), ["git", "nautilus", "omarchy-font-set", "omarchy-git-url-check",
+                                                    "omarchy-launch-floating-terminal-with-presentation",
+                                                    "omarchy-notification-send", "omarchy-theme-bg-set", "omarchy-theme-set",
+                                                    "pkill"])
         for bad in (["omarchy-theme-install", "x"], ["sudo", "rm", "-rf", "/"], ["pacman", "-S", "x"], ["sh", "-c", "x"]):
             with self.assertRaises(self.run.NotAllowed, msg=bad):
                 self.run.check(bad)
 
     def test_git_may_only_clone_into_the_holding_folder(self):
-        ok = ["git", "clone", "--", "https://github.com/a/b", str(data.PARTIAL_THEMES / "new-one")]
+        ok = ["git", "clone", "--progress", "--", "https://github.com/a/b", str(data.PARTIAL_THEMES / "new-one")]
         self.run.check(ok)
         for bad in (["git", "push"], ["git", "clone", "https://x", str(data.PARTIAL_THEMES / "y")],
-                    ["git", "clone", "--", "https://x", "/tmp/elsewhere"],
-                    ["git", "clone", "--", "https://x", str(data.USER_THEMES / "y")]):   # straight into themes
+                    ["git", "clone", "--", "https://x", str(data.PARTIAL_THEMES / "y")],   # the old form
+                    ["git", "clone", "--progress", "--", "https://x", "/tmp/elsewhere"],
+                    ["git", "clone", "--progress", "--", "https://x", str(data.USER_THEMES / "y")]):  # straight into themes
             with self.assertRaises(self.run.NotAllowed, msg=bad):
                 self.run.check(bad)
+
+    def test_clone_progress_lines_become_one_rising_percentage(self):
+        cp = self.run.clone_percent
+        self.assertEqual(cp("remote: Counting objects: 100% (40/40), done."), 2)
+        self.assertEqual(cp("Receiving objects:   0% (0/40)"), 5)
+        self.assertEqual(cp("Receiving objects:  50% (20/40), 1.2 MiB | 2.0 MiB/s"), 47)
+        self.assertEqual(cp("Resolving deltas: 100% (3/3), done."), 96)
+        self.assertEqual(cp("Updating files: 100% (12/12), done."), 100)
+        self.assertIsNone(cp("Cloning into '/x'..."))
+        self.assertIsNone(cp("fatal: repository not found"))
+
+    def test_ascii_bar_never_changes_width(self):
+        widths = {len(data.ascii_bar(p)) for p in (-5, 0, 1, 9, 50, 99, 100, 250)}
+        self.assertEqual(len(widths), 1)
+        self.assertEqual(data.ascii_bar(0), "[" + "." * 24 + "]   0%")
+        self.assertEqual(data.ascii_bar(100), "[" + "#" * 24 + "] 100%")
+        self.assertEqual(data.ascii_bar(50), "[" + "#" * 12 + "." * 12 + "]  50%")
+
+    def test_a_real_clone_feeds_the_bar(self):
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        src = HOME / "src-repo"
+        src.mkdir(parents=True)
+        (src / "colors.toml").write_text("accent = '#ffffff'\n")
+        env = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t",
+                   GIT_COMMITTER_EMAIL="t@t")
+        for cmd in (["git", "init", "-q"], ["git", "add", "."], ["git", "commit", "-qm", "x"]):
+            subprocess.run(cmd, cwd=src, env=env, check=True)
+        tmp, dest = data.PARTIAL_THEMES / "src-repo", data.USER_THEMES / "src-repo"
+        seen = []
+        self.run.perform((("clear_partial", tmp), ("run", ["git", "clone", "--progress", "--", src.as_uri(), str(tmp)]),
+                          ("move_in", tmp, dest)), progress=seen.append)
+        self.assertTrue((dest / "colors.toml").is_file())
+        self.assertTrue(seen, "no progress reported")
+        self.assertEqual(seen, sorted(set(seen)))   # only ever goes up
+        self.assertEqual(seen[-1], 100)
+
+    def test_removing_a_theme_counts_down_to_zero(self):
+        import time
+        folder = data.USER_THEMES / "doomed"
+        (folder / "backgrounds").mkdir(parents=True)
+        outside = HOME / "keep-me"
+        outside.mkdir(parents=True)
+        (outside / "precious.png").write_bytes(b"x" * 500)
+        for i in range(8):
+            (folder / "backgrounds" / f"{i}.png").write_bytes(b"x" * 1000 * (i + 1))
+        (folder / "colors.toml").write_text("accent = '#fff'\n")
+        (folder / "link-out").symlink_to(outside)       # must go, without touching what it points to
+        gone = data.REMOVING_THEMES / "doomed"
+        seen, t0 = [], time.monotonic()
+        self.run.take_out(folder, gone)
+        self.assertFalse(folder.exists(), "gone from themes/ in one step, before any deleting")
+        self.run.delete_counting(gone, seen.append, at_least=0.3)
+        self.assertGreaterEqual(time.monotonic() - t0, 0.25)
+        self.assertFalse(gone.exists())
+        self.assertTrue((outside / "precious.png").is_file())
+        self.assertEqual(seen, sorted(set(seen), reverse=True))   # only ever goes down
+        self.assertEqual(seen[-1], 0)
+
+    def test_removal_only_takes_your_own_theme_folders(self):
+        (data.USER_THEMES / "mine").mkdir(parents=True)
+        for folder, gone in ((HOME / "Documents", data.REMOVING_THEMES / "Documents"),
+                             (data.USER_THEMES / "mine", data.REMOVING_THEMES / "other-name"),
+                             (data.USER_THEMES / "mine", HOME / "mine"),
+                             (data.USER_THEMES / ".hidden", data.REMOVING_THEMES / ".hidden")):
+            with self.assertRaises(self.run.NotAllowed, msg=(folder, gone)):
+                self.run.take_out(folder, gone)
+        with self.assertRaises(self.run.NotAllowed):
+            self.run.delete_counting(HOME)
+        self.run.check(["omarchy-notification-send", "Theme removed", "mine"])
+        with self.assertRaises(self.run.NotAllowed):
+            self.run.check(["omarchy-notification-send", "anything else", "mine"])
+
+    def test_remove_action_is_the_countdown(self):
+        aura = next(t for t in data.local_themes() if t.name == "aura")
+        a = [x for x in data.theme_actions(aura, None, "tokyo-night") if x.label == "Remove"][0]
+        self.assertEqual(a.bar, 100)
+        self.assertEqual([st[0] for st in a.steps], ["take_out", "delete_counting", "run"])
 
     def test_shell_strings_and_odd_input_are_refused(self):
         for bad in ("omarchy-theme-set nord", "", [], ["omarchy-theme-set", 5], None):
@@ -554,7 +645,7 @@ class CommandRunner(unittest.TestCase):
     def test_a_refused_url_stops_before_the_clone(self):
         with self.assertRaises(self.run.StepFailed):
             self.run.perform([("run", ["omarchy-git-url-check", "--upload-pack=evil"]),
-                              ("run", ["git", "clone", "--", "x", str(data.USER_THEMES / "never")])])
+                              ("run", ["git", "clone", "--progress", "--", "x", str(data.USER_THEMES / "never")])])
         self.assertFalse((data.USER_THEMES / "never").exists())
 
     def test_a_theme_only_appears_once_its_download_is_complete(self):
@@ -600,11 +691,177 @@ class CommandRunner(unittest.TestCase):
                 if st[0] in ("run", "launch"):
                     self.run.check(st[1])
 
-    def test_password_actions_are_not_live_yet(self):
-        pkg = data.FontPackage("ttf-x-nerd", "1", "x", installed=True)
-        for a in (data.builtin_remove_action("nord"), data.builtin_restore_action("nord", "omarchy"),
-                  *data.font_actions(package=pkg)):
+    def test_builtin_theme_actions_are_not_live_yet(self):
+        for a in (data.builtin_remove_action("nord"), data.builtin_restore_action("nord", "omarchy")):
             self.assertEqual(a.steps, (), f"{a.label} belongs to a later batch")
+
+    def test_the_terminal_only_adds_or_drops_one_font_package(self):
+        t = "omarchy-launch-floating-terminal-with-presentation"
+        self.run.check([t, data.font_terminal_command("add", "ttf-x-nerd")])
+        self.run.check([t, data.font_terminal_command("drop", "otf-y-nerd")])
+        for bad in ("echo 'Installing ttf-x-nerd...'; omarchy-pkg-add ttf-other-nerd",
+                    "echo 'Installing ttf-x-nerd...'; omarchy-pkg-drop ttf-x-nerd",
+                    "echo 'Installing ttf-x-nerd...'; omarchy-pkg-add ttf-x-nerd; rm -rf ~",
+                    "echo 'Installing firefox...'; omarchy-pkg-add firefox",
+                    "omarchy-pkg-add ttf-x-nerd", "bash"):
+            with self.assertRaises(self.run.NotAllowed, msg=bad):
+                self.run.check([t, bad])
+        self.run.check(["omarchy-font-set", "Some Font"])
+        with self.assertRaises(self.run.NotAllowed):
+            self.run.check(["omarchy-font-set", "a", "b"])
+
+    def test_waiting_for_the_terminal(self):
+        term = data.font_terminal_command("add", "ttf-x-nerd")
+        worker = "/bin/bash /usr/share/omarchy/bin/omarchy-pkg-add ttf-x-nerd"
+        shell = f"bash -c omarchy-show-logo; {term}; if (( $? != 130 )); then omarchy-show-done; fi"
+        # pacman running, then the package is in but the script is still finishing (font cache), then done
+        states = iter([(False, [shell, worker]), (True, [shell, worker]), (True, [shell])])
+        cur, seen = [None], []
+        def cmdlines():
+            cur[0] = next(states)
+            seen.append(cur[0])
+            return cur[0][1]
+        self.run.wait_package("ttf-x-nerd", True, term, poll=0, installed=lambda _: cur[0][0], cmdlines=cmdlines)
+        self.assertEqual(len(seen), 3, "waited for the script to finish, not just for pacman")
+        # terminal closed without installing (wrong password / closed): a clear failure, not a hang
+        with self.assertRaises(self.run.StepFailed):
+            self.run.wait_package("ttf-x-nerd", True, term, poll=0, grace=0, installed=lambda _: False, cmdlines=lambda: [])
+        # removal: done once pacman no longer has it and the drop script has exited
+        self.run.wait_package("ttf-x-nerd", False, data.font_terminal_command("drop", "ttf-x-nerd"), poll=0,
+                              installed=lambda _: False, cmdlines=lambda: ["bash -c ... omarchy-show-done"])
+
+    def test_a_font_that_isnt_monospace_is_called_out(self):
+        mono = lambda: [data.Font("JetBrainsMono Nerd Font", "ttf-jetbrains-mono-nerd")]
+        fams = lambda pkgs: {"ttf-ubuntu-nerd": ["Ubuntu Nerd Font", "Ubuntu Nerd Font Propo"]}
+        note = self.run.check_mono("ttf-ubuntu-nerd", fonts=mono, families=fams)
+        self.assertIn("isn't a monospace font", note)
+        self.assertIsNone(self.run.check_mono("ttf-jetbrains-mono-nerd", fonts=mono, families=fams))
+        add = data.font_actions(package=data.FontPackage("ttf-ubuntu-nerd", "1", "", False))[0]
+        self.assertEqual(add.steps[-1], ("check_mono", "ttf-ubuntu-nerd"), "plain Add checks what landed")
+        # the note travels back from perform() so the window can show it instead of "added"
+        real = self.run.check_mono
+        self.run.check_mono = lambda pkg: f"{pkg} note"
+        try:
+            self.assertEqual(self.run.perform((("check_mono", "ttf-ubuntu-nerd"),)), "ttf-ubuntu-nerd note")
+        finally:
+            self.run.check_mono = real
+
+    def test_icon_twins_are_folded_away(self):
+        F = data.Font
+        fonts = [F("UbuntuMono Nerd Font", "u"), F("UbuntuMono Nerd Font Mono", "u"),
+                 F("JetBrainsMono Nerd Font", "j"), F("JetBrainsMono Nerd Font Mono", "j", True),
+                 F("Adwaita Mono", ""), F("Lonely Nerd Font Mono", "l")]
+        self.assertEqual([f.family for f in data.without_icon_twins(fonts)],
+                         ["UbuntuMono Nerd Font", "JetBrainsMono Nerd Font", "JetBrainsMono Nerd Font Mono",
+                          "Adwaita Mono", "Lonely Nerd Font Mono"])
+
+    def test_browse_offers_monospace_font_packages_only(self):
+        ok = data.browsable_font_package
+        for pkg in ("ttf-arimo-nerd", "ttf-tinos-nerd", "ttf-ubuntu-nerd", "ttf-nerd-fonts-symbols",
+                    "ttf-nerd-fonts-symbols-mono", "ttf-nerd-fonts-symbols-common"):
+            self.assertFalse(ok(pkg), pkg)
+        for pkg in ("ttf-ubuntu-mono-nerd", "ttf-noto-nerd", "ttf-jetbrains-mono-nerd", "otf-overpass-nerd"):
+            self.assertTrue(ok(pkg), pkg)
+        # one found out after an install is remembered (in the app's cache) and hidden from then on
+        data.learn_not_mono("ttf-newthing-nerd")
+        data.learn_not_mono("ttf-newthing-nerd")
+        self.assertEqual(data.learned_not_mono(), {"ttf-newthing-nerd"})
+        self.assertFalse(ok("ttf-newthing-nerd", data.learned_not_mono()))
+        self.assertTrue(str(data.LEARNED_NOT_MONO).startswith(str(HOME)), "sandboxed cache")
+
+    def test_matched_sizes_follow_omarchys_own_anchors(self):
+        self.assertEqual(data.sizes_for(12, 1.0), (12, 9))     # Omarchy's defaults
+        self.assertEqual(data.sizes_for(11, 1.0), (11, 8))     # the owner's 11 px -> 8 pt, as Omarchy rounds it
+        self.assertEqual(data.sizes_for(11, data.font_scale(464)), (13, 9.5))   # Ubuntu Mono
+        self.assertEqual(data.font_scale(550), 1.0)
+        self.assertEqual(data.font_scale(100), data.SCALE_MAX)
+        self.assertEqual(data.font_scale(9999), data.SCALE_MIN)
+        self.assertEqual(data.font_scale(None), 1.0)
+
+    def _configs(self):
+        c = HOME / ".config"
+        files = {"alacritty/alacritty.toml": "[font]\nnormal = { family = \"JetBrainsMono Nerd Font\" }\nsize = 8\n",
+                 "kitty/kitty.conf": "include x.conf\nfont_family JetBrainsMono Nerd Font\nfont_size 8.0\n",
+                 "ghostty/config": "font-family = \"JetBrainsMono Nerd Font\"\nfont-size = 8\n",
+                 "foot/foot.ini": "[main]\nfont=JetBrainsMono Nerd Font:size=9\n",
+                 "omarchy/shell.toml": "[bar]\nx = 1\n\n[font]\nbase-size = 11\n# keep me\n"}
+        for rel, text in files.items():
+            (c / rel).parent.mkdir(parents=True, exist_ok=True)
+            (c / rel).write_text(text)
+        return lambda rel: (c / rel).read_text()
+
+    def test_switching_fonts_matches_sizes_and_comes_back_exactly(self):
+        read = self._configs()
+        heights = {"UbuntuMono Nerd Font": 464, "JetBrainsMono Nerd Font": 550}
+        real_x, real_run, signals = data.font_x_height, self.run.run, []
+        data.font_x_height = heights.get
+        self.run.run = lambda argv, timeout=300: (signals.append(argv), subprocess.CompletedProcess(argv, 0, "", ""))[1]
+        try:
+            self.run.remember_text_size()
+            self.run.font_size("UbuntuMono Nerd Font")
+            self.assertIn("size = 9.5", read("alacritty/alacritty.toml"))
+            self.assertIn("font_size 9.5", read("kitty/kitty.conf"))
+            self.assertIn("font-size = 9.5", read("ghostty/config"))
+            self.assertIn("font=JetBrainsMono Nerd Font:size=9.5", read("foot/foot.ini"))
+            self.assertEqual(read("omarchy/shell.toml"), "[bar]\nx = 1\n\n[font]\nbase-size = 13\n# keep me\n")
+            self.assertIn(["pkill", "-USR1", "kitty"], signals)
+            # back to JetBrains: exactly Omarchy's own sizes for 11 px (foot too, which font-set had left at 9)
+            self.run.remember_text_size()
+            self.run.font_size("JetBrainsMono Nerd Font")
+            self.assertIn("size = 8\n", read("alacritty/alacritty.toml"))
+            self.assertIn("font_size 8.0", read("kitty/kitty.conf"))
+            self.assertIn(":size=8\n", read("foot/foot.ini"))
+            self.assertIn("base-size = 11\n", read("omarchy/shell.toml"))
+            # the owner changes the text size in Omarchy's panel (plain 14): that becomes the base
+            self.run._set_shell_base_size(14)
+            self.run.remember_text_size()
+            self.run.font_size("UbuntuMono Nerd Font")
+            self.assertIn("base-size = 17\n", read("omarchy/shell.toml"))    # 14 * 1.185
+            self.assertIn("size = 13\n", read("alacritty/alacritty.toml"))   # Omarchy: 14 px -> 11 pt; * 1.185 = 13
+        finally:
+            data.font_x_height, self.run.run = real_x, real_run
+
+    def test_shell_toml_is_created_or_extended_like_omarchy_does(self):
+        path = HOME / ".config/omarchy/shell.toml"
+        self.assertEqual(self.run.shell_base_size(), 12)
+        self.run._set_shell_base_size(13)
+        self.assertEqual(path.read_text(), "[font]\nbase-size = 13\n")
+        path.write_text("[bar]\ny = 2\n")
+        self.run._set_shell_base_size(10)
+        self.assertEqual(path.read_text(), "[bar]\ny = 2\n\n[font]\nbase-size = 10\n")
+        self.assertEqual(self.run.shell_base_size(), 10)
+
+    def test_only_the_two_reload_nudges_may_be_sent(self):
+        self.run.check(["pkill", "-USR1", "kitty"])
+        self.run.check(["pkill", "-SIGUSR2", "ghostty"])
+        for bad in (["pkill", "kitty"], ["pkill", "-9", "Hyprland"], ["pkill", "-USR1", "foot"]):
+            with self.assertRaises(self.run.NotAllowed, msg=bad):
+                self.run.check(bad)
+
+    def test_add_and_use_picks_the_family(self):
+        ran = []
+        real, real_size = self.run.run, self.run.font_size
+        self.run.run = lambda argv, timeout=300: (ran.append(argv), subprocess.CompletedProcess(argv, 0, "", ""))[1]
+        self.run.font_size = lambda family: ran.append(["font_size", family])
+        try:
+            fonts = lambda: [data.Font("Iosevka Nerd Font Mono", "ttf-iosevka-nerd"), data.Font("Other", "x")]
+            self.run.use_font("ttf-iosevka-nerd", "", fonts=fonts)
+            self.run.use_font("ttf-firacode-nerd", "FiraCode Nerd Font", fc_list=lambda: "/f.ttf: FiraCode Nerd Font:style=Regular")
+            both = "x: Iosevka Nerd Font:style=Regular\ny: Iosevka Nerd Font Mono:style=Regular"
+            # Iosevka's plain family isn't monospace (only its Mono twin is), so Omarchy's pick stands
+            self.run.use_font("ttf-iosevka-nerd", "Iosevka Nerd Font Mono", fc_list=lambda: both,
+                              fonts=lambda: [data.Font("Iosevka Nerd Font Mono", "ttf-iosevka-nerd")])
+            # a font whose plain family IS monospace gets the plain name
+            self.run.use_font("ttf-x-nerd", "X Nerd Font Mono", fc_list=lambda: "X Nerd Font Mono X Nerd Font",
+                              fonts=lambda: [data.Font("X Nerd Font", "ttf-x-nerd"), data.Font("X Nerd Font Mono", "ttf-x-nerd")])
+            with self.assertRaises(self.run.StepFailed):
+                self.run.use_font("ttf-none-nerd", "", wait=0, fonts=lambda: [])
+        finally:
+            self.run.run, self.run.font_size = real, real_size
+        self.assertEqual([r for r in ran if r[0] != "font_size"],
+                         [["omarchy-font-set", "Iosevka Nerd Font Mono"], ["omarchy-font-set", "FiraCode Nerd Font"],
+                          ["omarchy-font-set", "Iosevka Nerd Font Mono"], ["omarchy-font-set", "X Nerd Font"]])
+        self.assertEqual(ran[1], ["font_size", "Iosevka Nerd Font Mono"], "every switch is followed by its size")
 
 
 class Thumbnails(unittest.TestCase):

@@ -25,7 +25,7 @@ APP_ID = "io.github.jesuslovesyou1013.omaskins"
 TITLE = "OmaSkins Manager"
 CHECK = "\U000f012c"  # nf-md-check — a plain mark, never a checkbox (same as OmaPlugs)
 CARD_W, CARD_H = 272, 153  # 16:9, the shape of omarchy.org screenshots
-PROTOTYPE_NOTE = ("PARTLY LIVE: theme and background actions really run. Fonts, rounded corners, removing "
+PROTOTYPE_NOTE = ("PARTLY LIVE: theme, background and font actions really run. Rounded corners, removing "
                   "built-in themes, rotation and Share still only show what they would do.")
 
 
@@ -1039,6 +1039,7 @@ class Window(Adw.ApplicationWindow):
         super().__init__(application=app, title=TITLE, default_width=1180, default_height=820)
         self.add_css_class("omaskins")
         self.community, self.local, self.fonts, self.font_pkgs = [], [], [], []
+        self.not_mono = {}  # installed font packages with no monospace face: {package: [families]}
         self.builtin_pkg, self.removed_builtins = "", []
         self.current_theme = data.current_theme_name()
         self._last_bg, self._theme_changed_at = data.current_background(), 0
@@ -1250,7 +1251,10 @@ class Window(Adw.ApplicationWindow):
             except Exception as e:  # noqa: BLE001
                 community, err = [], e
             pkg = data.builtin_package()
-            return (community, err, data.local_themes(), data.installed_fonts(), data.repo_fonts(),
+            fonts, font_pkgs = data.installed_fonts(), data.repo_fonts()
+            mono = {f.package for f in fonts}
+            other = data.package_families([p.package for p in font_pkgs if p.installed and p.package not in mono])
+            return (community, err, data.local_themes(), fonts, font_pkgs, other,
                     data.current_font(), pkg, data.removed_builtins(data.shipped_builtins(pkg)))
         bg(work, self._on_loaded)
 
@@ -1258,12 +1262,12 @@ class Window(Adw.ApplicationWindow):
         if isinstance(res, Exception):
             self.set_status(f"Couldn't load: {res}")
             return
-        (self.community, err, self.local, self.fonts, self.font_pkgs, self.current_font,
+        (self.community, err, self.local, self.fonts, self.font_pkgs, self.not_mono, self.current_font,
          self.builtin_pkg, self.removed_builtins) = res
         self.current_theme = data.current_theme_name()
         self.rebuild()
         n_local = len(self.local)
-        msg = f"{len(self.community)} community themes · {n_local} installed · {len(self.fonts)} fonts"
+        msg = f"{len(self.community)} community themes · {n_local} installed · {len(data.without_icon_twins(self.fonts))} fonts"
         if err:
             msg = f"omarchy.org unreachable ({err}); showing installed only · " + msg
         self.set_status(msg)
@@ -1328,20 +1332,25 @@ class Window(Adw.ApplicationWindow):
 
     def _rebuild_fonts(self):
         cur_pkg = next((f.package for f in self.fonts if f.current), "")
+        fonts = data.without_icon_twins(self.fonts)
         fams = {}
-        for f in self.fonts:
+        for f in fonts:
             if f.package:
                 fams.setdefault(f.package, []).append(f.family)
         inst, brow = self.font_lists["Installed"], self.font_lists["Browse"]
         inst.remove_all()
         brow.remove_all()
-        for f in sorted(self.fonts, key=lambda f: (not f.current, f.family.lower())):
+        for f in sorted(fonts, key=lambda f: (not f.current, f.family.lower())):
             inst.append(FontRow(self, f, cur_pkg))
+        learned = data.learned_not_mono() | set(self.not_mono)
         pkgs = sorted(self.font_pkgs, key=lambda p: (not p.omarchy_pick, not p.installed, p.package))
+        shown = 0
         for p in pkgs:
-            brow.append(FontPackageRow(self, p, fams.get(p.package, []), cur_pkg))
-        self.font_counts["Installed"].set_text(str(len(self.fonts)))
-        self.font_counts["Browse"].set_text(str(len(self.font_pkgs)))
+            if data.browsable_font_package(p.package, learned):  # monospace fonts only, never anything else
+                brow.append(FontPackageRow(self, p, fams.get(p.package, []), cur_pkg))
+                shown += 1
+        self.font_counts["Installed"].set_text(str(len(fonts)))
+        self.font_counts["Browse"].set_text(str(shown))
 
     # ---- navigation
     def _on_main_tab(self, name):
@@ -1506,8 +1515,11 @@ class Window(Adw.ApplicationWindow):
                 on_done()
         if a.password:  # always asked, even from right-click: say why a password will come up
             d = Adw.AlertDialog(heading="This one needs your password",
-                                body=f"{a.password}\n\n{a.note + chr(10) * 2 if a.note else ''}This would run:\n\n"
-                                     f"{a.command}\n\n(Prototype: nothing will actually change.)")
+                                body=f"{a.password}\n\n{a.note + chr(10) * 2 if a.note else ''}"
+                                     f"This {'will' if a.steps else 'would'} run:\n\n{a.command}"
+                                     + ("\n\nA terminal opens for your password; OmaSkins carries on once it's done."
+                                        if any(st[0] == "terminal" for st in a.steps)
+                                        else "" if a.steps else "\n\n(Prototype: nothing will actually change.)"))
             d.add_response("cancel", "Cancel")
             d.add_response("ok", a.label)
             d.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE if a.label == "Remove"
@@ -1536,39 +1548,57 @@ class Window(Adw.ApplicationWindow):
         if a.command in self._running:
             return  # a double-click shouldn't run it twice
         self._running.add(a.command)
-        busy = None
+        busy = progress = None
         if a.busy:
             busy = Adw.Toast(title=a.busy, timeout=0)
+            if a.bar >= 0:
+                # Adding or removing a theme: an ASCII bar under the title, in the same toast, fixed width.
+                box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+                box.append(Gtk.Label(label=a.busy, xalign=0))
+                bar = Gtk.Label(label=data.ascii_bar(a.bar), xalign=0)
+                bar.add_css_class("mono")
+                box.append(bar)
+                busy.set_custom_title(box)
+                progress = lambda pct: GLib.idle_add(lambda: (bar.set_label(data.ascii_bar(pct)), False)[1])
             self.toasts.add_toast(busy)
         if any(st[0] == "run" and st[1][0] in ("omarchy-theme-set", "omarchy-theme-bg-set") for st in a.steps):
             # OmaSkins' own change: not a manual pick, so it mustn't reset the rotation timers.
             self._own_change_until = GLib.get_monotonic_time() + 15_000_000
 
-        def finished(err):
+        def finished(result):
             self._running.discard(a.command)
             if busy:
                 busy.dismiss()
-            if err:
-                self.toasts.add_toast(Adw.Toast(title=f"{a.label} didn't work: {err}", timeout=8))
+            if isinstance(result, Exception):
+                self.toasts.add_toast(Adw.Toast(title=f"{a.label} didn't work: {result}", timeout=8))
                 return
-            if a.done or a.label not in ("Open folder",):
+            if result:  # a step's note replaces the usual message (e.g. a font that isn't monospace)
+                t = Adw.Toast(title=result, timeout=0)
+                pkg = next((st[1] for st in a.steps if st[0] == "check_mono"), None)
+                if pkg:  # it's hidden everywhere now, so offer to take it straight back out
+                    t.set_button_label("Remove")
+                    t.connect("button-clicked", lambda *_: self.do_action(data._remove_font_package(pkg)))
+                self.toasts.add_toast(t)
+            elif a.done or a.label not in ("Open folder",):
                 self.toasts.add_toast(Adw.Toast(title=a.done or f"{a.label}: done.", timeout=4))
             if on_done:
                 on_done()
             self._pending.add("local")  # lists, counts and ✓ marks follow the change, in one refresh
-        def finished_then_settle(err):
-            finished(err)
+            if any(st[0] == "use_font" or st[0] == "run" and st[1][0] == "omarchy-font-set" for st in a.steps):
+                self._pending.add("state")  # the window's own lettering follows the new font
+        def finished_then_settle(result):
+            finished(result)
             # Omarchy's last touches (background link, caches) land just after; refresh once they have.
             self._quiet_until = GLib.get_monotonic_time() + 1_500_000
             self._debounce("settle", 1600, self._settle)
-        bg(lambda: run.perform(a.steps), finished_then_settle)
+        bg(lambda: run.perform(a.steps, progress), finished_then_settle)
 
     def _settle(self):
         """The single refresh after OmaSkins' own action(s): recolour once, rebuild once."""
         if self._running:
             return  # another action is still going; its own settle will do it
         pending, self._pending = self._pending, set()
-        if "state" in pending:
+        if "state" in pending or "font" in pending:
             self.reload_theme()
             self.current_theme, self._last_bg = data.current_theme_name(), data.current_background()
         if pending:
@@ -1625,19 +1655,23 @@ class Window(Adw.ApplicationWindow):
         if msg:
             self.toasts.add_toast(Adw.Toast(title=f"Prototype: {msg}", timeout=6))
 
-    def _watch(self, path, cb):
+    def _watch(self, path, cb, only=None):
+        """Watch a folder; `only` = react to that one file name in it."""
         try:
             mon = Gio.File.new_for_path(str(path)).monitor_directory(Gio.FileMonitorFlags.NONE, None)
         except GLib.Error:
             return
-        mon.connect("changed", lambda *_: cb())
+        mon.connect("changed", lambda _m, f, *_: (only is None or f.get_basename() == only) and cb())
         self._monitors.append(mon)
 
     def _watch_files(self):
         self._watch(data.STATE_DIR, lambda: self._on_files_changed("state"))
         self._watch(data.USER_THEMES, lambda: self._on_files_changed("local"))
         self._watch(data.USER_BACKGROUNDS, lambda: self._on_files_changed("local"))
-        self._watch(Path.home() / ".config/fontconfig", lambda: self._on_files_changed("local"))
+        # The font (Omarchy's menu, or OmaSkins) and the text size (the widget's slider writes
+        # [font] base-size here, the same value the bar sizes itself from): the window follows live.
+        self._watch(Path.home() / ".config/fontconfig", lambda: self._on_files_changed("font"))
+        self._watch(Path.home() / ".config/omarchy", lambda: self._on_files_changed("font"), only="shell.toml")
 
     def _on_files_changed(self, kind):
         """Omarchy's files changed. While OmaSkins' own action is still running (and briefly after),
@@ -1647,8 +1681,17 @@ class Window(Adw.ApplicationWindow):
             self._pending.add(kind)
         elif kind == "state":
             self._state_changed()
+        elif kind == "font":
+            self._debounce("font", 300, self._font_changed)  # a dragged slider writes many times
         else:
             self._debounce("local", 600, self.load)
+
+    def _font_changed(self):
+        """Restyle with the new font / text size, then redraw the lists (their previews are sized from it)."""
+        old = (self.font_base, self._last_css)
+        self.reload_theme()
+        if (self.font_base, self._last_css) != old:
+            self.load()
 
 
 class App(Adw.Application):

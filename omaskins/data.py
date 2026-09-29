@@ -37,6 +37,7 @@ USER_BACKGROUNDS = HOME / ".config/omarchy/backgrounds"
 # Downloads land here first and move into USER_THEMES in one step once complete, so neither this app
 # nor Omarchy's own menu ever sees (or applies) a half-downloaded theme. Same filesystem = atomic move.
 PARTIAL_THEMES = HOME / ".config/omarchy/.omaskins-partial"
+REMOVING_THEMES = HOME / ".config/omarchy/.omaskins-removing"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy" / "current"
 MENU_DEFAULTS = OMARCHY_PATH / "default/omarchy/omarchy-menu.jsonc"
 HYPR_DIR = HOME / ".config/hypr"          # Omarchy's hyprland.lua requires "hypr.<name>" from here
@@ -44,6 +45,7 @@ CORNERS_FILE = HYPR_DIR / "omaskins.lua"  # OmaSkins' own file: rounded corners 
 CORNERS_REQUIRE = 'require("hypr.omaskins")'
 CORNERS_DEFAULT, CORNERS_MAX = 8, 40      # 8 = the example value in Omarchy's own looknfeel.lua
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omaskins"
+OMASKINS_STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omaskins"
 
 THEMES_PAGE = "https://omarchy.org/themes/"
 SITE = "https://omarchy.org"
@@ -72,6 +74,7 @@ class Action:
     steps: tuple = ()     # set = LIVE: what run.perform() really does; empty = prototype, shown only
     busy: str = ""        # shown while a live action runs, e.g. "Applying Nord…"
     done: str = ""        # shown when it worked (default: "<label>: done")
+    bar: int = -1         # >= 0: the busy toast carries an ASCII progress bar starting at this percent
 
 
 @dataclass
@@ -387,6 +390,64 @@ def installed_fonts():
     return [Font(f, owners.get(p, ""), f == cur) for f, p in sorted(files.items())]
 
 
+def package_families(packages):
+    """{package: [font families it installed]}, any spacing: for installed font packages that have
+    no monospace face (Omarchy's font menu, and the Installed list, only show monospace ones)."""
+    if not packages:
+        return {}
+    owner = {}
+    for line in _run(["pacman", "-Ql", *packages], 30).splitlines():
+        pkg, _, path = line.partition(" ")
+        if path and not path.endswith("/"):
+            owner[path] = pkg
+    out = {}
+    for line in _run(["fc-list", "-f", "%{family[0]}|%{file}\n"]).splitlines():
+        fam, _, path = line.partition("|")
+        if path in owner and fam not in out.setdefault(owner[path], []):
+            out[owner[path]].append(fam)
+    return {p: sorted(f) for p, f in out.items()}
+
+
+# Hidden from Browse: Omarchy's font menu only offers monospace fonts. Checked 2026-09-28 against
+# the Arch file lists of all 76 Nerd Font packages: these three have no monospace family at all
+# (the rest do, some alongside sans/serif ones), and the symbols packages are icon glyphs only.
+# ttf-heavydata-nerd: measured 2026-09-28, its faces do not report fixed spacing either.
+NOT_MONO_PACKAGES = {"ttf-arimo-nerd", "ttf-tinos-nerd", "ttf-ubuntu-nerd", "ttf-heavydata-nerd"}
+LEARNED_NOT_MONO = CACHE_DIR / "not-monospace.txt"  # any other package found out after an install
+
+
+def learned_not_mono():
+    try:
+        return {l.strip() for l in LEARNED_NOT_MONO.read_text().splitlines() if l.strip()}
+    except OSError:
+        return set()
+
+
+def learn_not_mono(package):
+    if package in NOT_MONO_PACKAGES or package in learned_not_mono():
+        return
+    try:
+        LEARNED_NOT_MONO.parent.mkdir(parents=True, exist_ok=True)
+        with LEARNED_NOT_MONO.open("a") as f:
+            f.write(package + "\n")
+    except OSError:
+        pass
+
+
+def browsable_font_package(package, learned=frozenset()):
+    """False for packages that can never be Omarchy's font: no monospace face, or symbols only."""
+    return not (package in NOT_MONO_PACKAGES or package in learned or "nerd-fonts-symbols" in package)
+
+
+def without_icon_twins(fonts):
+    """Drop each "<X> Nerd Font Mono" whose "<X> Nerd Font" is also there: same letters, only the
+    icons are shrunk to one character cell, so to the owner it's a duplicate. A twin that is the
+    font in use stays, so its ✓ still shows."""
+    names = {f.family for f in fonts}
+    return [f for f in fonts
+            if f.current or not (f.family.endswith(" Nerd Font Mono") and f.family[:-5] in names)]
+
+
 def omarchy_font_picks():
     """{package: family} from Omarchy's Install › Font menu entries."""
     try:
@@ -428,6 +489,69 @@ def normalized_size(base_px, x_height_ratio, reference_ratio):
     return round(base_px * max(0.7, min(1.4, reference_ratio / x_height_ratio)), 1)
 
 
+# --------------------------------------------------------------------------- matched font sizes
+#
+# Faces at the same point size read very differently (Ubuntu Mono's lowercase is 16% shorter than
+# JetBrains Mono's). When a font is set, OmaSkins scales Omarchy's font sizes so its x-height matches
+# JetBrains Mono (Omarchy's default font) at your text size. The x-heights were measured ONCE
+# (font_heights.py); a font that isn't in that table is measured the first time and remembered.
+
+REFERENCE_X = 550            # JetBrains Mono: x-height in px at 1000 pt
+SCALE_MIN, SCALE_MAX = 0.8, 1.25
+TERM_DEFAULT_PT, SHELL_DEFAULT_PX = 9, 12   # Omarchy's anchors: 12 px text size == 9 pt terminals
+LEARNED_HEIGHTS = CACHE_DIR / "font-x-heights.json"
+TEXT_SIZE_STATE = OMASKINS_STATE / "text-size.json"
+
+
+def learned_heights():
+    try:
+        return json.loads(LEARNED_HEIGHTS.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def font_x_height(family):
+    """From the table measured once; else measured now (render an 'x' with ImageMagick, as for
+    thumbnails) and remembered, so each font is only ever measured once."""
+    from .font_heights import X_HEIGHTS
+    known = X_HEIGHTS.get(family) or learned_heights().get(family)
+    if known:
+        return known
+    faces = [(l.split("|") + ["", ""])[:3]
+             for l in _run(["fc-list", "-f", "%{family[0]}|%{style[0]}|%{file}\n"]).splitlines()]
+    files = [f for fam, style, f in faces if fam == family and style in ("Regular", "Book")] \
+        or [f for fam, _, f in faces if fam == family]
+    if not files or not shutil.which("magick"):
+        return None
+    out = _run(["magick", "-background", "white", "-fill", "black", "-font", files[0], "-pointsize", "1000",
+                "label:x", "-trim", "-format", "%h", "info:"]).strip()
+    if not out.isdigit():
+        return None
+    learned = learned_heights()
+    learned[family] = int(out)
+    try:
+        LEARNED_HEIGHTS.parent.mkdir(parents=True, exist_ok=True)
+        LEARNED_HEIGHTS.write_text(json.dumps(learned, indent=1, sort_keys=True))
+    except OSError:
+        pass
+    return int(out)
+
+
+def font_scale(x_height):
+    """How much to scale a face so its lowercase reads as big as JetBrains Mono's."""
+    if not x_height:
+        return 1.0
+    return max(SCALE_MIN, min(SCALE_MAX, REFERENCE_X / x_height))
+
+
+def sizes_for(text_size_px, scale):
+    """(shell base-size px, terminal pt) for your text size and a font's scale. At scale 1 these are
+    exactly what `omarchy display text size` sets (terminal pt rounded the same way)."""
+    base_pt = int(text_size_px * TERM_DEFAULT_PT / SHELL_DEFAULT_PX + 0.5)
+    pt = round(base_pt * scale, 1)
+    return max(1, int(text_size_px * scale + 0.5)), (int(pt) if pt == int(pt) else pt)
+
+
 # --------------------------------------------------------------------------- actions (described, never run)
 
 def q(s):
@@ -450,9 +574,7 @@ def theme_actions(local=None, community=None, current=""):
         if local.builtin:
             rm = builtin_remove_action(local.name)
         else:
-            rm = Action("Remove", f"omarchy-theme-remove {q(local.name)}",
-                        steps=(("run", ["omarchy-theme-remove", local.name]),), busy=f"Removing {local.title}…",
-                        done=f"{local.title} removed. You can add it again from Browse.")
+            rm = remove_theme_action(local)
         if local.name == current:
             rm.blocked = "This is your current theme. Switch to another one first."
         acts.append(rm)
@@ -467,7 +589,26 @@ def theme_has_files(path):
         return False
 
 
+def ascii_bar(percent, width=24):
+    """Omarchy-style progress bar, always the same width: [#########...............]  37%"""
+    percent = max(0, min(100, int(percent)))
+    n = width * percent // 100
+    return f"[{'#' * n}{'.' * (width - n)}] {percent:>3}%"
+
+
 THEME_NAME_OK = re.compile(r"[a-z0-9_][a-z0-9._+-]*")  # omarchy-theme-install's own rule
+
+
+def remove_theme_action(local):
+    """What omarchy-theme-remove does (rm -rf the folder, then its "Theme removed" notification), but
+    the folder first leaves themes/ in one rename, so neither this app nor Omarchy's menu ever sees
+    a half-deleted theme, and is then deleted file by file so the bar can count down to 0%."""
+    folder, gone = USER_THEMES / local.name, REMOVING_THEMES / local.name
+    cmd = f"rm -rf ~/.config/omarchy/themes/{q(local.name)} && omarchy-notification-send 'Theme removed' {q(local.name)}"
+    return Action("Remove", cmd, busy=f"Removing {local.title}…", bar=100,
+                  done=f"{local.title} removed. You can add it again from Browse.",
+                  steps=(("take_out", folder, gone), ("delete_counting", gone),
+                         ("run", ["omarchy-notification-send", "Theme removed", local.name])))
 
 
 def add_theme_action(community):
@@ -479,10 +620,10 @@ def add_theme_action(community):
     cmd = f"omarchy-git-url-check {q(url)} && git clone -- {q(url)} {q(tmp)} && mv {q(tmp)} {q(dest)}"
     if not THEME_NAME_OK.fullmatch(name):
         return Action("Add", cmd, blocked="This repository's name doesn't make a usable theme folder name.")
-    return Action("Add", cmd, busy=f"Adding {community.name}…",
+    return Action("Add", cmd, busy=f"Adding {community.name}…", bar=0,
                   done=f"{community.name} added. Apply it whenever you like.",
                   steps=(("clear_partial", tmp), ("run", ["omarchy-git-url-check", url]),
-                         ("run", ["git", "clone", "--", url, str(tmp)]), ("move_in", tmp, dest)))
+                         ("run", ["git", "clone", "--progress", "--", url, str(tmp)]), ("move_in", tmp, dest)))
 
 
 # The owner doesn't want password prompts for everyday adding/removing. The few actions that can't
@@ -593,25 +734,58 @@ def open_folder_action(theme_name):
                   steps=(("mkdir", dest), ("launch", ["nautilus", str(dest)])))
 
 
+FONT_PKG_OK = re.compile(r"(ttf|otf)-[a-z0-9][a-z0-9.+-]*nerd[a-z0-9.+-]*")  # nothing a shell reads specially
+
+
+def font_terminal_command(verb, package):
+    """What runs in Omarchy's floating terminal, where pacman asks for the password (the same
+    presentation omarchy-install-font uses). `verb` is "add" or "drop"."""
+    doing = {"add": "Installing", "drop": "Removing"}[verb]
+    return f"echo '{doing} {package}...'; omarchy-pkg-{verb} {package}"
+
+
 def font_actions(font=None, package=None, current_package=""):
-    """`current_package` owns the font in use; removing it would pull that font out from under Omarchy."""
+    """`current_package` owns the font in use; removing it would pull that font out from under Omarchy.
+    Package changes happen in Omarchy's floating terminal (pacman asks for the password there); OmaSkins
+    waits for pacman to finish, then refreshes."""
     if package:
+        pkg = package.package
+        if not FONT_PKG_OK.fullmatch(pkg):
+            return []
         if package.installed:
-            if package.package == current_package:
+            if pkg == current_package:
                 return []
-            return [Action("Remove", f"omarchy-pkg-remove {package.package}", password=PASSWORD_FONT)]
-        fam = package.omarchy_pick or "<its family name>"
-        return [Action("Add", f"omarchy-pkg-add {package.package}", password=PASSWORD_FONT),
-                Action("Add and use", f"omarchy-install-font {q(fam)} {package.package} {q(fam)}",
-                       password=PASSWORD_FONT)]
+            return [_remove_font_package(pkg)]
+        term = font_terminal_command("add", pkg)
+        wait = ("wait_package", pkg, True, term)
+        fam = package.omarchy_pick
+        return [Action("Add", f"omarchy-pkg-add {pkg}   (in a terminal)", password=PASSWORD_FONT,
+                       busy=f"Installing {pkg}: type your password in the terminal…", done=f"{pkg} added.",
+                       steps=(("terminal", term), wait, ("check_mono", pkg))),
+                Action("Add and use", f"omarchy-pkg-add {pkg}   (in a terminal), then "
+                                      f"omarchy-font-set {q(fam or '<its font>')}", password=PASSWORD_FONT,
+                       busy=f"Installing {pkg}: type your password in the terminal…",
+                       done=f"{pkg} added and in use.",
+                       steps=(("terminal", term), wait, ("remember_text_size",), ("use_font", pkg, fam)))]
     acts = []
     if font and not font.current:
-        acts.append(Action("Use", f"omarchy-font-set {q(font.family)}"))
+        acts.append(Action("Use", f"omarchy-font-set {q(font.family)}, then match its size",
+                           busy=f"Switching to {font.family}…", done=f"{font.family} is your font now.",
+                           steps=(("remember_text_size",), ("run", ["omarchy-font-set", font.family]),
+                                  ("font_size", font.family))))
     # Only Nerd Font packages are offered for removal: others (adwaita-fonts, ttf-liberation)
     # are pulled in by the system, and the font in use is never removable.
-    if font and font.package != current_package and re.search(r"-nerd(-|$)", font.package):
-        acts.append(Action("Remove", f"omarchy-pkg-remove {font.package}", password=PASSWORD_FONT))
+    if font and font.package != current_package and re.search(r"-nerd(-|$)", font.package) \
+            and FONT_PKG_OK.fullmatch(font.package):
+        acts.append(_remove_font_package(font.package))
     return acts
+
+
+def _remove_font_package(pkg):
+    term = font_terminal_command("drop", pkg)
+    return Action("Remove", f"omarchy-pkg-drop {pkg}   (in a terminal)", password=PASSWORD_FONT,
+                  busy=f"Removing {pkg}: type your password in the terminal…", done=f"{pkg} removed.",
+                  steps=(("terminal", term), ("wait_package", pkg, False, term)))
 
 
 # --------------------------------------------------------------------------- export plan
