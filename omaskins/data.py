@@ -41,9 +41,13 @@ REMOVING_THEMES = HOME / ".config/omarchy/.omaskins-removing"
 STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy" / "current"
 MENU_DEFAULTS = OMARCHY_PATH / "default/omarchy/omarchy-menu.jsonc"
 HYPR_DIR = HOME / ".config/hypr"          # Omarchy's hyprland.lua requires "hypr.<name>" from here
+# Built-in themes you hide are moved here (outside Omarchy's themes folder, which lists every
+# subfolder), so Restore is an instant move back instead of a reinstall. Root-owned, like the themes.
+HIDDEN_BUILTINS = Path(os.environ.get("OMASKINS_HIDDEN_THEMES", "/usr/local/share/omaskins/hidden-themes"))
+PACMAN_CONF = Path(os.environ.get("OMASKINS_PACMAN_CONF", "/etc/pacman.conf"))
 CORNERS_FILE = HYPR_DIR / "omaskins.lua"  # OmaSkins' own file: rounded corners for every theme
 CORNERS_REQUIRE = 'require("hypr.omaskins")'
-CORNERS_DEFAULT, CORNERS_MAX = 8, 40      # 8 = the example value in Omarchy's own looknfeel.lua
+CORNERS_DEFAULT, CORNERS_MAX = 15, 40     # 15 = the owner's pick (2026-09-29): looks right on every theme
 CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", HOME / ".cache")) / "omaskins"
 OMASKINS_STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omaskins"
 
@@ -75,6 +79,7 @@ class Action:
     busy: str = ""        # shown while a live action runs, e.g. "Applying Nord…"
     done: str = ""        # shown when it worked (default: "<label>: done")
     bar: int = -1         # >= 0: the busy toast carries an ASCII progress bar starting at this percent
+    choices: tuple = ()   # set = a question first: ((button label, Action), ...), `note` is the question
 
 
 @dataclass
@@ -217,6 +222,129 @@ def parse_community(html):
 def community_themes(force=False):
     page = cached_download(THEMES_PAGE, "themes.html", ttl=0 if force else PAGE_TTL)
     return parse_community(page.read_text(encoding="utf-8", errors="replace"))
+
+
+STARS_CACHE = CACHE_DIR / "stars.json"
+STARS_TTL = 24 * 3600
+
+
+PKGSTATS_CACHE = CACHE_DIR / "pkgstats.json"
+PKGSTATS_TTL = 7 * 24 * 3600
+PKGSTATS_API = "https://pkgstats.archlinux.de/api/packages"
+
+
+def cached_font_popularity():
+    """Last fetched {package: % of Arch users with it installed}, however old (instant, no network)."""
+    try:
+        return json.loads(PKGSTATS_CACHE.read_text()).get("popularity", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def font_popularity(force=False):
+    """{package: popularity} from Arch's pkgstats (the share of Arch users who have it installed): the
+    "Top Picks" order for fonts. All Nerd Fonts share one GitHub repo, so stars can't rank them. Paged
+    over the ttf-/otf- names, cached for a week; {} offline (fonts then sort A-Z)."""
+    try:
+        cached = json.loads(PKGSTATS_CACHE.read_text())
+        if not force and time.time() - cached.get("at", 0) < PKGSTATS_TTL:
+            return cached["popularity"]
+    except (OSError, ValueError, KeyError):
+        pass
+    popularity = {}
+    for prefix in ("ttf-", "otf-"):
+        offset = 0
+        while True:
+            try:
+                with urllib.request.urlopen(f"{PKGSTATS_API}?query={prefix}&limit=250&offset={offset}",
+                                            timeout=20) as r:
+                    page = json.loads(r.read().decode())
+            except (OSError, ValueError):
+                break
+            rows = page.get("packagePopularities") or []
+            for row in rows:
+                if isinstance(row.get("popularity"), (int, float)):
+                    popularity[row["name"]] = row["popularity"]
+            offset += len(rows)
+            if not rows or offset >= int(page.get("total", 0)):
+                break
+    if popularity:
+        try:
+            PKGSTATS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            PKGSTATS_CACHE.write_text(json.dumps({"at": time.time(), "popularity": popularity}))
+        except OSError:
+            pass
+    return popularity
+
+
+# The owner's sort choice for Themes and Fonts ("top" = Top Picks, "az" = A -> Z), kept between launches.
+UI_STATE = OMASKINS_STATE / "ui.json"
+
+
+def sort_mode():
+    try:
+        mode = json.loads(UI_STATE.read_text()).get("sort")
+    except (OSError, ValueError):
+        mode = None
+    return mode if mode in ("top", "az") else "top"
+
+
+def save_sort_mode(mode):
+    try:
+        st = json.loads(UI_STATE.read_text())
+    except (OSError, ValueError):
+        st = {}
+    st["sort"] = mode
+    try:
+        UI_STATE.parent.mkdir(parents=True, exist_ok=True)
+        UI_STATE.write_text(json.dumps(st))
+    except OSError:
+        pass
+
+
+def cached_theme_stars():
+    """The last star counts fetched, however old (instant, no network): for sorting at startup."""
+    try:
+        return json.loads(STARS_CACHE.read_text()).get("stars", {})
+    except (OSError, ValueError):
+        return {}
+
+
+def theme_stars(community, force=False):
+    """{repo key: GitHub stars} for the omarchy.org themes: the only popularity measure there is (the
+    page itself has none). One batched, read-only GraphQL query through the signed-in `gh`, cached for
+    a day. Empty when gh or the network isn't there: Browse then sorts those themes A-Z."""
+    keys = sorted({t.key for t in community if t.key and "/" in t.key})
+    try:
+        cached = json.loads(STARS_CACHE.read_text())
+        if not force and time.time() - cached.get("at", 0) < STARS_TTL and set(keys) <= set(cached["stars"]):
+            return cached["stars"]
+    except (OSError, ValueError, KeyError):
+        pass
+    if not keys or not shutil.which("gh"):
+        return {}
+    stars = {}
+    for start in range(0, len(keys), 100):
+        chunk = keys[start:start + 100]
+        parts = []
+        for i, key in enumerate(chunk):
+            owner, name = key.split("/", 1)
+            parts.append(f"r{i}: repository(owner: {json.dumps(owner)}, name: {json.dumps(name)}) {{ stargazerCount }}")
+        out = _run(["gh", "api", "graphql", "-f", "query=query { " + " ".join(parts) + " }"], 30)
+        try:
+            answered = json.loads(out or "{}").get("data") or {}
+        except ValueError:
+            answered = {}
+        for alias, repo in answered.items():
+            if repo and isinstance(repo.get("stargazerCount"), int):
+                stars[chunk[int(alias[1:])]] = repo["stargazerCount"]
+    if stars:
+        try:
+            STARS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            STARS_CACHE.write_text(json.dumps({"at": time.time(), "stars": stars}))
+        except OSError:
+            pass
+    return stars
 
 
 def remote_colors(theme):
@@ -572,7 +700,7 @@ def theme_actions(local=None, community=None, current=""):
                 apply.blocked = "Still downloading, or this theme folder is empty."
             acts.append(apply)
         if local.builtin:
-            rm = builtin_remove_action(local.name)
+            rm = builtin_hide_action(local.name, builtin_package_cached())
         else:
             rm = remove_theme_action(local)
         if local.name == current:
@@ -629,13 +757,22 @@ def add_theme_action(community):
 # The owner doesn't want password prompts for everyday adding/removing. The few actions that can't
 # avoid one (they change system packages) always confirm first and say why.
 PASSWORD_BUILTIN = ("Built-in themes are part of Omarchy's own system package, so removing or restoring one "
-                    "asks for your password. Themes you added never do.")
+                    "entirely asks for your password. Hiding one from OmaSkins, and themes you added, never do.")
 PASSWORD_FONT = ("Fonts are system packages, so adding or removing one asks for your password. "
                  "Switching between installed fonts never does.")
 
 # Built-in themes belong to Omarchy's package, so omarchy-theme-remove won't touch them and an
 # update would bring a deleted one back. Removing = delete the folder as root + a NoExtract rule
 # (it must sit in pacman.conf's [options] section). Restoring = drop the rule, reinstall the package.
+
+_BUILTIN_PKG = []
+
+
+def builtin_package_cached():
+    if not _BUILTIN_PKG:
+        _BUILTIN_PKG.append(builtin_package())
+    return _BUILTIN_PKG[0]
+
 
 def builtin_package():
     """The pacman package that owns the built-in themes ('' if unknown)."""
@@ -656,27 +793,130 @@ def shipped_builtins(package):
 
 
 def removed_builtins(shipped):
-    """Built-ins the package ships whose folder is gone (removed through OmaSkins)."""
+    """Built-ins the package ships whose folder isn't in Omarchy's themes folder (hidden or removed)."""
     return [n for n in shipped if not (BUILTIN_THEMES / n).is_dir()]
 
 
+def builtin_held_aside(name):
+    """True when a removed built-in's folder is held aside, so Restore can be an instant move back."""
+    return (HIDDEN_BUILTINS / name).is_dir()
+
+
+# Built-ins you hid from OmaSkins only (no password): still installed, still in Omarchy's own menu,
+# still updated. Also the package version each built-in was removed at (for Restore).
+BUILTIN_STATE = OMASKINS_STATE / "builtin-themes.json"
+
+
+def _builtin_state():
+    try:
+        st = json.loads(BUILTIN_STATE.read_text())
+    except (OSError, ValueError):
+        st = {}
+    return {"hidden": list(st.get("hidden", [])), "removed_at": dict(st.get("removed_at", {}))}
+
+
+def _save_builtin_state(st):
+    BUILTIN_STATE.parent.mkdir(parents=True, exist_ok=True)
+    BUILTIN_STATE.write_text(json.dumps(st, indent=1, sort_keys=True))
+
+
+def hidden_in_omaskins():
+    return set(_builtin_state()["hidden"])
+
+
+def set_hidden_in_omaskins(name, hidden):
+    st = _builtin_state()
+    names = set(st["hidden"])
+    names.add(name) if hidden else names.discard(name)
+    st["hidden"] = sorted(names)
+    _save_builtin_state(st)
+
+
+def package_version(package):
+    return (_run(["pacman", "-Q", package], 10).split() + ["", ""])[1] if package else ""
+
+
+def note_removed_version(name, package):
+    st = _builtin_state()
+    st["removed_at"][name] = package_version(package)
+    _save_builtin_state(st)
+
+
+def removed_at_version(name):
+    return _builtin_state()["removed_at"].get(name, "")
+
+
+NAME_OK = re.compile(r"[a-z0-9][a-z0-9._-]*")
+PKG_OK = re.compile(r"[a-z0-9][a-z0-9._+-]*")
+
+
 def _no_extract(name):
-    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", name):
+    if not NAME_OK.fullmatch(name):
         raise ValueError(f"unexpected theme folder name: {name!r}")
     return f"NoExtract = {str(BUILTIN_THEMES / name).lstrip('/')}/*"
 
 
-def builtin_remove_action(name):
-    return Action("Remove", f"sudo rm -rf {q(BUILTIN_THEMES / name)} && "
-                            f"sudo sed -i '/^\\[options\\]/a {_no_extract(name)}' /etc/pacman.conf",
-                  note="It's built into Omarchy: it will stay listed under Browse, marked Built-in, "
-                       "with a Restore button.", password=PASSWORD_BUILTIN)
+def builtin_terminal_command(kind, name, package=""):
+    """What runs in Omarchy's floating terminal (sudo asks for the password there). Built only from a
+    checked folder name / package name and fixed paths; run.py rebuilds it and must get the same text.
+    hide: move the folder aside + a NoExtract rule so package updates don't bring it back.
+    unhide: move it back + drop the rule. reinstall (no hidden copy): drop the rule + pacman -S."""
+    rule, themes, hidden, conf = _no_extract(name), BUILTIN_THEMES, HIDDEN_BUILTINS, PACMAN_CONF
+    drop_rule = f"sudo sed -i '\\|^{rule.replace('*', '[*]')}$|d' {conf}"
+    if kind == "hide":
+        return (f"echo 'Hiding {name}...'; [ ! -e {hidden}/{name} ] && sudo mkdir -p {hidden} && "
+                f"sudo mv {themes}/{name} {hidden}/{name} && "
+                f"(grep -qxF '{rule}' {conf} || sudo sed -i '/^\\[options\\]/a {rule}' {conf})")
+    if kind == "unhide":
+        return (f"echo 'Restoring {name}...'; [ ! -e {themes}/{name} ] && "
+                f"sudo mv {hidden}/{name} {themes}/{name} && {drop_rule}")
+    if kind == "reinstall":
+        if not PKG_OK.fullmatch(package):
+            raise ValueError(f"unexpected package name: {package!r}")
+        return (f"echo 'Reinstalling {name}...'; {drop_rule} && sudo pacman -S --noconfirm {package} && "
+                f"sudo rm -rf {hidden}/{name}")
+    raise ValueError(kind)
 
 
-def builtin_restore_action(name, package):
-    rule = _no_extract(name).replace("*", "\\*")
-    return Action("Restore", f"sudo sed -i '\\|^{rule}$|d' /etc/pacman.conf && sudo pacman -S --noconfirm {q(package)}",
-                  password=PASSWORD_BUILTIN)
+def builtin_hide_action(name, package=""):
+    """A built-in's Hide button asks first (owner's design): hide it from OmaSkins only (no password,
+    it stays installed and updated), or remove it entirely (password; gone from Omarchy's menu too)."""
+    if not NAME_OK.fullmatch(name):
+        raise ValueError(f"unexpected theme folder name: {name!r}")
+    title = display_name(name)
+    soft = Action("Hide from OmaSkins", f"(OmaSkins' own list: {BUILTIN_STATE})",
+                  done=f"{title} hidden from OmaSkins. Restore it from Browse whenever you like.",
+                  steps=(("hide_in_omaskins", name, True),))
+    cmd = builtin_terminal_command("hide", name)
+    hard = Action("Remove entirely", f"sudo mv {BUILTIN_THEMES / name} {HIDDEN_BUILTINS / name}  (+ NoExtract in pacman.conf)",
+                  password=PASSWORD_BUILTIN, busy=f"Removing {title}: type your password in the terminal…",
+                  done=f"{title} removed. Restore it from Browse whenever you like.",
+                  steps=(("terminal", cmd), ("wait_builtin", name, True, cmd), ("note_removed_version", name, package)))
+    return Action("Hide", f"hide {name}",
+                  note=(f"Do you want to hide this stock theme from OmaSkins, or remove it entirely?\n\n"
+                        f"Hide from OmaSkins: no password. It stays installed, keeps getting Omarchy's updates, "
+                        f"and still shows in Omarchy's own theme menu.\n\n"
+                        f"Remove entirely: asks for your password (it's part of Omarchy's system package). "
+                        f"It's gone from Omarchy's menu too, and updates won't bring it back.\n\n"
+                        f"Either way it stays under Browse, and Restore brings it back."),
+                  choices=(("Hide from OmaSkins", soft), ("Remove entirely", hard)))
+
+
+def builtin_restore_action(name, package, hidden_only=False):
+    title = display_name(name)
+    if hidden_only:
+        return Action("Restore", f"(OmaSkins' own list: {BUILTIN_STATE})", done=f"{title} is back.",
+                      steps=(("hide_in_omaskins", name, False),))
+    current = package_version(package)
+    if builtin_held_aside(name) and current and current == removed_at_version(name):
+        cmd = builtin_terminal_command("unhide", name)  # nothing changed since: the kept copy is current
+        shown = f"sudo mv {HIDDEN_BUILTINS / name} {BUILTIN_THEMES / name}  (- NoExtract in pacman.conf)"
+    else:  # Omarchy was updated meanwhile (or no copy was kept): reinstall for the fresh version
+        cmd = builtin_terminal_command("reinstall", name, package)
+        shown = f"sudo pacman -S {package}  (- NoExtract in pacman.conf; fresh copy, Omarchy updated it)"
+    return Action("Restore", shown, password=PASSWORD_BUILTIN,
+                  busy=f"Restoring {title}: type your password in the terminal…", done=f"{title} is back.",
+                  steps=(("terminal", cmd), ("wait_builtin", name, False, cmd)))
 
 
 def background_actions(bg, theme_name):
@@ -1021,11 +1261,14 @@ def corners_file_text(on, px):
 
 
 def corners_action(on, px):
+    """No password. OmaSkins' own file + one require line; saving it makes Hyprland reload by itself
+    (windows), OmaSkins restyles its own frame the moment the new radius is live, then the running
+    shell re-reads its style (bar, menus, popups) without restarting. A reload is only forced if
+    Hyprland didn't pick the change up by itself."""
     px = max(0, min(CORNERS_MAX, int(px)))
-    looknfeel = HYPR_DIR / "looknfeel.lua"
-    text = corners_file_text(on, px).replace("'", "'\\''")
-    cmd = (f"printf '%s' '{text}' > {q(CORNERS_FILE)} && "
-           f"(grep -qxF {q(CORNERS_REQUIRE)} {q(looknfeel)} || echo {q(CORNERS_REQUIRE)} >> {q(looknfeel)}) && "
-           "omarchy restart shell")
-    return Action("Round corners" if on else "Square corners", cmd)
-
+    return Action("Round corners" if on else "Square corners",
+                  f"write {CORNERS_FILE} (+ require line in looknfeel.lua), wait for Hyprland, "
+                  "omarchy-shell shell applyTheme (restyle, no restart)",
+                  busy="Rounding corners…" if on else "Back to each theme's own corners…",
+                  done=f"Corners: {px} px for every theme." if on else "Corners: each theme's own again.",
+                  steps=(("apply_corners", on, px), ("notify", "restyle"), ("shell_restyle",)))

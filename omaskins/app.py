@@ -5,6 +5,7 @@ would run. Nothing on the system is changed (see data.py).
 """
 
 import itertools
+import os
 import queue
 import sys
 import threading
@@ -25,11 +26,21 @@ APP_ID = "io.github.jesuslovesyou1013.omaskins"
 TITLE = "OmaSkins Manager"
 CHECK = "\U000f012c"  # nf-md-check — a plain mark, never a checkbox (same as OmaPlugs)
 CARD_W, CARD_H = 272, 153  # 16:9, the shape of omarchy.org screenshots
-PROTOTYPE_NOTE = ("PARTLY LIVE: theme, background and font actions really run. Rounded corners, removing "
-                  "built-in themes, rotation and Share still only show what they would do.")
+PROTOTYPE_NOTE = ("PARTLY LIVE: themes (built-in ones too), backgrounds, fonts and rounded corners really change. "
+                  "Rotation and Share still only show what they would do.")
 
 
 # --------------------------------------------------------------------------- small helpers
+
+_DEBUG = os.environ.get("OMASKINS_DEBUG") == "1"
+_T0 = GLib.get_monotonic_time()
+
+
+def dlog(*what):
+    """OMASKINS_DEBUG=1: timestamped trace of refreshes, to find what makes the window lag."""
+    if _DEBUG:
+        print(f"[{(GLib.get_monotonic_time() - _T0) / 1e6:9.3f}s]", *what, file=sys.stderr, flush=True)
+
 
 def bg(fn, done=None):
     """Run fn on a worker thread; deliver its result to `done` on the UI thread."""
@@ -203,9 +214,10 @@ def font_label(widget, family, reference, base_px):
 class ThemeEntry:
     """One theme card: a community listing, a local folder, or both."""
 
-    def __init__(self, community=None, local=None, removed=""):
+    def __init__(self, community=None, local=None, removed="", hidden=None):
         self.community, self.local = community, local
-        self.removed = removed    # folder name of a built-in removed through OmaSkins
+        self.removed = removed    # folder name of a built-in hidden or removed through OmaSkins
+        self.hidden = hidden      # its LocalTheme when only hidden from OmaSkins (still installed)
 
     @property
     def title(self):
@@ -219,6 +231,8 @@ class ThemeEntry:
 
     @property
     def image(self):
+        if self.hidden and self.hidden.preview:
+            return self.hidden.preview
         if self.local and self.local.preview:
             return self.local.preview
         return self.community.screenshot_url if self.community else None
@@ -284,16 +298,24 @@ class ThemeCard(Gtk.FlowBoxChild):
             box.add_css_class("current")
         box.append(picture(CARD_W, CARD_H, entry.image, priority=0 if entry.installed else 1))
         row = Gtk.Box(spacing=6)
+        row.add_css_class("card-row")  # one height for every card's title row (Apply button or not)
         row.append(label(entry.title, "card-name", hexpand=True, ellipsize=Pango.EllipsizeMode.END))
         if entry.removed:
             row.append(badge("Built-in", "builtin"))
-            row.append(badge("Removed", "warn"))
+            row.append(badge("Hidden" if entry.hidden else "Removed", "warn"))
         elif entry.local and entry.local.builtin:
             row.append(badge("Built-in", "builtin"))
         elif entry.installed and entry.community is None:
             row.append(badge("Not listed", "warn"))
         if is_current:
             row.append(badge("Current", "verified"))
+        if entry.installed and not is_current:
+            # One-click Apply right on the card (Browse and Installed), as quick as Omarchy's own picker.
+            apply = next((a for a in data.theme_actions(entry.local, entry.community, current) if a.label == "Apply"), None)
+            if apply:
+                b = win.action_button(apply)
+                b.add_css_class("card-apply")  # on the wrapper too when greyed out (rotation on); CSS covers both
+                row.append(b)
         if entry.installed:
             row.append(mark())
         box.append(row)
@@ -367,11 +389,13 @@ class BackgroundCard(Gtk.FlowBoxChild):
 class FontRow(Gtk.ListBoxRow):
     """Installed font: its name in its own face, x-height-matched to the current font."""
 
-    def __init__(self, win, font, current_package):
+    def __init__(self, win, font, current_package, grouped=False):
         super().__init__(activatable=False)
-        self.key = font.family.lower()
+        self.key = f"{font.family} {font.package}".lower()
         box = Gtk.Box(spacing=12)
         box.add_css_class("font-row")
+        if grouped:
+            box.add_css_class("font-in-group")  # indented under its package's header
         box.append(mark("Current font") if font.current else Gtk.Box(width_request=24))
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
         name, scale = font_label(win, font.family, win.current_font or font.family, win.font_base * 1.6)
@@ -384,7 +408,41 @@ class FontRow(Gtk.ListBoxRow):
         if font.current:
             box.append(badge("Current", "verified"))
         for a in data.font_actions(font=font, current_package=current_package):
+            if grouped and a.label == "Remove":
+                continue  # removing is per package: the group header has the one Remove
             box.append(win.action_button(a))
+        self.set_child(box)
+
+
+class FontGroupRow(Gtk.ListBoxRow):
+    """Header of an installed font package: the fonts it installed follow, indented. One Remove for
+    the whole group, because removing the package removes every font in it (owner's design)."""
+
+    def __init__(self, win, package, fonts, pkg=None, current_package=""):
+        super().__init__(activatable=False)
+        self.key = " ".join([package or "", *(f.family for f in fonts), pkg.description if pkg else ""]).lower()
+        box = Gtk.Box(spacing=12)
+        box.add_css_class("font-row")
+        box.add_css_class("font-group")
+        box.append(mark("Installed") if package else Gtk.Box(width_request=24))
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
+        title = Gtk.Box(spacing=8)
+        title.append(label(package or "Not from a package", "plugin-name"))
+        if pkg and pkg.omarchy_pick:
+            title.append(badge("Omarchy pick", "verified"))
+        if pkg:
+            title.append(badge("Installed", "enabled"))
+        elif package:
+            title.append(badge("System", "builtin"))
+        col.append(title)
+        n = len(fonts)
+        about = f"{n} font{'s' if n != 1 else ''}" + (f" · {pkg.description} · {pkg.version}" if pkg else
+                                                     " · comes with the system, so it stays installed")
+        col.append(label(about, "dim small", wrap=True))
+        box.append(col)
+        if pkg:
+            for a in data.font_actions(package=pkg, current_package=current_package):
+                box.append(win.action_button(a))
         self.set_child(box)
 
 
@@ -576,13 +634,14 @@ class ThemePage(Gtk.Box):
 
         # actions
         acts = Gtk.Box(spacing=8)
+        acts.add_css_class("page-actions")  # Apply / Remove / Backgrounds / GitHub: same height as a card's Apply
         if entry.removed:
-            theme_acts = [data.builtin_restore_action(entry.removed, win.builtin_pkg)]
+            theme_acts = [data.builtin_restore_action(entry.removed, win.builtin_pkg, bool(entry.hidden))]
         else:
             theme_acts = data.theme_actions(entry.local, entry.community, win.current_theme)
         for a in theme_acts:
             done = None
-            if a.label == "Remove" and win.rotation.plan.in_rotation(entry.local.name):
+            if a.label in ("Remove", "Hide") and win.rotation.plan.in_rotation(entry.local.name):
                 a.note = (a.note + " " if a.note else "") + "It will also be taken out of the rotation."
                 done = lambda name=entry.local.name: win.rotation.drop(name)
             acts.append(win.action_button(a, done))
@@ -598,8 +657,10 @@ class ThemePage(Gtk.Box):
         self.swatches = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=12,
                                     min_children_per_line=4, column_spacing=6, row_spacing=6)
         body.append(self.swatches)
-        if entry.removed:
-            self.swatches.append(label("Removed from this system. Its colors come back when it's restored.", "dim"))
+        if entry.hidden and entry.hidden.colors:
+            self._fill_swatches(entry.hidden.colors)
+        elif entry.removed:
+            self.swatches.append(label("Removed from Omarchy. Its colors come back when it's restored.", "dim"))
         elif entry.local and entry.local.colors:
             self._fill_swatches(entry.local.colors)
         elif entry.community:
@@ -615,7 +676,8 @@ class ThemePage(Gtk.Box):
         if entry.repo_url:
             rows.append(("Repository", entry.repo_url))
         if entry.removed:
-            rows.append(("Comes back from", f"the {win.builtin_pkg or 'Omarchy'} package"))
+            rows.append(("Restore", "instant, no password: it's still installed" if entry.hidden
+                         else "moves the kept copy back, or reinstalls it if Omarchy updated it meanwhile"))
         if entry.local:
             rows.append(("Folder", str(entry.local.path)))
             n = len(data.backgrounds_for(entry.local))
@@ -633,7 +695,8 @@ class ThemePage(Gtk.Box):
     def _source(self):
         e = self.entry
         if e.removed:
-            return "Built into Omarchy, removed. Restore brings back the original"
+            return ("Built into Omarchy, hidden from OmaSkins (still installed, still in Omarchy's menu)" if e.hidden
+                    else "Built into Omarchy, removed from the system")
         if e.local and e.local.builtin:
             return "Built into Omarchy"
         if e.community and e.local:
@@ -1039,10 +1102,15 @@ class Window(Adw.ApplicationWindow):
         super().__init__(application=app, title=TITLE, default_width=1180, default_height=820)
         self.add_css_class("omaskins")
         self.community, self.local, self.fonts, self.font_pkgs = [], [], [], []
+        self.stars = {}  # repo key -> GitHub stars (Top Picks order for themes)
+        self.font_pop = data.cached_font_popularity()  # package -> % of Arch users (Top Picks for fonts)
         self.not_mono = {}  # installed font packages with no monospace face: {package: [families]}
-        self.builtin_pkg, self.removed_builtins = "", []
+        self.builtin_pkg, self.removed_builtins, self.hidden_builtins = "", [], []
         self.current_theme = data.current_theme_name()
         self._last_bg, self._theme_changed_at = data.current_background(), 0
+        # Set when a theme gets applied while you're elsewhere: the next visit to Backgrounds opens on
+        # the (new) current theme; otherwise Backgrounds keeps the theme you last looked at.
+        self._bg_follow_current = False
         self._own_change_until, self._running = 0, set()
         self._quiet_until, self._pending = 0, set()
         self.current_font = ""
@@ -1081,6 +1149,25 @@ class Window(Adw.ApplicationWindow):
                 bar.append(btn)
             self.main_tabs[name] = btn
         bar.append(Gtk.Box(hexpand=True))
+        # Owner: how Themes and Fonts lists sort (Browse and Installed), kept between launches.
+        # Greyed, never hidden, on the tabs it doesn't apply to (no-layout-shift rule).
+        self.sort_mode = data.sort_mode()
+        self.sort_box = Gtk.Box(valign=Gtk.Align.CENTER, margin_end=8)
+        self.sort_box.add_css_class("sortbar")
+        first_sort = None
+        for mode, text, tip in (("top", "Top Picks", "Most popular first: Omarchy's own themes, then GitHub "
+                                 "stars; fonts by how many Arch users have them"),
+                                ("az", "A → Z", "Alphabetical")):
+            btn = Gtk.ToggleButton(label=text, tooltip_text=tip)
+            btn.add_css_class("subtab")
+            if first_sort:
+                btn.set_group(first_sort)
+            else:
+                first_sort = btn
+            btn.set_active(mode == self.sort_mode)
+            btn.connect("toggled", lambda b, m=mode: b.get_active() and self._on_sort(m))
+            self.sort_box.append(btn)
+        bar.append(self.sort_box)
         self.search = Gtk.SearchEntry(placeholder_text="Search themes…", valign=Gtk.Align.CENTER)
         self.search.connect("search-changed", self._on_search)
         bar.append(self.search)
@@ -1112,6 +1199,7 @@ class Window(Adw.ApplicationWindow):
 
         frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         frame.add_css_class("frame-root")
+        frame.set_overflow(Gtk.Overflow.HIDDEN)  # the banner is clipped to the frame's rounded corners
         frame.append(label(PROTOTYPE_NOTE, "prototype-banner", wrap=True))
         frame.append(self.stack)
         self.toasts = Adw.ToastOverlay()
@@ -1140,6 +1228,8 @@ class Window(Adw.ApplicationWindow):
             self.theme_flows[name] = fb
             self.theme_stack.add_named(scrolled(fb), name)
         box.append(self.theme_stack)
+        # Owner: a new launch opens on Installed; a switch to Browse lasts until OmaSkins is closed.
+        self.theme_sub_btns["Installed"].set_active(True)
         return box
 
     def _build_backgrounds(self):
@@ -1170,8 +1260,8 @@ class Window(Adw.ApplicationWindow):
     def _build_corners(self):
         """Global Rounded Corners: one radius for windows, menus and popups, whatever the theme."""
         on, px = data.corners_setting()
-        live = data.current_rounding()
-        self.corners = {"on": on, "px": px or (live if live else data.CORNERS_DEFAULT)}
+        # Your saved radius, else the default (not the theme's own: switching on should look the same everywhere).
+        self.corners = {"on": on, "px": px or data.CORNERS_DEFAULT}
         box = Gtk.Box(spacing=10, margin_start=24, valign=Gtk.Align.CENTER,
                       tooltip_text="Round the corners of windows, menus and popups for every theme, "
                                    "rotating or not. Off = each theme's own corners.")
@@ -1193,7 +1283,7 @@ class Window(Adw.ApplicationWindow):
             self.corner_size.set_sensitive(on)
         if px is not None:
             self.corners["px"] = px
-        # Wait until the +/- clicking settles, then (prototype) show what would run.
+        # Wait until the +/- clicking settles: each change reloads Hyprland and restarts the shell.
         self._debounce("corners", 700, lambda: self.do_action(
             data.corners_action(self.corners["on"], self.corners["px"])))
 
@@ -1231,7 +1321,7 @@ class Window(Adw.ApplicationWindow):
         return box
 
     def action_button(self, a, on_done=None):
-        css = "danger" if a.label == "Remove" else "primary" if a.label in ("Add", "Apply", "Use", "Restore") else ""
+        css = "danger" if a.label in ("Remove", "Hide") else "primary" if a.label in ("Add", "Apply", "Use", "Restore") else ""
         b = button(a.label, css, lambda *_: self.do_action(a, on_done))
         b.set_valign(Gtk.Align.CENTER)
         if a.label == "Apply" and self.rotation.plan.themes:
@@ -1242,6 +1332,7 @@ class Window(Adw.ApplicationWindow):
 
     # ---- data
     def load(self, force=False):
+        dlog("load (disk)")
         self.set_status("Loading…")
 
         def work():
@@ -1251,10 +1342,11 @@ class Window(Adw.ApplicationWindow):
             except Exception as e:  # noqa: BLE001
                 community, err = [], e
             pkg = data.builtin_package()
+            stars = data.cached_theme_stars()  # instant; fresh counts are fetched after the window shows
             fonts, font_pkgs = data.installed_fonts(), data.repo_fonts()
             mono = {f.package for f in fonts}
             other = data.package_families([p.package for p in font_pkgs if p.installed and p.package not in mono])
-            return (community, err, data.local_themes(), fonts, font_pkgs, other,
+            return (community, err, stars, data.local_themes(), fonts, font_pkgs, other,
                     data.current_font(), pkg, data.removed_builtins(data.shipped_builtins(pkg)))
         bg(work, self._on_loaded)
 
@@ -1262,9 +1354,17 @@ class Window(Adw.ApplicationWindow):
         if isinstance(res, Exception):
             self.set_status(f"Couldn't load: {res}")
             return
-        (self.community, err, self.local, self.fonts, self.font_pkgs, self.not_mono, self.current_font,
+        (self.community, err, self.stars, self.local, self.fonts, self.font_pkgs, self.not_mono, self.current_font,
          self.builtin_pkg, self.removed_builtins) = res
         self.current_theme = data.current_theme_name()
+        # Popularity for Browse: refresh the GitHub star counts in the background (at most once a day),
+        # re-sorting only if they changed, so the window never waits on the network.
+        community = self.community
+        bg(lambda: data.theme_stars(community), self._stars_fetched)
+        bg(data.font_popularity, self._font_popularity_fetched)  # "Top Picks" for fonts (Arch pkgstats)
+        hidden = data.hidden_in_omaskins()
+        self.hidden_builtins = [t for t in self.local if t.builtin and t.name in hidden and t.name != self.current_theme]
+        self.local = [t for t in self.local if t not in self.hidden_builtins]  # gone from every list, rotation too
         self.rebuild()
         n_local = len(self.local)
         msg = f"{len(self.community)} community themes · {n_local} installed · {len(data.without_icon_twins(self.fonts))} fonts"
@@ -1272,17 +1372,61 @@ class Window(Adw.ApplicationWindow):
             msg = f"omarchy.org unreachable ({err}); showing installed only · " + msg
         self.set_status(msg)
 
+    def _stars_fetched(self, stars):
+        if isinstance(stars, dict) and stars and stars != self.stars:
+            dlog("stars refreshed:", len(stars))
+            self.stars = stars
+            self.rebuild()
+
+    def _font_popularity_fetched(self, pop):
+        if isinstance(pop, dict) and pop and pop != self.font_pop:
+            dlog("font popularity refreshed:", len(pop))
+            self.font_pop = pop
+            self._rebuild_fonts()
+
+    def _on_sort(self, mode):
+        """Top Picks / A -> Z: re-sort Themes and Fonts (Browse and Installed) and remember it."""
+        if mode == self.sort_mode:
+            return
+        self.sort_mode = mode
+        data.save_sort_mode(mode)
+        dlog("sort ->", mode)
+        self.rebuild()
+
+    def _theme_order(self, e):
+        """Top Picks: Omarchy's own (built-in) themes first, then most GitHub stars (A-Z among equals
+        and themes without a count); A -> Z: alphabetical. Used for Browse and Installed alike."""
+        if self.sort_mode == "az":
+            return (0, 0, e.title.lower())
+        if e.removed or (e.local and e.local.builtin):
+            return (0, 0, e.title.lower())
+        key = e.community.key if e.community else (e.local.repo_url and data.repo_key(e.local.repo_url))
+        return (1, -self.stars.get(key or "", -1), e.title.lower())
+
+    def _font_order(self, package):
+        """Top Picks: most-used first (share of Arch users, pkgstats), A-Z among equals; A -> Z."""
+        name = (package or "").lower()
+        if self.sort_mode == "az":
+            return (0, name)
+        return (-self.font_pop.get(package or "", -1), name)
+
     def current_local(self):
         return next((t for t in self.local if t.name == self.current_theme), None)
 
     def rebuild(self):
+        dlog("rebuild grids, current =", self.current_theme)
         matched = data.match_installed(self.community, self.local)
         by_local = {t.name: c for c in self.community if (t := matched.get(c.key))}
         browse = [ThemeEntry(c, matched.get(c.key)) for c in self.community]
+        listed = {t.name for t in matched.values() if t}
+        browse += [ThemeEntry(None, t) for t in self.local if t.builtin and t.name not in listed]  # built-ins too
         browse += [ThemeEntry(removed=n) for n in self.removed_builtins]  # restorable originals
-        browse.sort(key=lambda e: e.title.lower())
+        browse += [ThemeEntry(removed=t.name, hidden=t) for t in self.hidden_builtins]
+
+        # Owner: one order for both sub-tabs, chosen with the Top Picks / A -> Z toggle.
+        browse.sort(key=self._theme_order)
         installed = [ThemeEntry(by_local.get(t.name), t) for t in self.local]
-        installed.sort(key=lambda e: (e.local.name != self.current_theme, e.local.builtin, e.title.lower()))
+        installed.sort(key=self._theme_order)
         for name, entries in (("Browse", browse), ("Installed", installed)):
             fb = self.theme_flows[name]
             fb.remove_all()
@@ -1333,29 +1477,41 @@ class Window(Adw.ApplicationWindow):
     def _rebuild_fonts(self):
         cur_pkg = next((f.package for f in self.fonts if f.current), "")
         fonts = data.without_icon_twins(self.fonts)
-        fams = {}
-        for f in fonts:
-            if f.package:
-                fams.setdefault(f.package, []).append(f.family)
+        # Installed fonts grouped by the package that brought them (owner: removing one removes the
+        # whole package, installing one brings them all, so show and count each package once).
+        groups = {}
+        for f in sorted(fonts, key=lambda f: f.family.lower()):
+            groups.setdefault(f.package, []).append(f)
+        pkg_info = {p.package: p for p in self.font_pkgs}
+
         inst, brow = self.font_lists["Installed"], self.font_lists["Browse"]
         inst.remove_all()
         brow.remove_all()
-        for f in sorted(fonts, key=lambda f: (not f.current, f.family.lower())):
-            inst.append(FontRow(self, f, cur_pkg))
+        # Installed: one group per package, in the Top Picks / A -> Z order.
+        for package in sorted(groups, key=self._font_order):
+            inst.append(FontGroupRow(self, package, groups[package], pkg_info.get(package), cur_pkg))
+            for f in groups[package]:
+                inst.append(FontRow(self, f, cur_pkg, grouped=True))
+        # Browse: the downloadable (monospace) Nerd Font packages, one list in the same order; installed
+        # ones are marked and previewed in their own face.
         learned = data.learned_not_mono() | set(self.not_mono)
-        pkgs = sorted(self.font_pkgs, key=lambda p: (not p.omarchy_pick, not p.installed, p.package))
-        shown = 0
+        pkgs = sorted((p for p in self.font_pkgs if data.browsable_font_package(p.package, learned)),
+                      key=lambda p: self._font_order(p.package))
         for p in pkgs:
-            if data.browsable_font_package(p.package, learned):  # monospace fonts only, never anything else
-                brow.append(FontPackageRow(self, p, fams.get(p.package, []), cur_pkg))
-                shown += 1
-        self.font_counts["Installed"].set_text(str(len(fonts)))
-        self.font_counts["Browse"].set_text(str(shown))
+            brow.append(FontPackageRow(self, p, [f.family for f in groups.get(p.package, [])], cur_pkg))
+        self.font_counts["Installed"].set_text(str(len(groups)))
+        self.font_counts["Browse"].set_text(str(len(pkgs)))
 
     # ---- navigation
     def _on_main_tab(self, name):
+        if name == "Backgrounds" and self._bg_follow_current:
+            # A theme was just applied: you most likely want to try its own backgrounds next.
+            self._bg_follow_current = False
+            dlog("Backgrounds opens on the current theme:", self.current_theme)
+            self._select_bg_theme(self.current_theme)
         self.main_stack.set_visible_child_name(name)
         self.search.set_sensitive(name != "Rotation")
+        self.sort_box.set_sensitive(name in ("Themes", "Fonts"))  # greyed elsewhere, never moved
         self.search.set_placeholder_text({"Themes": "Search themes…", "Backgrounds": "Search backgrounds…",
                                           "Fonts": "Search fonts…", "Rotation": ""}[name])
         self._apply_search()
@@ -1448,12 +1604,16 @@ class Window(Adw.ApplicationWindow):
     def show_backgrounds_for(self, name):
         self.go_back()
         self.main_tabs["Backgrounds"].set_active(True)
+        self._select_bg_theme(name)
+
+    def _select_bg_theme(self, name):
         row = self.bg_list.get_first_child()
         while row:
             if getattr(row, "theme", None) and row.theme.name == name:
                 self.bg_list.select_row(row)
-                break
+                return True
             row = row.get_next_sibling()
+        return False
 
     def show_export(self):
         ExportDialog(self).present(self)
@@ -1491,21 +1651,33 @@ class Window(Adw.ApplicationWindow):
     def quick_theme_action(self, entry):
         """The one thing a theme card's right-click menu offers: Add, Remove or Restore."""
         if entry.removed:
-            return data.builtin_restore_action(entry.removed, self.builtin_pkg)
+            return data.builtin_restore_action(entry.removed, self.builtin_pkg, bool(entry.hidden))
         acts = data.theme_actions(entry.local, entry.community, self.current_theme)
-        return next((a for a in acts if a.label in ("Add", "Remove")), None)
+        return next((a for a in acts if a.label in ("Add", "Remove", "Hide")), None)
 
     def quick_theme(self, entry, a):
         """Right-click Add/Remove/Restore: no confirmation dialog, it's for speed (and each one can be
         undone from Browse). Removing a rotating theme also takes it out of the rotation."""
         done = None
-        if a.label == "Remove" and self.rotation.plan.in_rotation(entry.local.name):
+        if a.label in ("Remove", "Hide") and self.rotation.plan.in_rotation(entry.local.name):
             def done(name=entry.local.name):
                 self.rotation.drop(name)
                 self.toasts.add_toast(Adw.Toast(title=f"{entry.title} was also taken out of the rotation.", timeout=4))
         self.do_action(a, done, confirm=False)
 
-    def do_action(self, a, on_done=None, confirm=True):
+    def do_action(self, a, on_done=None, confirm=True, explained=False):
+        if a.choices:  # a question first; each answer is its own action (already explained here)
+            d = Adw.AlertDialog(heading=f"{a.label}?", body=a.note)
+            d.add_response("cancel", "Cancel")
+            for i, (text, choice) in enumerate(a.choices):
+                d.add_response(str(i), text + (" (password)" if choice.password else ""))
+            d.set_response_appearance(str(len(a.choices) - 1), Adw.ResponseAppearance.DESTRUCTIVE)
+            d.set_default_response("cancel")
+            d.set_close_response("cancel")
+            d.connect("response", lambda _d, r: r != "cancel" and self.do_action(
+                a.choices[int(r)][1], on_done, confirm=False, explained=True))
+            d.present(self)
+            return
         def show():
             if a.steps:
                 self._perform(a, on_done)
@@ -1513,7 +1685,7 @@ class Window(Adw.ApplicationWindow):
             self.toasts.add_toast(Adw.Toast(title=f"Prototype, nothing changed. Would run: {a.command}", timeout=6))
             if on_done:
                 on_done()
-        if a.password:  # always asked, even from right-click: say why a password will come up
+        if a.password and not explained:  # always asked, even from right-click: say why a password will come up
             d = Adw.AlertDialog(heading="This one needs your password",
                                 body=f"{a.password}\n\n{a.note + chr(10) * 2 if a.note else ''}"
                                      f"This {'will' if a.steps else 'would'} run:\n\n{a.command}"
@@ -1522,7 +1694,7 @@ class Window(Adw.ApplicationWindow):
                                         else "" if a.steps else "\n\n(Prototype: nothing will actually change.)"))
             d.add_response("cancel", "Cancel")
             d.add_response("ok", a.label)
-            d.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE if a.label == "Remove"
+            d.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE if a.label in ("Remove", "Hide")
                                       else Adw.ResponseAppearance.SUGGESTED)
             d.set_default_response("cancel")
             d.set_close_response("cancel")
@@ -1583,26 +1755,38 @@ class Window(Adw.ApplicationWindow):
                 self.toasts.add_toast(Adw.Toast(title=a.done or f"{a.label}: done.", timeout=4))
             if on_done:
                 on_done()
-            self._pending.add("local")  # lists, counts and ✓ marks follow the change, in one refresh
-            if any(st[0] == "use_font" or st[0] == "run" and st[1][0] == "omarchy-font-set" for st in a.steps):
+            applies_theme = any(st[0] == "run" and st[1][0] in ("omarchy-theme-set", "omarchy-theme-bg-set")
+                                for st in a.steps)
+            if applies_theme:
+                self._pending.add("marks")  # only which theme/background is current changed: no list reload
+            elif not any(st[0] == "apply_corners" for st in a.steps):  # corners change no list: restyle only
+                self._pending.add("local")  # lists, counts and ✓ marks follow the change, in one refresh
+            if any(st[0] in ("use_font", "apply_corners") or st[0] == "run" and st[1][0] == "omarchy-font-set"
+                   for st in a.steps):
                 self._pending.add("state")  # the window's own lettering follows the new font
         def finished_then_settle(result):
             finished(result)
             # Omarchy's last touches (background link, caches) land just after; refresh once they have.
             self._quiet_until = GLib.get_monotonic_time() + 1_500_000
             self._debounce("settle", 1600, self._settle)
-        bg(lambda: run.perform(a.steps, progress), finished_then_settle)
+        # A step can say "live now" mid-action (the new corner radius): restyle right then, so the
+        # window's own frame changes together with Hyprland's border instead of seconds later.
+        notify = lambda what: GLib.idle_add(lambda: (self.reload_theme(), False)[1])  # noqa: E731
+        bg(lambda: run.perform(a.steps, progress, notify), finished_then_settle)
 
     def _settle(self):
         """The single refresh after OmaSkins' own action(s): recolour once, rebuild once."""
         if self._running:
             return  # another action is still going; its own settle will do it
         pending, self._pending = self._pending, set()
+        dlog("settle, pending:", sorted(pending))
         if "state" in pending or "font" in pending:
             self.reload_theme()
+        if pending - {"state", "marks"}:
             self.current_theme, self._last_bg = data.current_theme_name(), data.current_background()
-        if pending:
-            self.load()
+            self.load()  # something beyond the current marks changed: re-read from disk
+        elif pending:
+            self._show_current_marks()  # a theme/background was applied: marks only, if not already done
 
     # ---- live theme
     def set_status(self, text):
@@ -1611,7 +1795,11 @@ class Window(Adw.ApplicationWindow):
     def reload_theme(self):
         t = theme.load_theme()
         self.font_base = t.font_px
-        css = theme.build_css(t)
+        # OmaSkins draws its own frame (Omarchy's menu style) just inside Hyprland's border. Round it to
+        # exactly Hyprland's window radius, or its square corner shows as a bright patch at the curve.
+        r = data.current_rounding() or 0
+        css = theme.build_css(t) + (f"\nwindow.omaskins, window.omaskins.csd, .frame-root {{ border-radius: {r}px; }}\n"
+                                    if r else "")
         if css == self._last_css:
             return
         self._last_css = css
@@ -1629,13 +1817,39 @@ class Window(Adw.ApplicationWindow):
             return False
         self._timers[key] = GLib.timeout_add(ms, fire)
 
+    def _theme_landed(self):
+        """omarchy-theme-set just swapped a new theme in (it writes theme.name right then): recolour,
+        and move the "Current" marks straight away, with the bar, instead of after the whole switch."""
+        dlog("theme.name changed")
+        self.reload_theme()
+        self._show_current_marks()
+
+    def _show_current_marks(self):
+        """Re-read the current theme and background; redraw the cards only if either differs from
+        what's on screen (no disk reload: only which theme/background is current changed)."""
+        cur, bgnow = data.current_theme_name(), data.current_background()
+        if (cur, bgnow) == (self.current_theme, self._last_bg):
+            dlog("marks already current:", cur)
+            return False
+        theme_moved = cur != self.current_theme
+        self.current_theme, self._last_bg = cur, bgnow
+        if theme_moved:
+            dlog("marks -> theme", cur)
+            if self.main_stack.get_visible_child_name() != "Backgrounds":
+                self._bg_follow_current = True  # don't pull the rug if you're looking at Backgrounds now
+            self.rebuild()
+        else:  # only the background moved (Omarchy sets it a moment after the theme): Backgrounds tab only
+            dlog("marks -> background only")
+            self._rebuild_bg_sidebar()
+        return True
+
     def _state_changed(self):
         # Themes are swapped in several steps (rm + mv + hooks): settle, then re-read.
         def apply():
+            dlog("state settled (Omarchy's picker)")
             self.reload_theme()
             old_theme, old_bg = self.current_theme, self._last_bg
-            self.current_theme, self._last_bg = data.current_theme_name(), data.current_background()
-            self.rebuild()  # the current theme and background marks may both have moved
+            self._show_current_marks()  # redraws only if the marks moved (theme.name may have done it)
             self._manual_change(self.current_theme != old_theme, self._last_bg != old_bg)
         # omarchy-theme-set touches these files several times over a few seconds: wait until they settle.
         self._debounce("state", 1000, apply)
@@ -1665,6 +1879,11 @@ class Window(Adw.ApplicationWindow):
         self._monitors.append(mon)
 
     def _watch_files(self):
+        # omarchy-theme-set writes theme.name right after the new theme is swapped in, the moment the
+        # bar recolours: recolour this window then too (colours only; lists refresh once at the end),
+        # instead of seconds later when the whole switch has finished. Works for OmaSkins' own Apply
+        # and for Omarchy's picker alike.
+        self._watch(data.STATE_DIR, lambda: self._debounce("recolor", 120, self._theme_landed), only="theme.name")
         self._watch(data.STATE_DIR, lambda: self._on_files_changed("state"))
         self._watch(data.USER_THEMES, lambda: self._on_files_changed("local"))
         self._watch(data.USER_BACKGROUNDS, lambda: self._on_files_changed("local"))
@@ -1678,8 +1897,10 @@ class Window(Adw.ApplicationWindow):
         just note it: one refresh at the end beats redrawing the window at every step of a theme
         switch, which made the UI flash and jump."""
         if self._running or GLib.get_monotonic_time() < self._quiet_until:
+            dlog("noted during own action:", kind)
             self._pending.add(kind)
         elif kind == "state":
+            dlog("state files changed")
             self._state_changed()
         elif kind == "font":
             self._debounce("font", 300, self._font_changed)  # a dragged slider writes many times
@@ -1701,6 +1922,10 @@ class App(Adw.Application):
     def do_activate(self):
         win = self.props.active_window or Window(self)
         win.present()
+        if _DEBUG:  # which renderer GTK really uses (the VM launcher asks for software, reports 04c/07)
+            GLib.timeout_add(800, lambda: (dlog("renderer:", type(win.get_renderer()).__name__,
+                                                "GSK_RENDERER=" + os.environ.get("GSK_RENDERER", ""),
+                                                "zink=" + os.environ.get("MESA_LOADER_DRIVER_OVERRIDE", "")), False)[1])
 
 
 def main():

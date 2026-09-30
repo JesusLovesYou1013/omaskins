@@ -13,7 +13,7 @@ Batch 2, fonts: Use (omarchy-font-set, no password) and adding/removing Nerd Fon
 run in Omarchy's floating terminal where pacman asks for the password; OmaSkins waits for them.
 
 (data.py also calls a few programs, all read-only: pacman -Q, fc-list, hyprctl getoption, magick
-for thumbnails in the app's own cache.)
+for thumbnails in the app's own cache, and `gh api graphql` for the themes' GitHub star counts.)
 """
 
 import json
@@ -48,12 +48,27 @@ def _one_arg(argv):
 _FONT_TERMINAL = re.compile(r"echo '(Installing|Removing) (\S+)\.\.\.'; omarchy-pkg-(add|drop) (\S+)")
 
 
+_BUILTIN_TERMINAL = re.compile(r"echo '(Hiding|Restoring|Reinstalling) ([a-z0-9][a-z0-9._-]*)\.\.\.'; .*", re.S)
+
+
 def _font_terminal(argv):
-    # Omarchy's floating terminal, and only ever to add or drop one Nerd Font package: the command
-    # string is rebuilt from the checked package name and must come out identical.
-    m = len(argv) == 2 and _FONT_TERMINAL.fullmatch(argv[1])
-    return bool(m and m.group(2) == m.group(4) and data.FONT_PKG_OK.fullmatch(m.group(2))
-                and argv[1] == data.font_terminal_command(m.group(3), m.group(2)))
+    # Omarchy's floating terminal, and only ever for one of two things, each command string rebuilt
+    # from a checked name and required to come out identical: adding/dropping one Nerd Font package,
+    # or hiding/restoring one built-in theme (move aside or back + its pacman.conf NoExtract rule).
+    if len(argv) != 2:
+        return False
+    m = _FONT_TERMINAL.fullmatch(argv[1])
+    if m:
+        return bool(m.group(2) == m.group(4) and data.FONT_PKG_OK.fullmatch(m.group(2))
+                    and argv[1] == data.font_terminal_command(m.group(3), m.group(2)))
+    m = _BUILTIN_TERMINAL.fullmatch(argv[1])
+    if not m:
+        return False
+    kind = {"Hiding": "hide", "Restoring": "unhide", "Reinstalling": "reinstall"}[m.group(1)]
+    try:
+        return argv[1] == data.builtin_terminal_command(kind, m.group(2), data.builtin_package())
+    except ValueError:
+        return False
 
 
 def _reload_signal(argv):
@@ -61,8 +76,19 @@ def _reload_signal(argv):
     return argv in (["pkill", "-USR1", "kitty"], ["pkill", "-SIGUSR2", "ghostty"])
 
 
+_B64 = re.compile(r"[A-Za-z0-9+/=]*")
+
+
+def _shell_restyle(argv):
+    # The one omarchy-shell call OmaSkins makes: the "re-read your style" message Omarchy's own
+    # theme switch sends (colors.toml / shell.toml of the current theme, base64), nothing else.
+    return len(argv) == 5 and argv[1:3] == ["shell", "applyTheme"] and all(_B64.fullmatch(a) for a in argv[3:])
+
+
 ALLOWED = {
     "omarchy-theme-set": None,
+    "omarchy-shell": _shell_restyle,
+    "hyprctl": lambda argv: argv == ["hyprctl", "reload"],
     "pkill": _reload_signal,
     "omarchy-font-set": _one_arg,
     "omarchy-launch-floating-terminal-with-presentation": _font_terminal,
@@ -254,24 +280,48 @@ def _cmdlines():
     return out
 
 
-def wait_package(pkg, want_installed, term_cmd, poll=1.0, grace=10.0, give_up=900.0,
-                 installed=package_installed, cmdlines=_cmdlines):
-    """Wait while the terminal does its work: done once pacman has the package added (or dropped) and
-    the add/drop script has exited (so the font cache is rebuilt too). If the terminal is gone and
-    nothing changed (closed, wrong password, cancelled), say so."""
-    verb = "add" if want_installed else "drop"
+def _wait_for_terminal(done, working, term_cmd, poll=1.0, grace=10.0, give_up=900.0, cmdlines=_cmdlines):
+    """Wait while Omarchy's floating terminal does its work: finished once done() and nothing is still
+    `working`; a clear failure if the terminal closes with the job not done (closed, wrong password)."""
     start = time.monotonic()
     while True:
         procs = cmdlines()
-        working = any(c.endswith(f"omarchy-pkg-{verb} {pkg}") for c in procs)
-        if installed(pkg) == want_installed and not working:
+        busy = working(procs)
+        if done() and not busy:
             return
         elapsed = time.monotonic() - start
-        if elapsed > grace and not working and not any(term_cmd in c for c in procs):
+        if elapsed > grace and not busy and not any(term_cmd in c for c in procs):
             raise StepFailed("the terminal closed before it finished (nothing changed)")
         if elapsed > give_up:
             raise StepFailed("gave up waiting for the terminal")
         time.sleep(poll)
+
+
+def wait_package(pkg, want_installed, term_cmd, poll=1.0, grace=10.0, give_up=900.0,
+                 installed=package_installed, cmdlines=_cmdlines):
+    """Done once pacman has the package added (or dropped) AND the add/drop script has exited (so the
+    font cache is rebuilt too)."""
+    verb = "add" if want_installed else "drop"
+    _wait_for_terminal(lambda: installed(pkg) == want_installed,
+                       lambda procs: any(c.endswith(f"omarchy-pkg-{verb} {pkg}") for c in procs),
+                       term_cmd, poll, grace, give_up, cmdlines)
+
+
+def builtin_state(name):
+    """(folder in Omarchy's themes, its NoExtract rule in pacman.conf) -- both readable without root."""
+    try:
+        rule = data._no_extract(name) in data.PACMAN_CONF.read_text().splitlines()
+    except OSError:
+        rule = False
+    return (data.BUILTIN_THEMES / name).is_dir(), rule
+
+
+def wait_builtin(name, hide, term_cmd, poll=1.0, grace=10.0, give_up=900.0, cmdlines=_cmdlines):
+    """Hidden = folder gone from Omarchy's themes + rule in pacman.conf; restored = folder back + rule
+    gone, and pacman (a reinstall) finished."""
+    want = (False, True) if hide else (True, False)
+    pacman_busy = lambda procs: any(re.search(r"(^|/)pacman -S ", c) for c in procs)  # noqa: E731
+    _wait_for_terminal(lambda: builtin_state(name) == want, pacman_busy, term_cmd, poll, grace, give_up, cmdlines)
 
 
 def use_font(pkg, family="", wait=10.0, fonts=None, fc_list=None):
@@ -408,6 +458,58 @@ def font_size(family):
     data.TEXT_SIZE_STATE.write_text(json.dumps({"base": base, "wrote": px}))
 
 
+def write_corners(on, px):
+    """OmaSkins' own ~/.config/hypr/omaskins.lua, then (once) the require line at the end of your
+    looknfeel.lua: after the theme's own look, so it wins for every theme; before Omarchy's toggles,
+    so "no gaps" can still square the corners. Nothing else in ~/.config/hypr is touched."""
+    looknfeel = data.HYPR_DIR / "looknfeel.lua"
+    if not looknfeel.is_file():
+        raise StepFailed("~/.config/hypr/looknfeel.lua is missing, so there's nowhere to load the corners from")
+    tmp = data.CORNERS_FILE.with_name(".omaskins.lua.tmp")
+    tmp.write_text(data.corners_file_text(on, max(0, min(data.CORNERS_MAX, int(px)))))
+    tmp.replace(data.CORNERS_FILE)  # the file exists before anything requires it
+    text = looknfeel.read_text()
+    if data.CORNERS_REQUIRE not in (l.strip() for l in text.splitlines()):
+        with looknfeel.open("a") as f:
+            f.write(("" if text.endswith("\n") or not text else "\n")
+                    + "\n-- Added by OmaSkins Manager: Global Rounded Corners (switch it off in OmaSkins).\n"
+                    + data.CORNERS_REQUIRE + "\n")
+
+
+def apply_corners(on, px, rounding=None, wait=2.0, poll=0.1):
+    """Save the corners and wait until Hyprland shows the new radius. Saving a file Hyprland loads
+    makes it reload by itself; a second, forced reload would blank this VM's screen twice. Only if
+    nothing changed within `wait` seconds is `hyprctl reload` run."""
+    rounding = rounding or data.current_rounding
+    before = rounding()
+    write_corners(on, px)
+    px = max(0, min(data.CORNERS_MAX, int(px)))
+    live = (lambda r: r == px) if on else (lambda r: r != before)
+    if on and before == px:
+        return  # already that radius: nothing for Hyprland to change
+    for forced in (False, True):
+        if forced:
+            run(["hyprctl", "reload"])
+        end = time.monotonic() + wait
+        while time.monotonic() < end:
+            if live(rounding()):
+                return
+            time.sleep(poll)
+    # Off can legitimately end on the same radius (the theme's own equals the old one): not an error.
+
+
+def shell_restyle(theme_dir=None):
+    """Ask the running Omarchy shell to re-read its style (it re-asks Hyprland for the corner
+    radius), with the current theme's colours, the same call omarchy-theme-set makes. No restart."""
+    import base64
+    theme_dir = Path(theme_dir or data.STATE_DIR / "theme")
+    payload = []
+    for name in ("colors.toml", "shell.toml"):
+        f = theme_dir / name
+        payload.append(base64.b64encode(f.read_bytes()).decode() if f.is_file() else "")
+    run(["omarchy-shell", "shell", "applyTheme", *payload])
+
+
 def check_mono(pkg, fonts=None, families=None):
     """After an install: a note if the package brought no monospace face (nothing to fail, but
     Omarchy's font menu won't list it); None when it's fine."""
@@ -421,12 +523,12 @@ def check_mono(pkg, fonts=None, families=None):
     return None
 
 
-def perform(steps, progress=None):
+def perform(steps, progress=None, notify=None):
     """Carry out an action's steps in order; stop at the first failure (StepFailed says why).
     A failed or refused theme download never leaves its half-finished folder behind.
     progress(percent), if given, hears how a theme download is going (called on this thread)."""
     try:
-        return _perform(steps, progress)
+        return _perform(steps, progress, notify)
     except Exception:
         for step in steps:
             if step[0] == "clear_partial":
@@ -438,7 +540,7 @@ def perform(steps, progress=None):
                 shutil.rmtree(_removing(step[1]), ignore_errors=True)
 
 
-def _perform(steps, progress=None):
+def _perform(steps, progress=None, notify=None):
     """Returns a note to show instead of the usual "done" message, if a step had one."""
     note = None
     for step in steps:
@@ -475,6 +577,21 @@ def _perform(steps, progress=None):
             wait_package(*args)
         elif kind == "use_font":
             use_font(*args)
+        elif kind == "hide_in_omaskins":
+            data.set_hidden_in_omaskins(args[0], args[1])
+        elif kind == "note_removed_version":
+            data.note_removed_version(*args)
+        elif kind == "wait_builtin":
+            wait_builtin(*args)
+        elif kind == "write_corners":
+            write_corners(*args)
+        elif kind == "apply_corners":
+            apply_corners(*args)
+        elif kind == "notify":  # tell the window something is live now (it restyles itself)
+            if notify:
+                notify(args[0])
+        elif kind == "shell_restyle":
+            shell_restyle()
         elif kind == "remember_text_size":
             remember_text_size()
         elif kind == "font_size":

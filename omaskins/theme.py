@@ -358,6 +358,13 @@ gridview > child:focus-visible {{ outline: 1px solid {sel_border}; outline-offse
 .tile.current {{ border-color: {rgba(accent, 0.7)}; background: {sel_fill}; }}
 .thumb {{ background: {rgba(fg, 0.05)}; border: 1px solid {line}; }}
 .card-name {{ font-weight: bold; color: {fg}; }}
+/* One button height for the theme card's Apply and the theme page's buttons (owner: a comfortable
+   click target, +5 px over a badge). Every card's title row gets it too, so cards stay level. */
+.card-apply, .card-apply button, button.omarchy-btn.card-apply {{ min-height: {int(t.font_px * 1.3) + 5}px; padding: 0 10px; font-size: {t.font_px * 0.85:.1f}px; }}
+.font-in-group {{ margin-left: 36px; }}   /* a package's fonts, indented under its header */
+.font-group {{ border-top: 1px solid {rgba(fg, 0.12)}; }}
+.card-row {{ min-height: {int(t.font_px * 1.3) + 5}px; }}
+.page-actions button.omarchy-btn {{ min-height: {int(t.font_px * 1.3) + 5}px; padding: 0 12px; }}
 .tile .installed-mark {{ font-size: {t.font_px * 1.2:.1f}px; min-width: 0; }}
 
 /* Backgrounds: theme list down the left edge */

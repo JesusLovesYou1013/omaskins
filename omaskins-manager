@@ -3,6 +3,22 @@
 import os
 import sys
 
+
+def _in_try_omarchy_vm():
+    try:
+        with open("/proc/cmdline") as f:
+            return "omarchy.qemu=1" in f.read().split()
+    except OSError:
+        return False
+
+
+# Try Omarchy VM: GTK's OpenGL renderer on virgl garbles tooltips and other small popups, and Zink
+# (inherited from a terminal that uses it) swaps red and blue. Draw in software there; on real
+# hardware GTK keeps its GPU renderer. An explicit GSK_RENDERER still wins. (Try Omarchy reports 04c, 07.)
+if _in_try_omarchy_vm():
+    os.environ.setdefault("GSK_RENDERER", "cairo")
+    os.environ.pop("MESA_LOADER_DRIVER_OVERRIDE", None)
+
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from omaskins.app import main  # noqa: E402
