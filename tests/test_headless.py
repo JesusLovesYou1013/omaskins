@@ -2558,6 +2558,82 @@ class NautilusTransparency(unittest.TestCase):
                                  "window = 'address:0xnew' }))"])
 
 
+class SkipAhead(unittest.TestCase):
+    """The bar's palette menu: next theme or background now, the rotation's way, without pausing it."""
+
+    def setUp(self):
+        build_fixture()
+        from omaskins import rotation
+        self.r = rotation
+        rotation.REQUEST = SANDBOX / "run/omaskins-next"
+        shutil.rmtree(SANDBOX / "run", ignore_errors=True)
+        data.ROTATION_STATE.unlink(missing_ok=True)
+        data.ROTATION_FILE.unlink(missing_ok=True)
+
+        class FakeDesktop:
+            def __init__(self):
+                self.did = []
+
+            def set_theme(self, name, background=None):
+                self.did.append(("rotation theme", name))
+                write(data.STATE_DIR / "theme.name", name)
+                return True
+
+            def apply_theme(self, name):
+                self.did.append(("omarchy theme", name))
+                write(data.STATE_DIR / "theme.name", name)
+                return True
+
+            def set_background(self, path):
+                self.did.append(("background", str(path)))
+                return True
+
+            def next_background(self):
+                self.did.append(("omarchy next background",))
+                return True
+        self.desk = FakeDesktop()
+
+    def test_without_rotation_omarchys_own_next(self):
+        names = self.r.all_themes()
+        self.assertGreater(len(names), 1)
+        write(data.STATE_DIR / "theme.name", names[0])
+        self.assertTrue(self.r.skip_ahead(self.desk, "theme"))
+        self.assertEqual(self.desk.did, [("omarchy theme", names[1])], "the next theme by name, Omarchy's apply")
+        self.assertTrue(self.r.skip_ahead(self.desk, "background"))
+        self.assertEqual(self.desk.did[-1], ("omarchy next background",))
+
+    def test_not_counted_as_your_pick(self):
+        names = self.r.all_themes()
+        write(data.STATE_DIR / "theme.name", names[0])
+        self.r.skip_ahead(self.desk, "theme")
+        st = data.rotation_status()
+        self.assertEqual(st["last_theme"], names[1], "the engine's own change: the schedule carries on")
+        self.assertNotIn("pick_skip", st)
+
+    def test_with_theme_rotation_its_own_list(self):
+        names = self.r.all_themes()[:3]
+        plan = data.RotationPlan(names[0])
+        plan.themes = True
+        plan.checked["All day"] = list(names)
+        data.save_rotation(plan)
+        write(data.STATE_DIR / "theme.name", names[0])
+        self.r.skip_ahead(self.desk, "theme")
+        self.assertEqual(self.desk.did[-1][0], "rotation theme")
+        self.assertIn(self.desk.did[-1][1], names[1:], "one of the rotation's themes, not the current one")
+
+    def test_asks_the_running_engine(self):
+        import fcntl
+        lock = open(self.r.REQUEST.with_name("omaskins-rotate.lock"), "w") if self.r.REQUEST.parent.mkdir(parents=True, exist_ok=True) is None else None
+        fcntl.flock(lock, fcntl.LOCK_EX)   # an engine is running
+        try:
+            self.assertTrue(self.r.request_next("background"))
+            self.assertEqual(self.r.take_request(), "background")
+            self.assertIsNone(self.r.take_request(), "taken once")
+            self.assertFalse(self.r.request_next("anything"))
+        finally:
+            lock.close()
+
+
 class FileDialogs(unittest.TestCase):
     """File dialogs (GTK3, Omarchy's dialog service) look like Nautilus, at the slider's level."""
 

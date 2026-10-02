@@ -5,13 +5,34 @@ your desktop in one place: themes, backgrounds and fonts, a rotation that change
 schedule, window transparency, and Qt apps and file dialogs that follow the theme. Also called
 OmaSkins for short.
 
-> Everything works and changes your system through Omarchy's own commands. It isn't packaged as an
-> installable Omarchy plugin yet; that's the next step.
+> Everything works and changes your system through Omarchy's own commands. Still being tested as an
+> installable plugin.
 
 **Requirements:** Python 3 with PyGObject, GTK4 and libadwaita, plus ImageMagick for thumbnails.
-All of these ship with a stock Omarchy install.
+All of these ship with a stock Omarchy install. Installing needs no password.
 
-    ./omaskins-manager
+## Install
+
+    omarchy plugin add https://github.com/JesusLovesYou1013/omaskins.git --enable
+
+Or **Setup › Plugins › Add Plugin** with that URL. Enabling puts OmaSkins' palette icon in the bar.
+
+## The palette icon
+
+Click it for **Next background**, **Next theme** or **Open OmaSkins** (in Omarchy's own menu). Next
+follows your rotation's lists when it rotates that (no repeats until each has had its turn), and the
+schedule carries on as before; without a rotation it's Omarchy's own next background, or the next
+installed theme.
+
+The icon is also what keeps OmaSkins on: removing it from the bar (or disabling the plugin) stops the
+rotation.
+
+## Remove
+
+    omarchy plugin remove io.github.jesuslovesyou1013.omaskins
+
+Before removing, set **Transparency** back to step 2 and switch **Qt apps** off in OmaSkins, so its
+look settings go with it (see "What it writes" below).
 
 ## Tabs
 

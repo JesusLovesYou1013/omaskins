@@ -153,6 +153,20 @@ class Desktop:
         except (OSError, subprocess.SubprocessError):
             return False
 
+    def apply_theme(self, name):
+        """Omarchy's own apply (it picks the theme's background as usual)."""
+        try:
+            return subprocess.run(["omarchy-theme-set", data.theme_folder_for(name)], capture_output=True,
+                                  timeout=180).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
+    def next_background(self):
+        try:
+            return subprocess.run(["omarchy-theme-bg-next"], capture_output=True, timeout=30).returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            return False
+
     def set_background(self, path):
         try:
             return subprocess.run(["omarchy-theme-bg-set", path], capture_output=True, text=True,
@@ -397,6 +411,107 @@ def change(desktop, plan, st, theme, current, themes, others, pool, rng, now):
 _ENABLED = {}
 
 
+# --------------------------------------------------------------------------- skip ahead (the bar's palette menu)
+#
+# The palette menu asks the running engine (one writer for the rotation's state): it leaves the request in
+# REQUEST and the engine carries it out within half a second. Skipping ahead is the rotation moving on early,
+# not "your pick": the schedule carries on as before (no pause, no notification).
+REQUEST = Path(os.environ.get("XDG_RUNTIME_DIR") or data.OMASKINS_STATE) / "omaskins-next"
+WHATS = ("theme", "background")
+
+
+def request_next(what):
+    """Ask the engine; if none is running (the plugin is off), do it right here."""
+    if what not in WHATS:
+        return False
+    lock = REQUEST.with_name("omaskins-rotate.lock")
+    try:
+        with open(lock, "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            running = False
+            fcntl.flock(f, fcntl.LOCK_UN)
+    except OSError:
+        running = True
+    if not running:
+        return skip_ahead(Desktop(), what)
+    REQUEST.parent.mkdir(parents=True, exist_ok=True)
+    tmp = REQUEST.with_name(".omaskins-next.tmp")
+    tmp.write_text(what + "\n")
+    tmp.replace(REQUEST)
+    return True
+
+
+def take_request():
+    try:
+        what = REQUEST.read_text().strip()
+        REQUEST.unlink()
+    except OSError:
+        return None
+    return what if what in WHATS else None
+
+
+def all_themes():
+    """Installed themes in Omarchy's own order (by name), the ones hidden in OmaSkins left out."""
+    names = set()
+    for root in (data.USER_THEMES, data.BUILTIN_THEMES):
+        try:
+            names |= {d.name for d in root.iterdir() if d.is_dir()}
+        except OSError:
+            pass
+    return sorted(names - data.hidden_in_omaskins(), key=str.lower)
+
+
+def skip_ahead(desktop, what, rng=random, now=None):
+    """The next theme or background now. From the rotation's own lists, in its no-repeat rounds, when it
+    rotates that; otherwise Omarchy's own next background, or the next installed theme (Omarchy's own
+    apply, which picks its background as usual)."""
+    now = time.time() if now is None else now
+    st = load_state()
+    theme = data.current_theme_name()
+    plan = data.load_rotation(theme)
+    current = canonical_background(theme)
+    for key in ("theme_shown", "bg_shown"):
+        st[key] = [s for s in st.get(key, []) if isinstance(s, str)]
+    themes = [n for n in plan.checked.get(plan.period_now(time.localtime(now)), []) if installed_theme(n)]
+    ok = False
+    if what == "theme":
+        if plan.themes and [n for n in themes if n != theme]:
+            pick = choose(themes, st["theme_shown"], theme, rng, key=str)
+            bg = choose(plan.pool(pick), [], None, rng) if plan.backgrounds else None
+            if real(data.STATE_DIR / "background") != current and os.path.isfile(current):
+                desktop.set_background(current)   # off Omarchy's copy of the old theme first (no visible change)
+            ok = desktop.set_theme(pick, bg)
+            if ok:
+                st["theme_shown"].append(pick)
+        else:
+            names = all_themes()
+            if theme in names and len(names) > 1:
+                pick = names[(names.index(theme) + 1) % len(names)]
+            else:
+                pick = names[0] if names else None
+            ok = bool(pick) and desktop.apply_theme(pick)
+        if ok:
+            theme = data.current_theme_name()
+            current = canonical_background(theme)
+            st["bg_shown"] = [current]
+    elif what == "background":
+        pool = plan.mixed_pool(themes) if plan.mix and plan.themes and plan.backgrounds else \
+            plan.pool(theme) if plan.backgrounds else []
+        shown = st.setdefault("mix_shown", []) if plan.mix and plan.themes and plan.backgrounds else st["bg_shown"]
+        bg = choose(pool, shown, current, rng) if pool else None
+        ok = desktop.set_background(bg) if bg else desktop.next_background()
+        if ok:
+            current = canonical_background(theme)
+            if not bg:
+                st["bg_shown"].append(current)
+    if ok:
+        log("skipped ahead:", what, theme, current)
+        # The engine's own change: not counted as your pick (no pause of the schedule).
+        st.update(last_theme=theme, last_bg=current, last_change={"at": now, "theme": theme, "path": current})
+        save_state(st)
+    return ok
+
+
 def mix_it_up(desktop, plan, st, theme, current, themes, others, rng, now):
     """Mix it up! (owner, 2026-09-30): every slot pairs the next theme with the next background drawn
     from ALL the bright backgrounds of ALL the themes in the list (the current period's, with Dawn &
@@ -590,6 +705,12 @@ def run(plugin_id=None):
                 log("omaskins.lua brought up to date")
         except Exception as e:
             log("omaskins.lua update failed:", repr(e))
+    # Double-clicking an exported .omaskins file opens OmaSkins, from the moment it's installed.
+    try:
+        from . import share
+        share.register_file_type()
+    except Exception as e:
+        log("file type registration failed:", repr(e))
     qt = QtApps()
     dialogs = DialogLook()
     try:
@@ -606,6 +727,12 @@ def run(plugin_id=None):
             # file stamps: next to nothing), so they follow within a second instead of up to five.
             end = time.monotonic() + TICK
             while True:
+                what = take_request()
+                if what:
+                    try:
+                        skip_ahead(desktop, what)
+                    except Exception as e:
+                        log("skip ahead failed:", repr(e))
                 qt.glance()
                 dialogs.glance()
                 left = end - time.monotonic()
@@ -623,8 +750,10 @@ def main(argv):
     if argv == ["tick"]:
         print(json.dumps(tick(Desktop()), indent=1, sort_keys=True))
         return 0
+    if len(argv) == 2 and argv[0] == "next":
+        return 0 if request_next(argv[1]) else 1
     if argv == ["status"]:
         print(json.dumps(data.rotation_status(), indent=1, sort_keys=True))
         return 0
-    print("usage: omaskins-rotate run [--plugin-id <id>] | tick | status", file=sys.stderr)
+    print("usage: omaskins-rotate run [--plugin-id <id>] | tick | status | next theme|background", file=sys.stderr)
     return 2
