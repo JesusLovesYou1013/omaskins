@@ -8,7 +8,7 @@ import Quickshell.Io
 // shell exits, and a crashed engine is restarted after a pause. The engine also stops by
 // itself once the plugin is disabled (it checks shell.json). -B: Python writes no
 // __pycache__ here, since any file change in a plugin folder makes the shell reload it.
-// While on, the engine also puts OmaSkins in the app launcher and in Omarchy's menu (Style ›
+// While on, the engine also puts OmaSkins in Omarchy's menu (Style ›
 // OmaSkins); turning the plugin off takes them away again (removeCommand below).
 Item {
   id: root
@@ -33,8 +33,8 @@ Item {
     onTriggered: engine.running = true
   }
 
-  // Turned off or removed: OmaSkins leaves Omarchy's menu (Style › OmaSkins), the app launcher and the
-  // .omaskins file type. Inline, not in a script, because `omarchy plugin remove` deletes this folder
+  // Turned off or removed: OmaSkins leaves Omarchy's menu (Style › OmaSkins), and its hidden launcher
+  // entry and the .omaskins file type go too. Inline, not in a script, because `omarchy plugin remove` deletes this folder
   // right after disabling it (CtrlZ Guard's way). The service is also destroyed on a normal shell exit or
   // reload; while the id is still in shell.json (as a plugin or its bar icon) this does nothing.
   readonly property string removeCommand:

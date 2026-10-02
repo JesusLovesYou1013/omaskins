@@ -187,7 +187,8 @@ MIMEAPPS = Path(os.environ.get("XDG_CONFIG_HOME") or data.HOME / ".config") / "m
 
 
 def _desktop_entry(launcher=None):
-    """OmaSkins in the app launcher (Super + Space) and the app opened for its setups."""
+    """The app opened for OmaSkins setups. Hidden (owner, 2026-10-02: OmaSkins lives in Style › OmaSkins
+    only, not in Apps or the app launcher)."""
     launcher = launcher or Path(__file__).resolve().parent.parent / "omaskins-manager"
     return ("[Desktop Entry]\n"
             "Type=Application\n"
@@ -197,8 +198,7 @@ def _desktop_entry(launcher=None):
             f'Exec="{launcher}" %f\n'
             "Icon=preferences-desktop-theme\n"
             f"MimeType={MIME_TYPE};\n"
-            "Categories=Settings;DesktopSettings;\n"
-            "Keywords=theme;background;wallpaper;font;rotation;transparency;omarchy;\n"
+            "NoDisplay=true\n"
             "Terminal=false\n")
 
 

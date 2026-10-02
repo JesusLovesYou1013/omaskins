@@ -2051,7 +2051,7 @@ class ShareImport(unittest.TestCase):
         self.assertTrue(str(self.share.MIME_PACKAGE).startswith(str(HOME)), "yours only, never system-wide")
         entry = self.share.APP_DESKTOP.read_text()
         self.assertIn("MimeType=application/x-omaskins-setup;\n", entry, "that type only")
-        self.assertNotIn("NoDisplay", entry, "OmaSkins shows in the app launcher (owner, 2026-10-02)")
+        self.assertIn("NoDisplay=true", entry, "not in Apps or the launcher: Style › OmaSkins only (owner, 2026-10-02)")
         self.assertIn("application/x-omaskins-setup=io.github.jesuslovesyou1013.omaskins.desktop",
                       self.share.MIMEAPPS.read_text())
         self.share.MIMEAPPS.write_text("[Default Applications]\napplication/x-omaskins-setup=other.desktop\n")

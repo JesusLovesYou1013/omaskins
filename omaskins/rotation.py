@@ -709,7 +709,7 @@ def run(plugin_id=None):
                 log("omaskins.lua brought up to date")
         except Exception as e:
             log("omaskins.lua update failed:", repr(e))
-    # OmaSkins in the app launcher, in Style › OmaSkins, and double-clicking an exported .omaskins file
+    # OmaSkins in Style › OmaSkins, and double-clicking an exported .omaskins file
     # opens it, from the moment it's installed (Service.qml takes them away when the plugin goes off).
     launcher = Path(__file__).resolve().parent.parent / "omaskins-manager"
     try:

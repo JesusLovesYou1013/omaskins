@@ -23,12 +23,10 @@ Once it's on, any of these:
 
 - **Style › OmaSkins** in Omarchy's menu (the last row of Style: rows a plugin adds always come after
   Omarchy's own);
-- the app launcher (**Super + Space**, type "OmaSkins");
 - the palette icon in the bar › **Open OmaSkins**;
 - double-click an exported `.omaskins` file.
 
-Turning OmaSkins off or removing it takes the menu row, the launcher entry and the file type away
-again.
+Turning OmaSkins off or removing it takes the menu row and the file type away again.
 
 ## The palette icon
 
