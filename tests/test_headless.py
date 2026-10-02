@@ -2328,7 +2328,8 @@ rules, tags = {}, { ["0xa"] = {}, ["0xb"] = {} }
 local Rule = {}
 Rule.__index = Rule
 function Rule:set_enabled(on) self.on = on end
-hl = { dsp = { window = { tag = function(t) return t end } }, config = function() end }
+hl = { dsp = { window = { tag = function(t) return t end } }, config = function() end,
+       layer_rule = function(r) r.on = true; return setmetatable(r, Rule) end }
 function hl.window_rule(r) r.on = true; setmetatable(r, Rule); rules[#rules + 1] = r; return r end
 function hl.dispatch(t)
   local w = t.window:sub(9)
@@ -2400,7 +2401,8 @@ print(#rules, on, table.concat(names, " "), seen)
         lua = SANDBOX / "reader.lua"
         data.save_transparency(3)
         lua.write_text("o = { window = function(m, r) print('rule', m.class or m.tag, r.tag or r.opacity, r.tag and r.opacity or '') end }\n"
-                       "hl = { config = function(c) print('blur', c.decoration.blur.enabled) end }\n"
+                       "hl = { config = function(c) print('blur', c.decoration.blur.enabled) end,\n"
+                       "       layer_rule = function(r) print('layer blur', r.match.namespace ~= nil) end }\n"
                        + data.TRANSPARENCY_LUA)
         out = subprocess.run(["lua", str(lua)], capture_output=True, text=True,
                              env=dict(os.environ, XDG_CONFIG_HOME=str(HOME / ".config"))).stdout
@@ -2481,7 +2483,7 @@ class NautilusTransparency(unittest.TestCase):
             _run.apply_transparency(2, evaluate=calls.append, clients=lambda: clients, sleep=lambda s: None)
             self.assertTrue(any("retag({ '0xa' }" in c for c in calls))
             self.assertFalse(any("0xn" in c for c in calls), "Nautilus isn't faded by Hyprland")
-            self.assertTrue(calls[-1].endswith("nautilus(true)"), "its own: out of Hyprland's fade")
+            self.assertTrue(any(c.endswith("nautilus(true)") for c in calls), "its own: out of Hyprland's fade")
             self.assertEqual(restarted, [{"/org/gnome/Nautilus/window/1": ["file:///home/x/Downloads"]}])
             restarted.clear()
             _run.apply_transparency(2, evaluate=calls.append, clients=lambda: clients, sleep=lambda s: None)
@@ -2577,6 +2579,39 @@ class PluginEnabled(unittest.TestCase):
         self.assertTrue(self.check({"plugins": [me]}))
         self.assertFalse(self.check({"bar": {"layout": {"right": [{"id": "omarchy.clock"}]}}, "plugins": []}),
                          "icon removed from the bar: off")
+
+
+class ShellSurfaces(unittest.TestCase):
+    """Omarchy's menus, panels and notifications at the step, through the shell's own live setting."""
+
+    def setUp(self):
+        self.assertTrue(str(data.SHELL_TOML).startswith(str(SANDBOX)), "never the real shell.toml")
+        data.SHELL_TOML.unlink(missing_ok=True)
+        data.TRANSPARENCY_FILE.unlink(missing_ok=True)
+
+    def test_block_beside_omarchys_text_size(self):
+        write(data.SHELL_TOML, "[font]\nbase-size = 14\n")
+        self.assertTrue(data.write_shell_block(4))
+        text = data.SHELL_TOML.read_text()
+        self.assertTrue(text.startswith("[font]\nbase-size = 14\n"), "Omarchy's text size untouched")
+        for surface in data.SHELL_SURFACES:
+            self.assertIn(f"[{surface}]\nbackground-alpha = 0.65\n", text)
+        self.assertTrue(data.write_shell_block(3))
+        self.assertEqual(data.SHELL_TOML.read_text().count(data.SHELL_START), 1, "replaced, not stacked")
+        self.assertIn("background-alpha = 0.75", data.SHELL_TOML.read_text())
+        self.assertTrue(data.write_shell_block(data.TRANSPARENCY_DEFAULT))
+        self.assertEqual(data.SHELL_TOML.read_text(), "[font]\nbase-size = 14\n", "Omarchy's look again, file as it was")
+
+    def test_the_fade_sets_it_and_the_blur(self):
+        calls = []
+        write(HOME / ".config/hypr/looknfeel.lua", "-- looknfeel\n")
+        _run.apply_transparency(4, evaluate=calls.append, clients=lambda: [], sleep=lambda s: None)
+        self.assertIn("background-alpha = 0.65", data.SHELL_TOML.read_text())
+        self.assertTrue(any(c.endswith("shell_blur(true)") for c in calls))
+        calls.clear()
+        _run.apply_transparency(1, evaluate=calls.append, clients=lambda: [], sleep=lambda s: None)
+        self.assertFalse(data.SHELL_TOML.exists(), "nothing of ours (and the file was only ours)")
+        self.assertTrue(any(c.endswith("shell_blur(false)") for c in calls))
 
 
 class MenuRow(unittest.TestCase):

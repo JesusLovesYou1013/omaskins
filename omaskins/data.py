@@ -1894,6 +1894,31 @@ TRANSPARENCY_DEFAULT = 1
 # points apart instead of 5 (owner, 2026-10-02: step 4 = the old step 5, which is what they use).
 TRANSPARENCY_STEPS = ((1.0, 1.0, False), None, (0.85, 0.80, True), (0.75, 0.68, True), (0.65, 0.56, True))
 TRANSPARENCY_BLUR = "hl.config({ decoration = { blur = { enabled = true, size = 5, passes = 2 } } })"
+# Omarchy's own menus, panels (the bar's dropdowns) and notifications: the shell draws them itself, so
+# Hyprland's window fade never reaches them. The shell has its own setting for each (`background-alpha`,
+# solid by default), read live from your ~/.config/omarchy/shell.toml, where Omarchy's text size also lives
+# (its command edits only its own line). OmaSkins keeps its values there in a marked block, at the focused
+# level of the step; none at the default step. Hyprland blurs behind them by the names Omarchy gives them.
+SHELL_TOML = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy" / "shell.toml"
+SHELL_START = "# >>> OmaSkins: menus, panels and notifications see-through at the Transparency step (set it in OmaSkins)"
+SHELL_END = "# <<< OmaSkins"
+SHELL_SURFACES = ("menu", "popups", "notifications")
+SHELL_NAMESPACES = "^(omarchy-menu|omarchy-keyboard-panel|omarchy-notifications|omarchy-clipboard|omarchy-emojis)$"
+SHELL_BLUR_RULE = f'hl.layer_rule({{ match = {{ namespace = "{SHELL_NAMESPACES}" }}, blur = true, ignore_alpha = 0.05 }})'
+
+
+def shell_block(step):
+    if step == TRANSPARENCY_DEFAULT:
+        return ""
+    a = transparency_values(step)[0]
+    return "\n".join([SHELL_START] + [f"[{s}]\nbackground-alpha = {a:g}\n" for s in SHELL_SURFACES] + [SHELL_END]) + "\n"
+
+
+def write_shell_block(step):
+    """OmaSkins' block in ~/.config/omarchy/shell.toml (the shell picks it up live). True if changed."""
+    return _write_css_block(SHELL_TOML, SHELL_START, SHELL_END, shell_block(step))
+
+
 TRANSPARENCY_LUA = """
 -- OmaSkins makes only its own background see-through (its previews stay solid), so Hyprland leaves its
 -- windows out of the whole-window fade.
@@ -1928,6 +1953,7 @@ if type(omaskins_t) == "string" then
     o.window({ tag = "default-opacity" }, { opacity = a .. " " .. b })
     if blur == "blur" then
       """ + TRANSPARENCY_BLUR + """
+      """ + SHELL_BLUR_RULE + """
     end
   end
 end

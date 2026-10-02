@@ -34,12 +34,15 @@ Item {
   }
 
   // Turned off or removed: OmaSkins leaves Omarchy's menu (Style › OmaSkins), and its hidden launcher
-  // entry, the .omaskins file type and its copy of GTK3's dark theme (if it wrote one) go too. Inline, not in a script, because `omarchy plugin remove` deletes this folder
+  // entry, the .omaskins file type, its copy of GTK3's dark theme (if it wrote one) and its transparency
+  // for Omarchy's menus and panels (shell.toml) go too. Inline, not in a script, because `omarchy plugin remove` deletes this folder
   // right after disabling it (CtrlZ Guard's way). The service is also destroyed on a normal shell exit or
   // reload; while the id is still in shell.json (as a plugin or its bar icon) this does nothing.
   readonly property string removeCommand:
     "sleep 1; c=\"${XDG_CONFIG_HOME:-$HOME/.config}\"; d=\"${XDG_DATA_HOME:-$HOME/.local/share}\"; " +
     "grep -qF '\"" + pluginId + "\"' \"$c/omarchy/shell.json\" 2>/dev/null && exit 0; " +
+    "s=\"$c/omarchy/shell.toml\"; " +
+    "[ -f \"$s\" ] && sed -i --follow-symlinks '/^# >>> OmaSkins: menus, panels/,/^# <<< OmaSkins/d' \"$s\"; " +
     "f=\"$c/omarchy/extensions/omarchy-menu.jsonc\"; " +
     "[ -f \"$f\" ] && sed -i --follow-symlinks '/^  \\/\\/ >>> OmaSkins/,/^  \\/\\/ <<< OmaSkins/d' \"$f\"; " +
     "rm -f \"$d/applications/" + pluginId + ".desktop\" \"$d/mime/packages/" + pluginId + ".xml\"; " +

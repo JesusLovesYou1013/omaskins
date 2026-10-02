@@ -903,6 +903,13 @@ local function nautilus(own, a, b)
       or hl.window_rule({ match = m, opacity = a .. " " .. b })
   end
 end
+local function shell_blur(on)
+  -- Blur behind Omarchy's menus, panels and notifications (see data.SHELL_BLUR_RULE).
+  if not F.shell_blur then
+    F.shell_blur = """ + data.SHELL_BLUR_RULE + """
+  end
+  F.shell_blur:set_enabled(on)
+end
 local function dialogs(own)
   -- File dialogs (Omarchy's dialog service) out of Hyprland's fade while OmaSkins styles them.
   if not F.dialogs then
@@ -968,6 +975,10 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
         evaluate(FADE_LUA + f"nautilus(false, '{data.OMARCHY_OPACITY[0]:g}', '{data.OMARCHY_OPACITY[1]:g}')")
     else:
         evaluate(FADE_LUA + "nautilus(true)")
+    # Omarchy's menus, panels and notifications: the shell re-reads its file live; blur behind them with
+    # the windows' blur.
+    data.write_shell_block(step)
+    evaluate(FADE_LUA + f"shell_blur({'true' if after[2] else 'false'})")
     if data.write_nautilus_css(step):
         open_windows = nautilus_windows()
         if open_windows:
