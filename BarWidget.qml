@@ -1,10 +1,12 @@
 import QtQuick
 import Quickshell
+import Quickshell.Io
 import qs.Commons
 import qs.Ui
 
-// OmaSkins' palette in the bar. A click drops a small panel down from the icon (Omarchy's own panel, like
-// its other bar widgets): Next background, Next theme, Open OmaSkins. "Next" asks OmaSkins' rotation
+// OmaSkins' palette in the bar. A click drops a small panel down from the icon (Omarchy's own panel, laid
+// out like its Audio and Tailscale panels: a header with the current theme, then the actions): Next
+// background, Next theme, Open OmaSkins. "Next" asks OmaSkins' rotation
 // engine, so a skip follows the rotation's own lists and the schedule carries on. Arrow keys and Enter work,
 // Esc or a click elsewhere closes it. Drawn in the bar's and the popups' colours, so it follows every theme.
 Panel {
@@ -17,6 +19,19 @@ Panel {
   readonly property string pluginDir:
     decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, ""))
   property int cursor: -1
+  property string themeName: ""
+
+  // "tokyo-night" -> "Tokyo Night", the way Omarchy's theme menu shows names.
+  readonly property string themeLabel: themeName.split("-").map(function(w) {
+    return w ? w.charAt(0).toUpperCase() + w.slice(1) : w
+  }).join(" ")
+
+  FileView {
+    path: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme.name"
+    watchChanges: true
+    onFileChanged: reload()
+    onLoaded: root.themeName = text().trim()
+  }
 
   readonly property var actions: [
     { icon: "󰋩", label: "Next background", command: "omaskins-rotate next background" },
@@ -78,6 +93,26 @@ Panel {
         id: column
         width: parent.width
         spacing: Style.space(2)
+
+        PanelHero {
+          width: parent.width
+          title: "OmaSkins"
+          meta: root.themeLabel
+          foreground: Color.popups.text
+          fontFamily: root.fontFamily
+          iconComponent: Component {
+            Text {
+              text: "󰏘"
+              color: Color.popups.text
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+            }
+          }
+        }
+
+        PanelSeparator {
+          foreground: Color.popups.text
+        }
 
         Repeater {
           model: root.actions
