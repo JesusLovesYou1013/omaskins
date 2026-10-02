@@ -3,6 +3,10 @@
 import os
 import sys
 
+# Never write Python's cache into the plugin folder: Omarchy reloads the plugin on any file change there.
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"   # and nothing it starts writes it either
+
 
 def _in_try_omarchy_vm():
     try:

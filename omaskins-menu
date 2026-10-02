@@ -1,0 +1,20 @@
+#!/bin/bash
+
+# omarchy:summary=OmaSkins' bar menu: next theme or background, or open OmaSkins
+#
+# Kept for a shell still running the older palette icon (the shell keeps a plugin's QML until it
+# restarts); the current icon drops its own small panel instead. Shown in Omarchy's own menu. "Next"
+# asks OmaSkins' rotation engine, so a skip follows the rotation's own lists when it rotates that.
+
+dir="$(dirname "$(realpath "$0")")"
+
+choice=$(omarchy-menu-select "OmaSkins" \
+  $'󰋩\tNext background' \
+  $'󰏘\tNext theme' \
+  $'󰏌\tOpen OmaSkins' 2>/dev/null) || exit 0
+
+case "$choice" in
+  "Next background") "$dir/omaskins-rotate" next background ;;
+  "Next theme") "$dir/omaskins-rotate" next theme ;;
+  "Open OmaSkins") setsid -f uwsm-app -- "$dir/omaskins-manager" >/dev/null 2>&1 ;;
+esac

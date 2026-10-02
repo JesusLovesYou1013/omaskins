@@ -3,6 +3,9 @@
 import os
 import sys
 
+# Never write Python's cache into the plugin folder: Omarchy reloads the plugin on any file change there.
+sys.dont_write_bytecode = True
+
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from omaskins.rotation import main  # noqa: E402
