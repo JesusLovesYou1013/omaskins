@@ -2398,7 +2398,7 @@ print(#rules, on, table.concat(names, " "), seen)
         if not shutil.which("lua"):
             self.skipTest("no lua")
         lua = SANDBOX / "reader.lua"
-        data.save_transparency(4)
+        data.save_transparency(3)
         lua.write_text("o = { window = function(m, r) print('rule', m.class or m.tag, r.tag or r.opacity, r.tag and r.opacity or '') end }\n"
                        "hl = { config = function(c) print('blur', c.decoration.blur.enabled) end }\n"
                        + data.TRANSPARENCY_LUA)
@@ -2699,13 +2699,15 @@ class FileDialogs(unittest.TestCase):
 
     def test_like_nautilus_at_the_step(self):
         write(self.dark, "/* GTK3's dark theme */")
-        css = data.dialog_css(4, "dark")
+        css = data.dialog_css(3, "dark")
         self.assertIn("dialog.background, dialog.background.csd, dialog headerbar.titlebar, dialog .titlebar headerbar "
                       "{ background-color: alpha(#1d1d20, 0.75);", css, "Nautilus's grey, title bar included")
         self.assertIn("alpha(#1d1d20, 0.68)", css, "unfocused a little more see-through")
         self.assertIn("dialog filechooser placessidebar { background-color: alpha(#2e2e32, 0.4); }", css,
                       "sidebar 10 points more solid, like Nautilus's")
-        self.assertIn("alpha(#ffffff, 0.75)", data.dialog_css(4, "light"), "light themes: Nautilus's light grey")
+        self.assertIn("alpha(#ffffff, 0.75)", data.dialog_css(3, "light"), "light themes: Nautilus's light grey")
+        self.assertIn("dialog:backdrop filechooser placessidebar { background-color: alpha(#2e2e32, 0.312); }", css,
+                      "unfocused: its own sidebar level (a selector that matches)")
         self.assertEqual(data.dialog_css(data.TRANSPARENCY_DEFAULT, "dark"), "", "Omarchy's default: nothing of ours")
 
     def test_dark_theme_without_the_package(self):
@@ -2821,7 +2823,7 @@ class QtStyle(unittest.TestCase):
     def test_palette_any_colour_set_and_the_step(self):
         self.theme('mode = "dark"\nbackground = "#1a1b26"\nforeground = "#a9b1d6"\naccent = "#7aa2f7"\n')  # few colours
         write(data.STATE_DIR / "theme/icons.theme", "Yaru-blue\n")
-        data.save_transparency(4)
+        data.save_transparency(3)
         self.assertTrue(self.q.rebuild())
         active, inactive = self.roles("active_colors"), self.roles("inactive_colors")
         self.assertEqual(len(active), 21, "all of Qt's colour roles")

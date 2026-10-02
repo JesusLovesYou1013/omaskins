@@ -1890,8 +1890,9 @@ def corners_file_text(on, px):
 TRANSPARENCY_FILE = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omaskins" / "transparency"
 OMARCHY_OPACITY = (0.985, 0.96)
 TRANSPARENCY_DEFAULT = 1
-# Steps 3-5 one notch stronger than first tried (owner, 2026-10-02: the blur made it less obvious).
-TRANSPARENCY_STEPS = ((1.0, 1.0, False), None, (0.85, 0.80, True), (0.80, 0.74, True), (0.75, 0.68, True))
+# Steps 3-5 one notch stronger than first tried (owner, 2026-10-02: the blur made it less obvious), then 10
+# points apart instead of 5 (owner, 2026-10-02: step 4 = the old step 5, which is what they use).
+TRANSPARENCY_STEPS = ((1.0, 1.0, False), None, (0.85, 0.80, True), (0.75, 0.68, True), (0.65, 0.56, True))
 TRANSPARENCY_BLUR = "hl.config({ decoration = { blur = { enabled = true, size = 5, passes = 2 } } })"
 TRANSPARENCY_LUA = """
 -- OmaSkins makes only its own background see-through (its previews stay solid), so Hyprland leaves its
@@ -2135,7 +2136,7 @@ def dialog_css(step, mode):
         f"{fc} treeview.view header button, {fc} placessidebar list, {fc} actionbar, {fc} revealer, {fc} searchbar,",
         f"{d} .dialog-action-area {{ background-color: transparent; background-image: none; box-shadow: none; }}",
         f"{fc} placessidebar {{ background-color: alpha({sidebar}, {extra(a):g}); }}",
-        f"{d}:backdrop {fc} placessidebar {{ background-color: alpha({sidebar}, {extra(b):g}); }}",
+        f"{d}:backdrop filechooser placessidebar {{ background-color: alpha({sidebar}, {extra(b):g}); }}",
         DIALOG_CSS_END]) + "\n"
 
 
