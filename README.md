@@ -30,7 +30,8 @@ Turning OmaSkins off or removing it takes the menu row and the file type away ag
 
 ## The palette icon
 
-Click it for **Next background**, **Next theme** or **Open OmaSkins** (in Omarchy's own menu). Next
+Click it for a small panel under the icon (like Omarchy's other bar widgets): **Next background**,
+**Next theme** or **Open OmaSkins**; arrow keys and Enter work, Esc closes it. Next
 follows your rotation's lists when it rotates that (no repeats until each has had its turn), and the
 schedule carries on as before; without a rotation it's Omarchy's own next background, or the next
 installed theme.
