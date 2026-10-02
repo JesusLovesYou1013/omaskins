@@ -583,6 +583,10 @@ class DialogLook:
     def glance(self):
         from . import run as _run
         try:
+            if data.ensure_gtk3_dark():
+                self.pending = True   # the dialog service reads its theme when it starts
+                log("GTK3's dark theme:", "OmaSkins' copy written" if data.GTK3_USER_DARK.exists()
+                    else "Omarchy's own is back, OmaSkins' copy removed")
             sig = self.signature()
             if sig != self.seen:
                 self.seen = sig

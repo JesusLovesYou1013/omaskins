@@ -34,7 +34,7 @@ Item {
   }
 
   // Turned off or removed: OmaSkins leaves Omarchy's menu (Style › OmaSkins), and its hidden launcher
-  // entry and the .omaskins file type go too. Inline, not in a script, because `omarchy plugin remove` deletes this folder
+  // entry, the .omaskins file type and its copy of GTK3's dark theme (if it wrote one) go too. Inline, not in a script, because `omarchy plugin remove` deletes this folder
   // right after disabling it (CtrlZ Guard's way). The service is also destroyed on a normal shell exit or
   // reload; while the id is still in shell.json (as a plugin or its bar icon) this does nothing.
   readonly property string removeCommand:
@@ -44,6 +44,9 @@ Item {
     "[ -f \"$f\" ] && sed -i --follow-symlinks '/^  \\/\\/ >>> OmaSkins/,/^  \\/\\/ <<< OmaSkins/d' \"$f\"; " +
     "rm -f \"$d/applications/" + pluginId + ".desktop\" \"$d/mime/packages/" + pluginId + ".xml\"; " +
     "update-mime-database \"$d/mime\" >/dev/null 2>&1; " +
+    "t=\"$d/themes/Adwaita-dark/gtk-3.0/gtk.css\"; " +
+    "grep -qF 'Written by OmaSkins' \"$t\" 2>/dev/null && rm -f \"$t\" && " +
+    "rmdir \"$d/themes/Adwaita-dark/gtk-3.0\" \"$d/themes/Adwaita-dark\" 2>/dev/null; " +
     "m=\"$c/mimeapps.list\"; " +
     "[ -f \"$m\" ] && sed -i --follow-symlinks '/^application\\/x-omaskins-setup=" +
     pluginId.replace(/\./g, "\\.") + "\\.desktop;\\?$/d' \"$m\"; true"

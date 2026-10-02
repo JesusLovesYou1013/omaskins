@@ -2693,7 +2693,9 @@ class FileDialogs(unittest.TestCase):
         data.GTK3_CSS.unlink(missing_ok=True)
         self.dark = HOME / ".local/share/themes/Adwaita-dark/gtk-3.0/gtk.css"
         shutil.rmtree(HOME / ".local/share/themes", ignore_errors=True)
-        data.GTK3_DARK_THEME = [self.dark]   # never what the real system has installed
+        data.GTK3_SYSTEM_DARK = [SANDBOX / "usr-share-themes/Adwaita-dark/gtk-3.0/gtk.css"]   # never the real one
+        shutil.rmtree(SANDBOX / "usr-share-themes", ignore_errors=True)
+        data.GTK3_USER_DARK = self.dark
 
     def test_like_nautilus_at_the_step(self):
         write(self.dark, "/* GTK3's dark theme */")
@@ -2705,6 +2707,24 @@ class FileDialogs(unittest.TestCase):
                       "sidebar 10 points more solid, like Nautilus's")
         self.assertIn("alpha(#ffffff, 0.75)", data.dialog_css(4, "light"), "light themes: Nautilus's light grey")
         self.assertEqual(data.dialog_css(data.TRANSPARENCY_DEFAULT, "dark"), "", "Omarchy's default: nothing of ours")
+
+    def test_dark_theme_without_the_package(self):
+        """No gnome-themes-extra: OmaSkins' one-line copy of GTK3's built-in dark Adwaita (no password)."""
+        system = data.GTK3_SYSTEM_DARK[0]
+        self.assertTrue(data.ensure_gtk3_dark())
+        self.assertIn('@import url("resource:///org/gtk/libgtk/theme/Adwaita/gtk-contained-dark.css");',
+                      self.dark.read_text(), "the same line the package has")
+        self.assertTrue(data.gtk3_dark_available())
+        self.assertTrue(data.dialog_css(4, "dark"), "so dark-theme dialogs get their look")
+        self.assertFalse(data.ensure_gtk3_dark(), "once")
+        write(system, "/* the package's */")
+        self.assertTrue(data.ensure_gtk3_dark(), "the real one arrived")
+        self.assertFalse(self.dark.exists(), "ours removed: never in front of Omarchy's")
+        self.assertFalse(self.dark.parent.parent.exists(), "no empty folders left")
+        system.unlink()
+        write(self.dark, "/* yours */")
+        self.assertFalse(data.ensure_gtk3_dark(), "a file of yours is left alone")
+        self.assertEqual(self.dark.read_text(), "/* yours */")
 
     def test_dark_needs_gtk3s_dark_theme(self):
         self.assertEqual(data.dialog_css(4, "dark"), "", "no Adwaita-dark: dark text on dark grey, so nothing")

@@ -2061,8 +2061,15 @@ DIALOG_CSS_END = "/* <<< OmaSkins Manager */"
 DIALOG_CLASS = "xdg-desktop-portal-gtk"
 # libadwaita's own greys (Nautilus): its view (the window's see-through background) and sidebar.
 DIALOG_GREYS = {"dark": ("#1d1d20", "#2e2e32"), "light": ("#ffffff", "#ebebed")}
-GTK3_DARK_THEME = [Path(d) / "Adwaita-dark/gtk-3.0/gtk.css" for d in
-                   (HOME / ".local/share/themes", HOME / ".themes", "/usr/share/themes")]
+# GTK3's dark Adwaita: Omarchy's gnome-themes-extra puts it in /usr/share/themes, and that theme is one line
+# pointing at the dark style built into GTK3 itself. Where the package is missing (the Try Omarchy VM image),
+# OmaSkins writes the same line to your own themes folder, which GTK3 also reads: no package, no password.
+# Only then; it's removed again as soon as the real one is there, and when OmaSkins is removed (Service.qml).
+GTK3_USER_DARK = (Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "themes"
+                  / "Adwaita-dark" / "gtk-3.0" / "gtk.css")
+GTK3_SYSTEM_DARK = [Path(d) / "Adwaita-dark/gtk-3.0/gtk.css" for d in (HOME / ".themes", "/usr/share/themes")]
+GTK3_DARK_MARK = "/* Written by OmaSkins: GTK3's own dark Adwaita, as gnome-themes-extra has it. Removed with OmaSkins. */"
+GTK3_DARK_CSS = GTK3_DARK_MARK + '\n@import url("resource:///org/gtk/libgtk/theme/Adwaita/gtk-contained-dark.css");\n'
 
 
 def theme_mode():
@@ -2078,7 +2085,33 @@ def theme_mode():
 
 
 def gtk3_dark_available():
-    return any(p.exists() for p in GTK3_DARK_THEME)
+    return GTK3_USER_DARK.exists() or any(p.exists() for p in GTK3_SYSTEM_DARK)
+
+
+def ensure_gtk3_dark():
+    """OmaSkins' copy of GTK3's dark theme while the real one is missing, and gone once it's there. Never
+    touches a file of yours (only one with OmaSkins' mark). True if it changed anything."""
+    try:
+        ours = GTK3_USER_DARK.read_text().startswith(GTK3_DARK_MARK)
+    except OSError:
+        ours = None   # nothing there
+    if any(p.exists() for p in GTK3_SYSTEM_DARK):
+        if not ours:
+            return False
+        GTK3_USER_DARK.unlink()
+        for folder in (GTK3_USER_DARK.parent, GTK3_USER_DARK.parent.parent):
+            try:
+                folder.rmdir()   # only if empty
+            except OSError:
+                break
+        return True
+    if ours is not None:
+        return False   # ours already, or one of yours: left alone
+    GTK3_USER_DARK.parent.mkdir(parents=True, exist_ok=True)
+    tmp = GTK3_USER_DARK.with_name(".gtk.css.omaskins-tmp")
+    tmp.write_text(GTK3_DARK_CSS)
+    tmp.replace(GTK3_USER_DARK)
+    return True
 
 
 def dialog_css(step, mode):
