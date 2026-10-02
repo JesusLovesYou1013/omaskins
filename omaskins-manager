@@ -21,6 +21,17 @@ if _in_try_omarchy_vm():
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
+# Omarchy's font rule turns every monospace font asked for by name into the current font, so OmaSkins
+# couldn't show any other font. OmaSkins' own process uses the system font config without that one
+# rule (programs it starts get the normal setup back). Must happen before GTK/fontconfig start.
+from omaskins import data  # noqa: E402
+
+if "FONTCONFIG_FILE" not in os.environ:
+    _conf = data.private_fontconfig()
+    if _conf:
+        os.environ["FONTCONFIG_FILE"] = str(_conf)
+        os.environ["OMASKINS_FONTCONFIG"] = "1"
+
 from omaskins.app import main  # noqa: E402
 
 sys.exit(main())

@@ -5,10 +5,12 @@ would run. Nothing on the system is changed (see data.py).
 """
 
 import itertools
+import json
 import os
 import queue
 import sys
 import threading
+import time
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -18,16 +20,16 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango  # noqa: E402
+gi.require_version("PangoCairo", "1.0")
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
 
-from . import data, run, theme  # noqa: E402
+from . import data, qtstyle, rotation, run, share, theme  # noqa: E402
 
 APP_ID = "io.github.jesuslovesyou1013.omaskins"
 TITLE = "OmaSkins Manager"
 CHECK = "\U000f012c"  # nf-md-check — a plain mark, never a checkbox (same as OmaPlugs)
 CARD_W, CARD_H = 272, 153  # 16:9, the shape of omarchy.org screenshots
-PROTOTYPE_NOTE = ("PARTLY LIVE: themes (built-in ones too), backgrounds, fonts and rounded corners really change. "
-                  "Rotation and Share still only show what they would do.")
+PROTOTYPE_NOTE = "Prototype"  # until it is packaged and installable from GitHub (owner, 2026-10-02)
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -138,6 +140,11 @@ class Images:
         path = data.thumbnail(src, width) if width else Path(src)
         return Gdk.Texture.new_from_filename(str(path)) if path else None
 
+    def peek(self, src, width):
+        """The texture if it's already loaded, else None (no loading)."""
+        with self.lock:
+            return self.memo.get((str(src), width))
+
     def get(self, src, width, cb, priority=1):
         key = (str(src), width)
         with self.lock:
@@ -167,40 +174,170 @@ class Images:
 IMAGES = Images()
 
 
-def picture(w, h, src=None, width=480, priority=1):
-    """A w×h image, never bigger: the clamps stop the loaded texture's own size from widening the
-    card (which would collapse the grid to a single column) or, for a 4:3 or taller picture,
-    making it taller than its neighbours."""
+class ExactSize(Gtk.Widget):
+    """Holds one child at exactly w×h, whatever it asks for. (Clamps weren't enough: a picture wider
+    than 16:9, like Aether's 3608×1954 previews, still asked for ~320 px and widened its card.)"""
+
+    def __init__(self, child, w, h):
+        super().__init__(halign=Gtk.Align.START, valign=Gtk.Align.START)
+        self._child, self._w, self._h = child, w, h
+        self.set_overflow(Gtk.Overflow.HIDDEN)
+        child.set_parent(self)
+
+    def resize(self, w, h):
+        if (w, h) != (self._w, self._h):
+            self._w, self._h = w, h
+            self.queue_resize()
+
+    def do_measure(self, orientation, _for_size):
+        size = self._w if orientation == Gtk.Orientation.HORIZONTAL else self._h
+        return size, size, -1, -1
+
+    def do_size_allocate(self, width, height, baseline):
+        self._child.allocate(width, height, baseline, None)
+
+    def do_dispose(self):
+        if self._child is not None:
+            self._child.unparent()
+            self._child = None
+
+
+def picture(w, h, src=None, width=480, priority=1, zoom=False):
+    """A w×h image, never bigger or smaller: its texture's own shape can't widen the card (which
+    would knock it out of line, or collapse the grid to a single column) or make it taller.
+    zoom: a 🔍+ button in its top-right corner opens the big view (ImagePreview)."""
     pic = Gtk.Picture(content_fit=Gtk.ContentFit.COVER, can_shrink=True)
-    pic.set_size_request(w, h)
     pic.add_css_class("thumb")
     if src:
         IMAGES.get(src, width, lambda t: t and pic.set_paintable(t), priority)
-    wide = Adw.Clamp(child=pic, maximum_size=w, tightening_threshold=w, halign=Gtk.Align.START)
-    return Adw.Clamp(child=wide, orientation=Gtk.Orientation.VERTICAL, maximum_size=h, tightening_threshold=h,
-                     valign=Gtk.Align.START)
+    if not (zoom and src):
+        return ExactSize(pic, w, h)
+    over = Gtk.Overlay(child=pic)
+    btn = Gtk.Button(icon_name="zoom-in-symbolic", tooltip_text="View larger", halign=Gtk.Align.END,
+                     valign=Gtk.Align.START, margin_top=6, margin_end=6)
+    btn.add_css_class("zoom-btn")
+    btn.connect("clicked", lambda b: ImagePreview(b.get_root(), src, IMAGES.peek(src, width)).present())
+    over.add_overlay(btn)
+    return ExactSize(over, w, h)
+
+
+PREVIEW_WIDTH = 1920   # the big view loads this wide a copy (sharp at ~75% of a 2560 px screen)
+PREVIEW_SHARE = 0.75   # of the screen, so it's clearly a window over your desktop
+
+
+class ImagePreview(Gtk.Window):
+    """The big view of a theme's or background's picture: about 75% of the screen and shaped like the
+    picture, no frame. The window itself covers the whole screen, see-through and lightly dimmed, so a
+    click ANYWHERE closes it (as a picture-sized window, clicks beside it went to whatever was below,
+    and it closed only sometimes). Esc, or switching to another window, closes it too."""
+
+    def __init__(self, parent, src, small=None):
+        super().__init__(transient_for=parent, modal=True, decorated=False, title="OmaSkins preview")
+        self.add_css_class("image-preview")
+        monitor = parent.get_display().get_monitor_at_surface(parent.get_surface())
+        geo = monitor.get_geometry() if monitor else None
+        screen = (geo.width, geo.height) if geo else (1680, 1050)
+        self.set_default_size(*screen)
+        self._max = (screen[0] * PREVIEW_SHARE, screen[1] * PREVIEW_SHARE)
+        self.pic = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True)
+        self.holder = ExactSize(self.pic, *self._size(None))
+        self.holder.set_halign(Gtk.Align.CENTER)
+        self.holder.set_valign(Gtk.Align.CENTER)
+        self.set_child(self.holder)
+        self._show(small)
+        IMAGES.get(src, PREVIEW_WIDTH, self._show, priority=-2)
+        keys = Gtk.EventControllerKey()
+        keys.connect("key-pressed", lambda _c, key, *_: (self.close(), True)[1] if key == Gdk.KEY_Escape else False)
+        self.add_controller(keys)
+        click = Gtk.GestureClick()
+        click.connect("released", lambda *_: self.close())
+        self.add_controller(click)
+        self.connect("notify::is-active", self._focus_changed)
+        self.connect("close-request", lambda *_: setattr(self, "_was_active", False) or False)  # however it closes: once
+        self._was_active = False
+
+    def _focus_changed(self, _w, _p):
+        """Switching to another window closes it, once it has had the focus (not before it gets it)."""
+        if self.is_active():
+            self._was_active = True
+        elif self._was_active:
+            self.close()
+
+    def _size(self, texture):
+        """As big as fits in 75% of the screen, in the picture's own shape (16:9 until known)."""
+        aspect = texture.get_width() / texture.get_height() if texture and texture.get_height() else 16 / 9
+        max_w, max_h = self._max
+        w = int(min(max_w, max_h * aspect))
+        return w, int(w / aspect)
+
+    def _show(self, texture):
+        """The small card picture first, the sharp copy when it's loaded."""
+        if texture is not None:
+            self.pic.set_paintable(texture)
+            self.holder.resize(*self._size(texture))
 
 
 # --------------------------------------------------------------------------- font metrics
 
-_XRATIO = {}
+_XRATIO, _MATCHED = {}, {}
+
+
+def _x_ink(widget, family, px):
+    """Height in px of a lowercase 'x' drawn in `family` at `px` (fractional; hinting included), or 0
+    when that font isn't the one Pango actually loads (not installed / not loaded)."""
+    layout = widget.create_pango_layout("x")
+    desc = Pango.FontDescription()
+    desc.set_family(family)
+    desc.set_absolute_size(px * Pango.SCALE)
+    layout.set_font_description(desc)
+    font = layout.get_context().load_font(desc)
+    if font is None or font.describe().get_family().casefold() != family.casefold():
+        return 0.0
+    ink, _log = layout.get_extents()
+    return max(0.0, ink.height / Pango.SCALE)
 
 
 def x_height_ratio(widget, family):
-    """Height of a lowercase 'x' as a fraction of the font size, measured with Pango."""
+    """Height of a lowercase 'x' as a fraction of the font size, measured at 1000 px (sub-pixel)."""
     if family not in _XRATIO:
-        layout = widget.create_pango_layout("x")
-        desc = Pango.FontDescription.from_string(family)
-        desc.set_absolute_size(100 * Pango.SCALE)
-        layout.set_font_description(desc)
-        ink, _log = layout.get_pixel_extents()
-        _XRATIO[family] = ink.height / 100 if ink.height > 0 else 0
+        _XRATIO[family] = _x_ink(widget, family, 1000) / 1000
     return _XRATIO[family]
 
 
-def font_label(widget, family, reference, base_px):
-    """`family` drawn in itself, sized so its x-height matches the reference font."""
-    size = data.normalized_size(base_px, x_height_ratio(widget, family), x_height_ratio(widget, reference))
+def matched_size(widget, family, base_px):
+    """The size at which `family`'s lowercase is as tall as Omarchy's default font (JetBrainsMono
+    Nerd Font) at `base_px`: first by the measured ratio, then fine-tuned in 0.1 px steps on what is
+    actually drawn (hinting snaps letters to whole pixels), so switching fonts changes the style,
+    not the size."""
+    key = (family, round(base_px, 2))
+    if key not in _MATCHED:
+        ref = data.REFERENCE_FAMILY
+        ratio = x_height_ratio(widget, family)
+        ref_ratio = x_height_ratio(widget, ref) or data.REFERENCE_X / 1000
+        if not ratio:
+            _MATCHED[key] = float(base_px)
+        else:
+            first = data.normalized_size(base_px, ratio, ref_ratio)
+            target = _x_ink(widget, ref, base_px) or base_px * ref_ratio
+            steps = [round(first + d / 10, 1) for d in range(-10, 11)]
+            _MATCHED[key] = min(steps, key=lambda s: (abs(_x_ink(widget, family, s) - target), abs(s - first)))
+    return _MATCHED[key]
+
+
+FONT_SLOT = 1.75  # font previews sit in a box this many times the base size tall (tallest line: 1.58)
+
+
+def font_slot(base_px):
+    """A fixed-height box for one font preview. Fonts' own line spacing differs (27-38 px at the same
+    letter size), and a note becomes a preview later: same height either way, so nothing moves."""
+    box = Gtk.Box(height_request=int(base_px * FONT_SLOT + 0.5), valign=Gtk.Align.START)
+    box.set_overflow(Gtk.Overflow.HIDDEN)
+    return box
+
+
+def font_label(widget, family, base_px):
+    """`family` drawn in itself, sized so its lowercase matches Omarchy's default font."""
+    size = matched_size(widget, family, base_px)
     lab = label(family, ellipsize=Pango.EllipsizeMode.END)
     attrs = Pango.AttrList()
     attrs.insert(Pango.attr_family_new(family))
@@ -272,12 +409,98 @@ def sub_tabs(names, on_change):
     return bar, counts, buttons
 
 
+def card_tile(child):
+    """The card's own box (.tile): what lights up on hover."""
+    w = child.get_first_child() if child else None
+    while w is not None and not w.has_css_class("tile"):
+        w = w.get_first_child()
+    return w
+
+
+def click_on_card(fb, x, y):
+    """True when (x, y) in the grid is inside a card's highlighted box, edge to edge. GTK gives each
+    card its whole column (up to ~24 px wider than a theme card's box), so a click there would still
+    open it without this check."""
+    child = fb.get_child_at_pos(int(x), int(y))
+    tile = card_tile(child)
+    if tile is None:
+        return child is not None and child.get_activatable() is False
+    ok, b = tile.compute_bounds(fb)
+    return ok and b.get_x() <= x < b.get_x() + b.get_width() and b.get_y() <= y < b.get_y() + b.get_height()
+
+
+def zoom_button_at(fb, x, y):
+    """The 🔍+ button under (x, y) in the grid, if that's where the click is."""
+    w = fb.pick(x, y, Gtk.PickFlags.DEFAULT)
+    while w is not None and w is not fb:
+        if isinstance(w, Gtk.Button) and w.has_css_class("zoom-btn"):
+            return w
+        w = w.get_parent()
+    return None
+
+
 def flow():
     fb = Gtk.FlowBox(selection_mode=Gtk.SelectionMode.NONE, homogeneous=True, valign=Gtk.Align.START,
                      column_spacing=6, row_spacing=6, max_children_per_line=12, min_children_per_line=1,
                      margin_start=12, margin_end=12, margin_top=6, margin_bottom=12)
     fb.set_activate_on_single_click(True)
+    # Clicks outside a card's highlighted box open nothing: taken here, before the grid acts on them.
+    guard = Gtk.GestureClick(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+    def pressed(g, _n, x, y):
+        zoom = zoom_button_at(fb, x, y)
+        if zoom:  # the 🔍+ on a card: the big view only, never also open the card
+            g.set_state(Gtk.EventSequenceState.CLAIMED)
+            zoom.emit("clicked")
+        elif not click_on_card(fb, x, y):
+            g.set_state(Gtk.EventSequenceState.CLAIMED)
+    guard.connect("pressed", pressed)
+    fb.add_controller(guard)
     return fb
+
+
+STRIP_GAP = 8   # empty space between the controls and the scroll bar below them (owner: no misclicks)
+
+
+def hstrip(child):
+    """Rows of controls above a picture pane that scroll sideways together when the window is too
+    narrow for them (owner, 2026-10-01: OmaSkins tiled beside another window).
+    - A trackpad's left/right moves them; its up/down is left alone. A mouse wheel's up/down moves
+      them sideways (a wheel has no left/right). Middle-click-and-drag moves them too.
+    - It takes every scroll before the controls inside see it, so the Global Rounded Corners number
+      never changes by itself while you scroll across it; its - / + and typing still work.
+    - The scroll bar exists only when the rows don't fit: GTK's thin overlay one that fades away
+      until the pointer is over it, with STRIP_GAP of empty space above it."""
+    child.set_margin_bottom(STRIP_GAP)
+    sw = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.AUTOMATIC, vscrollbar_policy=Gtk.PolicyType.NEVER,
+                            overlay_scrolling=True, propagate_natural_width=True, propagate_natural_height=True,
+                            hexpand=True)
+    sw.set_child(child)
+
+    def fits():
+        adj = sw.get_hadjustment()
+        return adj.get_upper() - adj.get_page_size() <= 0
+
+    def move(by):
+        if not fits():
+            adj = sw.get_hadjustment()
+            adj.set_value(adj.get_value() + by)
+
+    wheel = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.BOTH_AXES,
+                                      propagation_phase=Gtk.PropagationPhase.CAPTURE)
+
+    def on_scroll(c, dx, dy):
+        if c.get_unit() == Gdk.ScrollUnit.WHEEL:
+            move((dy or dx) * 40)        # a wheel's up/down (or a tilt wheel's left/right): sideways
+        else:
+            move(dx)                     # a trackpad: its left/right only; up/down does nothing here
+        return True                      # never reaches a number box underneath
+    wheel.connect("scroll", on_scroll)
+    sw.add_controller(wheel)
+    drag, start = Gtk.GestureDrag(button=Gdk.BUTTON_MIDDLE), [0.0]
+    drag.connect("drag-begin", lambda *_: start.__setitem__(0, sw.get_hadjustment().get_value()))
+    drag.connect("drag-update", lambda _g, dx, _dy: fits() or sw.get_hadjustment().set_value(start[0] - dx))
+    sw.add_controller(drag)
+    return sw
 
 
 def scrolled(child):
@@ -296,17 +519,22 @@ class ThemeCard(Gtk.FlowBoxChild):
         is_current = entry.local is not None and entry.local.name == current
         if is_current:
             box.add_css_class("current")
-        box.append(picture(CARD_W, CARD_H, entry.image, priority=0 if entry.installed else 1))
+        box.append(picture(CARD_W, CARD_H, entry.image, priority=0 if entry.installed else 1, zoom=True))
         row = Gtk.Box(spacing=6)
         row.add_css_class("card-row")  # one height for every card's title row (Apply button or not)
-        row.append(label(entry.title, "card-name", hexpand=True, ellipsize=Pango.EllipsizeMode.END))
+        # The title fills what's left and ends in "…" when needed, but never asks for more: a card is
+        # always CARD_W wide, so its picture lines up with the cards above and below it.
+        row.append(label(entry.title, "card-name", hexpand=True, ellipsize=Pango.EllipsizeMode.END,
+                         max_width_chars=1))
         if entry.removed:
             row.append(badge("Built-in", "builtin"))
             row.append(badge("Hidden" if entry.hidden else "Removed", "warn"))
         elif entry.local and entry.local.builtin:
             row.append(badge("Built-in", "builtin"))
         elif entry.installed and entry.community is None:
-            row.append(badge("Not listed", "warn"))
+            # Not on omarchy.org: "Aether" (made with it) OR "Unlisted", never both; once a theme is
+            # listed, neither shows (owner, 2026-09-30). Short, so a card never grows wider.
+            row.append(badge("Aether", "builtin") if entry.local.aether else badge("Unlisted", "warn"))
         if is_current:
             row.append(badge("Current", "verified"))
         if entry.installed and not is_current:
@@ -348,7 +576,7 @@ class BackgroundCard(Gtk.FlowBoxChild):
         box.add_css_class("tile")
         if bgd.current:
             box.add_css_class("current")
-        box.append(picture(CARD_W, CARD_H, bgd.path, priority=0))
+        box.append(picture(CARD_W, CARD_H, bgd.path, priority=0, zoom=True))
         row = Gtk.Box(spacing=6)
         row.append(label(bgd.path.name, "small", hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE))
         if bgd.yours:
@@ -387,7 +615,7 @@ class BackgroundCard(Gtk.FlowBoxChild):
 
 
 class FontRow(Gtk.ListBoxRow):
-    """Installed font: its name in its own face, x-height-matched to the current font."""
+    """Installed font: its name in its own face, x-height-matched to Omarchy's default font."""
 
     def __init__(self, win, font, current_package, grouped=False):
         super().__init__(activatable=False)
@@ -398,12 +626,15 @@ class FontRow(Gtk.ListBoxRow):
             box.add_css_class("font-in-group")  # indented under its package's header
         box.append(mark("Current font") if font.current else Gtk.Box(width_request=24))
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
-        name, scale = font_label(win, font.family, win.current_font or font.family, win.font_base * 1.6)
-        col.append(name)
+        name, scale = font_label(win, font.family, win.font_base * 1.6)
+        name.set_valign(Gtk.Align.CENTER)
+        slot = font_slot(win.font_base * 1.6)
+        slot.append(name)
+        col.append(slot)
         bits = [font.package or "not from a package"]
         if abs(scale - 1) >= 0.02:
-            bits.append(f"shown at {scale * 100:.0f}% so its letters match {win.current_font}")
-        col.append(label(" · ".join(bits), "dim small"))
+            bits.append(f"shown at {scale * 100:.0f}% so its letters match {data.REFERENCE_FAMILY}")
+        col.append(label(" · ".join(bits), "dim small", wrap=True))
         box.append(col)
         if font.current:
             box.append(badge("Current", "verified"))
@@ -427,7 +658,8 @@ class FontGroupRow(Gtk.ListBoxRow):
         box.append(mark("Installed") if package else Gtk.Box(width_request=24))
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
         title = Gtk.Box(spacing=8)
-        title.append(label(package or "Not from a package", "plugin-name"))
+        title.append(label(package or "Not from a package", "plugin-name", ellipsize=Pango.EllipsizeMode.END,
+                           width_chars=10))
         if pkg and pkg.omarchy_pick:
             title.append(badge("Omarchy pick", "verified"))
         if pkg:
@@ -457,23 +689,47 @@ class FontPackageRow(Gtk.ListBoxRow):
         box.append(mark() if pkg.installed else Gtk.Box(width_request=24))
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, hexpand=True)
         title = Gtk.Box(spacing=8)
-        title.append(label(pkg.package, "plugin-name"))
+        title.append(label(pkg.package, "plugin-name", ellipsize=Pango.EllipsizeMode.END, width_chars=10))
         if pkg.omarchy_pick:
             title.append(badge("Omarchy pick", "verified"))
         if pkg.installed:
             title.append(badge("Installed", "enabled"))
         col.append(title)
-        if families:
-            name, _ = font_label(win, families[0], win.current_font or families[0], win.font_base * 1.6)
-            col.append(name)
+        # The preview: an installed font from the system; any other from its downloaded file
+        # (data.fetch_preview_font), filled in when it arrives.
+        self.win, self.preview = win, font_slot(win.font_base * 1.6)
+        col.append(self.preview)
+        cached = None if families else data.preview_font(pkg.package)
+        family = families[0] if families else cached and cached["family"]
+        if family:
+            self.show_preview(family)
         else:
-            col.append(label("Preview: the font would be downloaded to a cache and shown here "
-                             "(not in this prototype)", "dim small", wrap=True))
+            self.show_note("Downloading a preview…")
         col.append(label(f"{pkg.description} · {pkg.version}", "dim small", wrap=True))
         box.append(col)
         for a in data.font_actions(package=pkg, current_package=current_package):
             box.append(win.action_button(a))
         self.set_child(box)
+
+    def show_preview(self, family):
+        for c in list(self.preview):
+            self.preview.remove(c)
+        name, _scale = font_label(self.win, family, self.win.font_base * 1.6)
+        name.set_valign(Gtk.Align.CENTER)
+        self.preview.append(name)
+
+    def show_note(self, text):
+        for c in list(self.preview):
+            self.preview.remove(c)
+        self.preview.append(label(text, "dim small", valign=Gtk.Align.CENTER))
+
+
+def load_preview_font(path):
+    """Make a downloaded font file usable in this app only (not installed for the system)."""
+    try:
+        return PangoCairo.FontMap.get_default().add_font_file(str(path))
+    except (GLib.Error, TypeError):
+        return False
 
 
 # --------------------------------------------------------------------------- flip book
@@ -582,7 +838,8 @@ class FlipBook(Gtk.Box):
         self.at = i
         self.slot = "b" if self.slot == "a" else "a"
         self.stack.remove(self.stack.get_child_by_name(self.slot))
-        self.stack.add_named(picture(self.MAIN_W, self.MAIN_H, self.items[i][0], width=self.FULL), self.slot)
+        self.stack.add_named(picture(self.MAIN_W, self.MAIN_H, self.items[i][0], width=self.FULL, zoom=True),
+                             self.slot)
         self.stack.set_transition_type(Gtk.StackTransitionType.NONE if not step else
                                        Gtk.StackTransitionType.SLIDE_LEFT if step > 0 else
                                        Gtk.StackTransitionType.SLIDE_RIGHT)
@@ -725,54 +982,437 @@ class ThemePage(Gtk.Box):
             self.swatches.append(cell)
 
 
-# --------------------------------------------------------------------------- export dialog
+# --------------------------------------------------------------------------- share / import
+
+def _size_text(n):
+    return f"{n / 1024 ** 2:.1f} MB" if n >= 1024 ** 2 else f"{max(1, n // 1024)} KB"
+
 
 class ExportDialog(Adw.Dialog):
-    """The whole setup (top-right Share…). A single theme needs no zip: it's on omarchy.org by name."""
+    """Share… (top right): your whole setup in one zip, with a manifest (omaskins.json) that tells the
+    other OmaSkins what's inside before anything is unpacked."""
 
     def __init__(self, win):
-        super().__init__(title="Share your setup", content_width=620)
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_start=18, margin_end=18,
-                      margin_top=18, margin_bottom=18)
-        t = win.current_local()
-        cur_bg = None
-        if t:
-            cur_bg = next((b for b in data.backgrounds_for(t, win.current_theme, data.current_background())
-                           if b.current), None)
-        font = next((f for f in win.fonts if f.current), None)
-        items = data.export_plan(t, win.community, cur_bg, font) if t else []
-
-        box.append(label("The zip would hold:" if items else "Nothing to share.", "section-title"))
-        lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        lst.add_css_class("export-list")
-        for it in items:
-            row = Gtk.Box(spacing=10)
-            row.append(badge("Link" if it.how == "link" else "In zip", "verified" if it.how == "link" else "warn"))
-            col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, hexpand=True)
-            col.append(label(f"{it.kind}: {it.name}", "card-name"))
-            col.append(label(it.detail, "dim small", wrap=True, selectable=True))
-            row.append(col)
-            lst.append(row)
-        box.append(lst)
-        box.append(label("Links point at the same place Omarchy's own installer uses, so the zip stays small. "
-                         "Anything not on omarchy.org or in the Arch repos is copied in, so it works even if "
-                         "the other person has never seen it.", "dim small", wrap=True))
-        exp = Gtk.Expander(label="Manifest (omaskins.json)")
-        exp.set_child(label(data.export_summary_json(items), "mono small", selectable=True))
-        box.append(exp)
+        super().__init__(title="Share your setup", content_width=560)
+        bg(share.register_file_type)
+        self.win, self.collected = win, None
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_start=18, margin_end=18,
+                           margin_top=12, margin_bottom=18)
+        self.box.append(label("Everything OmaSkins looks after, in one file:", "section-title"))
+        self.summary = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        self.summary.append(label("Looking…", "dim"))
+        self.box.append(self.summary)
+        self.box.append(label("Themes from omarchy.org's list and fonts from the Arch repos go in as links, so the "
+                              "file stays small; everything else is copied in, so it works anywhere. Importing it "
+                              "merges with what's already there and never overwrites anything.", "dim small",
+                              wrap=True))
         btns = Gtk.Box(spacing=8, halign=Gtk.Align.END)
-        btns.append(button("Import a shared zip…", "", lambda *_: win.do_action(
-            data.Action("Import", "unzip <file> → install each link, copy bundled files into ~/.config/omarchy"))))
-        btns.append(button("Save zip…", "primary", lambda *_: win.do_action(
-            data.Action("Save zip", "write omaskins.json + bundled files to <chosen>.zip"))))
+        self.save = button("Export all settings…", "primary", lambda *_: self._choose())
+        self.save.set_sensitive(False)
+        btns.append(self.save)
+        self.box.append(btns)
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar())
+        view.set_content(self.box)
+        self.set_child(view)
+        bg(lambda: share.collect(win.community), self._show)
+
+    def _show(self, result):
+        clear(self.summary)
+        if isinstance(result, Exception):
+            self.summary.append(label(f"Couldn't look through your setup: {result}", "dim", wrap=True))
+            return
+        self.collected = result
+        m, files = result
+        themes = m["themes"]
+        kinds = lambda *k: sum(t["kind"] in k for t in themes)  # noqa: E731
+        fonts = m["fonts"]
+        rot = m["rotation"]
+        lines = [
+            ("Themes", f"{len(themes)}: {kinds('builtin')} built in, {kinds('link')} as links, "
+                       f"{kinds('folder', 'aether', 'edited')} copied in"),
+            ("Your backgrounds", str(len(m["backgrounds"]))),
+            ("Fonts", f"{len(fonts)}: {sum(f['source'] == 'repo' for f in fonts)} from the Arch repos, "
+                      f"{sum(f['source'] != 'repo' for f in fonts)} copied in"),
+            ("Rotation", f"set “{rot['set']}” in use" if rot.get("set") else "the settings in use (no saved set)"),
+            ("Rotation sets", str(len(m["rotation_sets"]))),
+            ("Look", f"{data.display_name(m['current'].get('theme') or '')}, {m['current'].get('font') or 'font'}, "
+                     f"corners {m['corners']['px'] if m['corners']['on'] else 'off'}"
+                     + (f", text size {m['text_size']}" if m.get("text_size") else "")),
+        ]
+        if m["hidden_builtins"]:
+            lines.append(("Hidden built-ins", str(len(m["hidden_builtins"]))))
+        if m["aether_blueprints"]:
+            lines.append(("Aether blueprints", str(len(m["aether_blueprints"]))))
+        for name, text in lines:
+            row = Gtk.Box(spacing=12)
+            row.append(label(name, "card-name", width_chars=16))
+            row.append(label(text, "dim", wrap=True, hexpand=True))
+            self.summary.append(row)
+        size = sum(p.stat().st_size for p, _ in files if p.exists())
+        self.summary.append(label(f"About {_size_text(size)}.", "dim small"))
+        self.save.set_sensitive(True)
+
+    def _choose(self):
+        d = Gtk.FileDialog(title="Export all settings",
+                           initial_name=f"omaskins-setup-{time.strftime('%Y-%m-%d')}{share.EXT}")
+        d.save(self.win, None, self._chosen)
+
+    def _chosen(self, d, res):
+        try:
+            f = d.save_finish(res)
+        except GLib.Error:
+            return  # cancelled
+        dest = Path(f.get_path())
+        if dest.suffix.lower() != share.EXT:
+            dest = dest.with_name(dest.name + share.EXT)
+        self.close()
+        win = self.win
+        toast, progress = win.progress_toast("Saving your setup…")
+        def done(result):
+            toast.dismiss()
+            if isinstance(result, Exception):
+                win.toasts.add_toast(Adw.Toast(title=f"Couldn't export: {result}", timeout=8))
+            else:
+                win.toasts.add_toast(Adw.Toast(title=f"Saved {dest.name} ({_size_text(result[1])}).", timeout=5))
+        bg(lambda: share.write_zip(dest, win.community, progress, self.collected), done)
+
+
+class ImportDialog(Adw.Dialog):
+    """What's in a shared zip, as tick boxes (all ticked: Everything). Something another item needs sits
+    underneath it, ticked and locked while that item is ticked, so it can't be left behind."""
+
+    GROUPS = ("Themes", "Built-in themes", "Your backgrounds", "Fonts", "Rotation sets", "Settings")
+    BADGES = {"merge": ("Merge", "verified"), "password": ("Password", "warn"), "have": ("Already here", "builtin")}
+
+    def __init__(self, win, path, manifest):
+        super().__init__(title="Import a shared setup", content_width=600, content_height=640)
+        self.win, self.path, self.manifest = win, path, manifest
+        self.rows = share.items(manifest)
+        self.by_id = {r["id"]: r for r in self.rows}
+        self.needs = {r["id"]: r["needs"] for r in self.rows}
+        # Rows that only remove things (to match the file exactly) start unticked and aren't part of
+        # Everything: a merge only adds (owner, 2026-10-02).
+        self.chosen = {r["id"] for r in self.rows if r["state"] != "have" and not r.get("opt_in")}
+        # A built-in the file removed: the Hide button's own question, as two choices under it.
+        self.pick = {r["id"]: r["choice"][0][0] for r in self.rows if r.get("choice")}
+        self.radios = {}          # row id -> [radio CheckButton, …]
+        self.details = {}         # row id -> its description, when it follows the answer picked
+        self.checks = {}          # id -> [CheckButton, …] (a theme can show under its set too)
+        self.group_checks = {}
+        self._syncing = False
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_start=18, margin_end=18,
+                      margin_top=12, margin_bottom=18)
+        made = manifest.get("created", "")[:10]
+        box.append(label(f"{Path(path).name}" + (f" · made {made}" if made else ""), "dim small"))
+        tree = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        self.everything = Gtk.CheckButton(label="Everything")
+        self.everything.add_css_class("card-name")
+        self.everything.connect("toggled", lambda b: self._set_all(b.get_active(), self.rows))
+        tree.append(self.everything)
+        for group in self.GROUPS:
+            rows = [r for r in self.rows if r["group"] == group]
+            if not rows:
+                continue
+            g = Gtk.CheckButton(label=f"{group} ({len(rows)})", margin_start=22, margin_top=6)
+            g.add_css_class("card-name")
+            g.connect("toggled", lambda b, rows=rows: self._set_all(b.get_active(), rows))
+            self.group_checks[group] = (g, rows)
+            tree.append(g)
+            for r in rows:
+                tree.append(self._row(r, 44))
+                for need in r["needs"]:
+                    if need in self.by_id:
+                        tree.append(self._row(self.by_id[need], 66))
+        scroll = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroll.set_child(tree)
+        box.append(scroll)
+        box.append(label("Nothing you have is overwritten: a theme with the name of one of yours adds the "
+                         "pictures it doesn't have yet to yours, a Rotation set with the name of one of yours is "
+                         "combined with it, and anything already here is skipped.", "dim small", wrap=True))
+        btns = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        self.go = button("Import…", "primary", lambda *_: self._ask())
+        btns.append(self.go)
         box.append(btns)
         view = Adw.ToolbarView()
         view.add_top_bar(Adw.HeaderBar())
         view.set_content(box)
         self.set_child(view)
+        self._sync()
+
+    def _row(self, r, indent):
+        line = Gtk.Box(spacing=8, margin_start=indent)
+        c = Gtk.CheckButton(label=r["label"])
+        c.connect("toggled", lambda b, i=r["id"]: self._toggle(i, b.get_active()))
+        self.checks.setdefault(r["id"], []).append(c)
+        line.append(c)
+        if r["detail"]:
+            detail = label(r["detail"], "dim small", ellipsize=Pango.EllipsizeMode.END, hexpand=True,
+                           tooltip_text=r["detail"])
+            line.append(detail)
+            if r.get("detail_for"):   # says what will happen for the answer picked under it
+                self.details[r["id"]] = detail
+                detail.set_text(r["detail_for"][self.pick[r["id"]]])
+        else:
+            line.append(Gtk.Box(hexpand=True))
+        if r["state"] in self.BADGES:
+            text, kind = self.BADGES[r["state"]]
+            line.append(badge(text, kind))
+        if not r.get("choice"):
+            return line
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.append(line)
+        first = None
+        for sub, text, detail, state, why in r["choice"]:
+            opt = Gtk.Box(spacing=8, margin_start=indent + 26, tooltip_text=why)
+            radio = Gtk.CheckButton(label=text, active=self.pick[r["id"]] == sub)
+            if first:
+                radio.set_group(first)
+            else:
+                first = radio
+            radio.connect("toggled", lambda b, i=r["id"], s=sub: b.get_active() and self._choose(i, s))
+            self.radios.setdefault(r["id"], []).append(radio)
+            opt.append(radio)
+            opt.append(label(detail, "dim small", ellipsize=Pango.EllipsizeMode.END, hexpand=True))
+            if state in self.BADGES:
+                opt.append(badge(*self.BADGES[state]))
+            box.append(opt)
+        return box
+
+    def _choose(self, i, sub):
+        if self._syncing:
+            return
+        self.pick[i] = sub
+        self.chosen.add(i)
+        r = self.by_id[i]
+        if i in self.details and sub in r.get("detail_for", {}):
+            self.details[i].set_text(r["detail_for"][sub])
+            self.details[i].set_tooltip_text(r["detail_for"][sub])
+        self._sync()
+
+    def _final(self):
+        """The ids to import: what's ticked (and what it needs), a built-in's chosen answer in its place."""
+        ids = (self.chosen | self._required()) - {r["id"] for r in self.rows if r["state"] == "have"}
+        return {self.pick.get(i, i) for i in ids}
+
+    def _password_items(self):
+        """What the one password will cover: font packages, built-ins removed or restored."""
+        out = []
+        for i in self._final():
+            r = self.by_id.get(i)
+            if r and r["state"] == "password":
+                out.append(r["label"])
+            elif i.startswith("remove:"):
+                out.append(f"Remove {data.display_name(i.split(':', 1)[1])}")
+        return sorted(set(out))
+
+    def _required(self):
+        """Ids some ticked item needs: ticked and locked."""
+        return share.with_needs({n for c in self.chosen for n in self.needs.get(c, [])}, self.rows)
+
+    def _toggle(self, i, on):
+        if self._syncing:
+            return
+        if on:
+            self.chosen.add(i)
+        else:
+            self.chosen.discard(i)
+        self._sync()
+
+    def _set_all(self, on, rows):
+        if self._syncing:
+            return
+        for r in rows:
+            if r["state"] != "have" and not r.get("opt_in"):
+                (self.chosen.add if on else self.chosen.discard)(r["id"])
+        self._sync()
+
+    def _sync(self):
+        self._syncing = True
+        required = self._required()
+        picked = self.chosen | required
+        for i, checks in self.checks.items():
+            have = self.by_id[i]["state"] == "have"
+            for c in checks:
+                c.set_active(i in picked and not have)
+                c.set_sensitive(not have and i not in required)
+                c.set_tooltip_text("Already here" if have else
+                                   "Needed by something you're bringing in" if i in required else None)
+
+        for i, radios in self.radios.items():
+            for radio in radios:
+                radio.set_sensitive(i in picked)
+
+        def mark(check, rows):
+            open_rows = [r for r in rows if r["state"] != "have" and not r.get("opt_in")]
+            n = sum(r["id"] in picked for r in open_rows)
+            check.set_active(bool(open_rows) and n == len(open_rows))
+            check.set_inconsistent(0 < n < len(open_rows))
+            check.set_sensitive(bool(open_rows))
+        for g, rows in self.group_checks.values():
+            mark(g, rows)
+        mark(self.everything, self.rows)
+        self.go.set_sensitive(bool(picked - {r["id"] for r in self.rows if r["state"] == "have"}))
+        self._syncing = False
+
+    def _ask(self):
+        body = ("Just import adds everything you ticked, so you have more to choose from. "
+                "Also apply makes it look exactly as it did there too: its theme and "
+                "background, font, corners and the rotation that was in use.")
+        pw = self._password_items()
+        if pw:
+            body += ("\n\nOne terminal will ask for your password once, for all of these:\n• "
+                     + "\n• ".join(pw))
+        d = Adw.AlertDialog(heading="Just import, or also apply the last settings from the file?", body=body)
+        d.add_response("cancel", "Cancel")
+        d.add_response("import", "Just import")
+        d.add_response("apply", "Also apply")
+        d.set_response_appearance("apply", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("import")
+        d.set_close_response("cancel")
+        d.connect("response", lambda _d, r: r != "cancel" and self._run(r == "apply"))
+        d.present(self)
+
+    def _run(self, apply):
+        chosen = self._final()
+        self.close()
+        ImportProgress(self.win, self.path, self.manifest, chosen, apply).present(self.win)
 
 
-# --------------------------------------------------------------------------- rotation (prototype: in memory only)
+class ImportProgress(Adw.Dialog):
+    """Over the window for as long as an import runs (it can't be closed meanwhile). Two bars: the
+    whole import, counted step by step (each theme, background, font, set, setting, the apply), and
+    below it the current download with git's own figures: how much has arrived and how fast, in
+    megabits per second. Both are always there (greyed when nothing is downloading), so nothing moves.
+    Then, in the same place, the result: what came in, what didn't and why, and Retry for themes that
+    couldn't be downloaded."""
+
+    def __init__(self, win, path, manifest, chosen, apply):
+        super().__init__(title="Importing", content_width=520, can_close=False)
+        self.win, self.path, self.manifest = win, path, manifest
+        self._latest, self._queued = None, False
+        self.box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, margin_start=24, margin_end=24,
+                           margin_top=18, margin_bottom=22)
+        view = Adw.ToolbarView()
+        view.add_top_bar(Adw.HeaderBar(show_end_title_buttons=False, show_start_title_buttons=False))
+        view.set_content(self.box)
+        self.set_child(view)
+        self._build_progress()
+        self._start(chosen, apply)
+
+    def _build_progress(self):
+        clear(self.box)
+        self.box.append(label("Importing…", "section-title"))
+        self.count = label("Getting ready…", "card-name")
+        self.box.append(self.count)
+        self.step = label("", "dim", wrap=True)
+        self.step.set_lines(2)
+        self.step.set_ellipsize(Pango.EllipsizeMode.END)
+        self.step.set_size_request(-1, 40)   # two lines' room, always (no layout shift)
+        self.box.append(self.step)
+        self.overall = Gtk.ProgressBar()
+        self.box.append(self.overall)
+        self.box.append(label("Download", "dim small", margin_top=8))
+        self.download = Gtk.ProgressBar(valign=Gtk.Align.START, vexpand=False)
+        self.download.add_css_class("download-bar")
+        self.box.append(self.download)
+        self.speed = label("", "small")
+        self.box.append(self.speed)
+        # Cancel: always in its place (no layout shift), usable while the password terminal is open.
+        btns = Gtk.Box(halign=Gtk.Align.END, margin_top=8)
+        self.cancel = button("Cancel", "", lambda *_: bg(share.cancel_password_step),
+                             tooltip="Close the password terminal: what it was going to do isn't done")
+        self.cancel.set_sensitive(False)
+        btns.append(self.cancel)
+        self.box.append(btns)
+        self._show({"step": 0, "total": 1, "text": "", "download": None})
+
+    def _start(self, chosen, apply):
+        def progress(info):
+            # Git can report many times a second: the window shows the latest, at most once per frame.
+            self._latest = info
+            if not self._queued:
+                self._queued = True
+                GLib.idle_add(self._drain)
+        bg(lambda: share.run_import(self.path, self.manifest, chosen, apply, progress), self._finished)
+
+    def _drain(self):
+        self._queued = False
+        if self._latest is not None and self.overall.get_root() is not None:
+            self._show(self._latest)
+        return False
+
+    def _show(self, info):
+        step, total, dl = info["step"], info["total"], info["download"]
+        self.cancel.set_sensitive(bool(info.get("cancel")))
+        if step:
+            self.count.set_text(f"Step {step} of {total}")
+            self.step.set_text(info["text"])
+        within = (dl["pct"] / 100) if dl else 0
+        done = total if info.get("finished") else max(step - 1, 0) + within
+        self.overall.set_fraction(min(1, done / total))
+        for w in (self.download, self.speed):
+            (w.remove_css_class if dl else w.add_css_class)("idle")
+        if not dl:
+            self.download.set_fraction(0)
+            self.speed.set_text("No download in this step")
+            return
+        self.download.set_fraction(dl["pct"] / 100)
+        got = f"{dl['got'] / 1e6:.1f} MB received" if dl["got"] else "Connecting…"
+        if dl["rate"] is None:
+            self.speed.set_text(got)
+        else:
+            mbps = dl["rate"] * 8 / 1e6
+            self.speed.set_text(f"{got} · {mbps:.2f} Mbps" if mbps < 10 else f"{got} · {mbps:.1f} Mbps")
+
+    def _finished(self, result):
+        win = self.win
+        clear(self.box)
+        self.set_can_close(True)
+        self.set_title("Import finished" if not isinstance(result, Exception) else "Import stopped")
+        if isinstance(result, Exception):
+            self.box.append(label("The import stopped", "section-title"))
+            self.box.append(label(str(result), "dim", wrap=True, selectable=True))
+            did, notes, failed = [], [], []
+        else:
+            did, notes, failed = result
+            changes = f"{len(did)} change{'s' * (len(did) != 1)}"
+            heading = (f"Imported {changes}; {len(notes)} thing{'s' * (len(notes) != 1)} didn't come in"
+                       if did and notes else f"Imported {changes}" if did
+                       else "Nothing was imported" if notes else "Nothing new: you had it all")
+            self.box.append(label(heading, "section-title"))
+        lines = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        for text in notes:
+            lines.append(label(f"✗  {text}", "", wrap=True, selectable=True))
+        for text in did:
+            lines.append(label(f"✓  {text}", "dim", wrap=True))
+        if did or notes:
+            scroll = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, propagate_natural_height=True,
+                                        max_content_height=360)
+            scroll.set_child(lines)
+            self.box.append(scroll)
+        btns = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        if failed:
+            names = ", ".join(data.display_name(n) for n in failed)
+            btns.append(button(f"Retry {names}", "", lambda *_: self._retry(failed)))
+        btns.append(button("Close", "primary", lambda *_: self.close()))
+        self.box.append(btns)
+        # Everything in the window shows what's on disk now (the Rotation tab included).
+        win._pending |= {"local", "state", "rotation"}
+        win._settle()
+
+    def _retry(self, failed):
+        self.set_can_close(False)
+        self.set_title("Importing")
+        self._build_progress()
+        self._start({f"theme:{n}" for n in failed}, False)
+
+
+# --------------------------------------------------------------------------- rotation
+#
+# The tab saves its settings (data.ROTATION_FILE); the engine (omaskins-rotate, run by the OmaSkins
+# service plugin) does the rotating, OmaSkins open or not, and writes its status back for the tab.
 #
 # Layout rule (owner's, for every strip in the app): a strip is always as big as the
 # largest thing it can hold. Options that don't apply are greyed out in place, never
@@ -785,13 +1425,75 @@ ROT_HINTS = {
     (False, False): "Rotation is off. Turn on Themes or Backgrounds above.",
     (True, False): "Backgrounds aren't rotating: your current background stays when the theme changes.",
     (False, True): ("Click a background to add or remove it. Your current theme stays, background changes "
-                      "and the bright ones take turns from any theme you like."),
-    (True, True): "Click a background to add or remove it. While this theme is on, its bright ones take turns.",
+                      "and the selected ones take turns from any theme you like."),
+    (True, True): ("Click a background to add or remove it. This theme's selected ones take turns; after the last "
+                     "one, the next theme comes in."),
 }
 
 
-def minutes_spin(value, on_change):
-    return number_spin(value, 1, 1440, on_change)
+MIX_HINT = ("Mix it up! is on: click a background to add or remove it. Each change pairs a random theme with a "
+            "random selected background from any theme in the list.")
+UNTICKED_HINT = "Tick it on the left to add it to the rotation; your selected and unselected picks come back as saved."
+
+
+def engine_alive(st):
+    """The engine records its process id; it's running if that process is still omaskins-rotate."""
+    try:
+        with open(f"/proc/{int(st.get('pid'))}/cmdline", "rb") as f:
+            return b"omaskins-rotate" in f.read()
+    except (OSError, TypeError, ValueError):
+        return False
+
+
+def rotation_status_text(plan, st, alive):
+    """One line for the Rotation tab from the engine's status file."""
+    if not (plan.themes or plan.backgrounds):
+        return ""
+    if not alive:
+        return "Engine off: plugin enabled?"
+    if plan.themes and st.get("theme_status") in ("single", "empty"):
+        return "Check at least one more theme"
+    if plan.backgrounds and st.get("bg_status") == "empty":
+        return "Pick some backgrounds"
+    if plan.backgrounds and st.get("bg_status") == "single":
+        return "Select a few more backgrounds"
+    nxt = st.get("next_change")
+    return f"Next change at {rotation.hhmm(nxt)}" if nxt and st.get("status") == "running" else "Starting…"
+
+
+def interval_stepper(minutes, on_change):
+    """− / + step through data.INTERVALS only (5, 10, 15, 20, 30 min, then hours that divide the day).
+    Built from a read-only box and two buttons with the spin button's own icons: a Gtk.SpinButton
+    reads its text back as a number before every step ("20 min" -> 20), and PyGObject can't answer
+    its "input" signal, so it can't show units and still step."""
+    steps = data.INTERVALS
+    at = [steps.index(data.snap_interval(minutes))]
+    box = Gtk.Box(valign=Gtk.Align.CENTER)
+    box.add_css_class("linked")
+    shown = Gtk.Entry(editable=False, can_focus=False, width_chars=6, max_width_chars=6, xalign=0.5)
+    minus = Gtk.Button(icon_name="value-decrease-symbolic", tooltip_text="Less often")
+    plus = Gtk.Button(icon_name="value-increase-symbolic", tooltip_text="More often")
+
+    def show():
+        shown.set_text(data.interval_text(steps[at[0]]))
+        minus.set_sensitive(at[0] > 0)
+        plus.set_sensitive(at[0] < len(steps) - 1)
+
+    def step(by):
+        at[0] = min(len(steps) - 1, max(0, at[0] + by))
+        show()
+        on_change(steps[at[0]])
+
+    minus.connect("clicked", lambda _b: step(-1))
+    plus.connect("clicked", lambda _b: step(+1))
+    for w in (shown, minus, plus):
+        box.append(w)
+    def set_minutes(minutes):   # a loaded Rotation set: show its interval, without reporting a change
+        at[0] = steps.index(data.snap_interval(minutes))
+        show()
+    show()
+    box.step, box.text, box.set_minutes = step, shown.get_text, set_minutes
+    return box
 
 
 def number_spin(value, lo, hi, on_change):
@@ -823,7 +1525,7 @@ def labelled_switch(text, active, on_change, tooltip=None):
 def rot_card(bgd, on):
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4, halign=Gtk.Align.CENTER, width_request=CARD_W)
     box.add_css_class("tile")
-    box.append(picture(CARD_W, CARD_H, bgd.path, priority=0))
+    box.append(picture(CARD_W, CARD_H, bgd.path, priority=0, zoom=True))
     row = Gtk.Box(spacing=6)
     row.append(label(bgd.path.name, "small", hexpand=True, ellipsize=Pango.EllipsizeMode.MIDDLE))
     if bgd.yours:
@@ -844,12 +1546,13 @@ def set_card_on(child, on):
 
 
 class RotationPage(Gtk.Box):
-    """The Rotation tab. PROTOTYPE: settings live only while the window is open; nothing runs."""
+    """The Rotation tab: the settings the rotation engine follows, saved as they change."""
 
     def __init__(self, win):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.win = win
-        self.plan = data.RotationPlan(win.current_theme)
+        self.plan = data.load_rotation(win.current_theme)
+        self._save_id, self._loading, self._hover_set = 0, False, None
         self.selected = None          # name of the theme shown on the right
         self.rows = {}                # theme name -> ListBoxRow
         self._syncing = False
@@ -857,41 +1560,75 @@ class RotationPage(Gtk.Box):
 
         self.top = top = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         top.add_css_class("toolbar")
-        # Each switch has its timer right beside it; the wide gap between the pairs says which is which.
-        row1 = field("Rotate")
-        self.themes_switch, self.theme_timer, pair = self._switch_pair(
-            "Themes", "themes", "theme_minutes", "Rotate through the checked themes")
-        row1.append(pair)
-        self.bgs_switch, self.bg_timer, pair = self._switch_pair(
-            "Backgrounds", "backgrounds", "bg_minutes", "Rotate through the bright backgrounds")
-        pair.set_margin_start(48)
-        row1.append(pair)
+        # Two switches, one interval: changes land on the clock (20 min = :00, :20, :40).
+        # No "Rotate" label (owner, 2026-10-02): the Themes switch starts at the row's own padding, and
+        # the row fits the window's default width without a scroll bar.
+        row1 = Gtk.Box(spacing=10)
+        box, self.themes_switch = labelled_switch("Themes", p.themes, lambda on: self._on_switch("themes", on),
+                                                  "Rotate through the checked themes")
+        row1.append(box)
+        box, self.bgs_switch = labelled_switch("Backgrounds", p.backgrounds,
+                                               lambda on: self._on_switch("backgrounds", on),
+                                               "Rotate through the selected backgrounds")
+        box.set_margin_start(14)
+        row1.append(box)
+        self.interval = Gtk.Box(spacing=8, margin_start=14,
+                                tooltip_text="Changes land on the clock: every 20 min = at :00, :20 and :40")
+        self.interval.append(label("every", "dim", valign=Gtk.Align.CENTER))
+        self.stepper = interval_stepper(p.minutes, lambda m: (setattr(self.plan, "minutes", m), self._changed()))
+        self.interval.append(self.stepper)
+        row1.append(self.interval)
+        # Dawn & Dusk: day and night theme sets, switching at sunrise and sunset where you are (worked
+        # out once per boot, nothing to set). Greyed unless Themes is on; the wrapper keeps its tooltip.
+        sun = data.sun_times_now()
+        at = lambda m: f"{m // 60:02d}:{m % 60:02d}"
+        tip = (f"Location: {sun['where']}\n"
+               f"Dawn (day themes) from sunrise: {at(sun['rise'])}\n"
+               f"Dusk (night themes) from sunset: {at(sun['set'])}\n"
+               "Worked out once at startup. Needs Themes on.")
+        self.dd_box, self.dd_switch = labelled_switch("Dawn & Dusk", p.dawn_dusk, self._on_dawn_dusk, tip)
+        self.dd_switch.set_tooltip_text(tip)
+        dd_wrap = Gtk.Box(margin_start=14, tooltip_text=tip)  # still shows while greyed (Themes off)
+        dd_wrap.append(self.dd_box)
+        row1.append(dd_wrap)
+        # Mix it up! (owner's "nutty" idea): text left of its switch; needs both Themes and Backgrounds.
+        mix_tip = ("Any theme with any background.\nEvery change pairs a random theme with a random selected "
+                   "background from any theme in the rotation.")
+        self.mix_box = Gtk.Box(spacing=8)
+        self.mix_box.append(label("Mix it up!", valign=Gtk.Align.CENTER))
+        self.mix_switch = Gtk.Switch(active=p.mix, valign=Gtk.Align.CENTER, tooltip_text=mix_tip)
+        self.mix_switch.connect("notify::active", lambda s, _p: self._on_mix(s.get_active()))
+        self.mix_box.append(self.mix_switch)
+        mix_wrap = Gtk.Box(margin_start=14, tooltip_text=mix_tip)  # tooltip still shows while greyed
+        mix_wrap.append(self.mix_box)
+        row1.append(mix_wrap)
+        # The engine's word on it ("Next change at 09:20"): one line at the end of the row, taking the
+        # room left over (all of "Next change at 09:20" at the window's default size); in a narrower
+        # window a longer message ends in "…" and its tooltip has it whole. Nothing else moves.
+        self.status = label("", "dim", hexpand=True, xalign=1, width_chars=12, max_width_chars=31,
+                            ellipsize=Pango.EllipsizeMode.END, valign=Gtk.Align.CENTER, margin_start=14)
+        row1.append(self.status)
         top.append(row1)
-        self.row2 = Gtk.Box(spacing=12)
-        dd, self.dd_switch = labelled_switch("", p.dawn_dusk, self._on_dawn_dusk, "Separate theme sets for day and night")
-        self.row2.append(field("Dawn & Dusk", dd))
-        self.times = Gtk.Box(spacing=8)
-        for name, attr in (("Dawn starts", "dawn"), ("Dusk starts", "dusk")):
-            self.times.append(label(name, "dim", valign=Gtk.Align.CENTER, margin_start=12))
-            e = Gtk.Entry(text=getattr(p, attr), width_chars=5, max_width_chars=5, valign=Gtk.Align.CENTER)
-            e.connect("changed", lambda w, a=attr: setattr(p, a, w.get_text()))
-            self.times.append(e)
-        self.row2.append(self.times)
-        top.append(self.row2)
-        self.append(top)
+        # (the window puts this row in its one sideways-scrolling area, with the main bar: tab_rows)
 
-        self.period_bar, _c, self.period_btns = sub_tabs(("Dawn", "Dusk"), self._on_period)
-        self.append(self.period_bar)
-
+        # The Dawn / Dusk tabs belong to the theme list, so they sit over that column only; the
+        # backgrounds on the right start right under the settings row.
         pane = Gtk.Box(vexpand=True)
+        left = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        self.period_bar, _c, self.period_btns = sub_tabs(("Dawn", "Dusk"), self._on_period)
+        left.append(self.period_bar)
         self.list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.list.add_css_class("sidebar")
         self.list.connect("row-selected", self._on_row)
+        # 280 px wide when there's room; narrower (names end in "…", ~10 characters always show) before
+        # the pictures on the right lose their last column.
         sw = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER, overlay_scrolling=True,
-                                width_request=280)
+                                propagate_natural_width=True, max_content_width=280)
         sw.add_css_class("sidebar")
         sw.set_child(self.list)
-        pane.append(sw)
+        left.append(sw)
+        left.append(self._build_sets())
+        pane.append(left)
 
         right = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, hexpand=True, margin_start=18,
                         margin_end=18, margin_top=14)
@@ -913,20 +1650,181 @@ class RotationPage(Gtk.Box):
         pane.append(right)
         self.append(pane)
         self._sync_strips()
+        self._show_status()
+        GLib.timeout_add_seconds(2, self._show_status)
 
-    def _switch_pair(self, text, attr, minutes, tip):
+    # ---- saved Rotation sets (owner, 2026-10-01)
+    def _build_sets(self):
+        """[ name of this set ][ ▾ ][ Save ] under the theme list. Save stores the whole Rotation setup
+        under the name (new, or after a question, over another set); ▾ lists the other saved sets
+        (picking one switches the whole setup to it, and its name moves into the box); hover one in
+        the list and press Delete to delete it (asked first)."""
+        bar = Gtk.Box(spacing=6, margin_start=8, margin_end=8, margin_top=8, margin_bottom=8)
+        bar.add_css_class("sets-bar")
+        self.set_entry = Gtk.Entry(placeholder_text="Name this set…", hexpand=True, width_chars=6,
+                                   max_length=data.SET_NAME_MAX, text=self.plan.set_name,
+                                   tooltip_text="Save the whole Rotation setup under a name, to switch back to later")
+        self.set_entry.connect("changed", lambda *_: self._sync_sets())
+        self.set_entry.connect("activate", lambda *_: self.set_save.get_sensitive() and self._save_set())
+        bar.append(self.set_entry)
+        self.sets_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, activate_on_single_click=True)
+        self.sets_list.connect("row-activated", lambda _l, row: self._use_set(row.set_name))
+        pop = Gtk.Popover(child=Gtk.ScrolledWindow(child=self.sets_list, propagate_natural_height=True,
+                                                   propagate_natural_width=True, max_content_height=320,
+                                                   hscrollbar_policy=Gtk.PolicyType.NEVER))
+        pop.connect("show", lambda *_: self._fill_sets())
+        keys = Gtk.EventControllerKey(propagation_phase=Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_sets_key)
+        pop.add_controller(keys)
+        self.sets_pop = pop
+        bar.append(Gtk.MenuButton(icon_name="pan-down-symbolic", popover=pop, valign=Gtk.Align.CENTER,
+                                  tooltip_text="Your saved Rotation sets (hover one and press Delete to delete it)"))
+        self.set_save = button("Save", "primary", lambda *_: self._save_set())
+        self.set_save.set_valign(Gtk.Align.CENTER)
+        bar.append(self.set_save)
+        self._sync_sets()
+        return bar
+
+    def _sync_sets(self):
+        """Save is clickable only when there's something to save: a new name, or changes since the set
+        was saved."""
+        name = data.clean_set_name(self.set_entry.get_text())
+        self.set_save.set_sensitive(bool(name) and (name != self.plan.set_name or data.set_has_changes(self.plan)))
+
+    def _fill_sets(self):
+        self.sets_list.remove_all()
+        self._hover_set = None
+        others = [n for n in data.rotation_sets() if n != self.plan.set_name]
+        if not others:
+            self.sets_list.append(Gtk.ListBoxRow(child=label("No other saved sets yet", "dim", margin_start=10,
+                                                             margin_end=10, margin_top=6, margin_bottom=6),
+                                                 activatable=False))
+        for name in others:
+            row = Gtk.ListBoxRow(child=label(name, margin_start=10, margin_end=10, margin_top=6, margin_bottom=6))
+            row.set_name = name
+            hover = Gtk.EventControllerMotion()
+            hover.connect("enter", lambda *_a, n=name: setattr(self, "_hover_set", n))
+            hover.connect("leave", lambda *_a, n=name: self._hover_set == n and setattr(self, "_hover_set", None))
+            row.add_controller(hover)
+            self.sets_list.append(row)
+
+    def _on_sets_key(self, _c, key, *_):
+        if key not in (Gdk.KEY_Delete, Gdk.KEY_KP_Delete) or not self._hover_set:
+            return False
+        name = self._hover_set
+        d = Adw.AlertDialog(heading=f"Delete the Rotation set “{name}”?",
+                            body="Its saved themes, backgrounds and settings are deleted. Your current setup "
+                                 "doesn't change.")
+        d.add_response("cancel", "Cancel")
+        d.add_response("delete", "Delete")
+        d.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        d.set_close_response("cancel")
+        d.connect("response", lambda _d, r: r == "delete" and (data.delete_rotation_set(name), self._fill_sets(),
+                                                               self.win.toasts.add_toast(Adw.Toast(
+                                                                   title=f"Deleted the set “{name}”.", timeout=3))))
+        d.present(self.win)
+        return True
+
+    def _save_set(self):
+        name = data.clean_set_name(self.set_entry.get_text())
+        if not name:
+            return
+
+        def save():
+            self._save_now_quietly()
+            data.save_rotation_set(name, self.plan)
+            self.set_entry.set_text(name)
+            self._sync_sets()
+            self.win.toasts.add_toast(Adw.Toast(title=f"Saved this Rotation setup as “{name}”.", timeout=3))
+        if name != self.plan.set_name and name in data.rotation_sets():
+            d = Adw.AlertDialog(heading=f"Replace the set “{name}”?",
+                                body=f"A Rotation set called “{name}” is already saved. Replace it with this setup?")
+            d.add_response("cancel", "Cancel")
+            d.add_response("replace", "Replace")
+            d.set_response_appearance("replace", Adw.ResponseAppearance.DESTRUCTIVE)
+            d.set_close_response("cancel")
+            d.connect("response", lambda _d, r: r == "replace" and save())
+            d.present(self.win)
+        else:
+            save()
+
+    def _save_now_quietly(self):
+        if self._save_id:
+            GLib.source_remove(self._save_id)
+            self._save_id = 0
+
+    def _use_set(self, name):
+        self.sets_pop.popdown()
+
+        def switch():
+            self._save_now_quietly()
+            self.plan = data.use_rotation_set(name, self.win.current_theme)
+            self._show_plan()
+            self.win.toasts.add_toast(Adw.Toast(title=f"Rotation set “{name}” in use.", timeout=3))
+        if data.set_has_changes(self.plan) and (self.plan.set_name or self.plan.running()):
+            what = f"the set “{self.plan.set_name}”" if self.plan.set_name else "this unsaved setup"
+            d = Adw.AlertDialog(heading=f"Switch to “{name}”?",
+                                body=f"The changes to {what} haven't been saved as a set. Switch anyway?")
+            d.add_response("cancel", "Cancel")
+            d.add_response("switch", "Switch")
+            d.set_close_response("cancel")
+            d.connect("response", lambda _d, r: r == "switch" and switch())
+            d.present(self.win)
+        else:
+            switch()
+
+    def _show_plan(self):
+        """Every control on the tab shows self.plan (a set was just loaded), handlers kept quiet."""
         p = self.plan
-        pair = Gtk.Box(spacing=14)
-        box, sw = labelled_switch(text, getattr(p, attr), lambda on: self._on_switch(attr, on), tip)
-        pair.append(box)
-        timer = Gtk.Box(spacing=8)
-        timer.append(label("every", "dim", valign=Gtk.Align.CENTER))
-        timer.append(minutes_spin(getattr(p, minutes), lambda v: setattr(p, minutes, v)))
-        timer.append(label("min", "dim", valign=Gtk.Align.CENTER))
-        pair.append(timer)
-        return sw, timer, pair
+        self._loading = True
+        try:
+            self.themes_switch.set_active(p.themes)
+            self.bgs_switch.set_active(p.backgrounds)
+            self.dd_switch.set_active(p.dawn_dusk)
+            self.mix_switch.set_active(p.mix)
+            self.stepper.set_minutes(p.minutes)
+            self.period_btns[p.period].set_active(True)
+            self.set_entry.set_text(p.set_name)
+        finally:
+            self._loading = False
+        self._sync_strips()
+        self.win.rotation_changed()
+        self._restyle()
+        self._sync_sets()
 
     # ---- data
+    def _changed(self):
+        """Save shortly after the last change (a spin button held down fires many)."""
+        if self._save_id:
+            GLib.source_remove(self._save_id)
+        self._save_id = GLib.timeout_add(400, self._save)
+
+    def _save(self):
+        self._save_id = 0
+        try:
+            data.save_rotation(self.plan)
+            self._saved_ok = True
+            if hasattr(self, "set_save"):
+                self._sync_sets()
+        except OSError as e:
+            self._saved_ok = False
+            self.win.toasts.add_toast(Adw.Toast(title=f"Couldn't save the rotation settings: {e}", timeout=8))
+        return False
+
+    def save_now(self):
+        """Save at once (Update all), whether or not a change is waiting. True if it worked."""
+        if self._save_id:
+            GLib.source_remove(self._save_id)
+        self._save()
+        return self._saved_ok
+
+    def _show_status(self):
+        st = data.rotation_status()
+        text = rotation_status_text(self.plan, st, engine_alive(st))
+        self.status.set_text(text)
+        self.status.set_tooltip_text(text or None)
+        return True
+
     def _theme(self, name):
         return next((t for t in self.win.local if t.name == name), None)
 
@@ -934,12 +1832,30 @@ class RotationPage(Gtk.Box):
         t = self._theme(name)
         return data.backgrounds_for(t) if t else []
 
+    def sync_from_disk(self):
+        """Show the settings file as it is now (an import, a set switched elsewhere, the engine). An
+        edit of yours still waiting to be saved wins: it's about to be written. True if it changed."""
+        if self._save_id:
+            return False
+        disk = data.load_rotation(self.win.current_theme)
+        if json.dumps(disk.to_dict(), sort_keys=True) == json.dumps(self.plan.to_dict(), sort_keys=True):
+            self._sync_sets()   # the saved sets may have changed on their own
+            return False
+        self.plan = disk
+        self._show_plan()
+        return True
+
     def refresh(self):
-        """Called when themes are (re)loaded."""
+        """Called when themes are (re)loaded. Starts from the file, never from what this window last
+        showed: tidying a stale copy and saving it would write old settings over new ones."""
+        self.sync_from_disk()
         p = self.plan
+        before = json.dumps(p.to_dict(), sort_keys=True)
         p.forget_missing({t.name for t in self.win.local})
         p.current_theme = self.win.current_theme
         p.seed_solo(self._backgrounds(p.current_theme))
+        if json.dumps(p.to_dict(), sort_keys=True) != before:
+            self._changed()
         self._build_list()
 
     # ---- left: every installed theme
@@ -953,12 +1869,13 @@ class RotationPage(Gtk.Box):
             row.theme_name = t.name
             box = Gtk.Box(spacing=8)
             col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, hexpand=True)
-            col.append(label(t.title, ellipsize=Pango.EllipsizeMode.END))
+            col.append(label(t.title, ellipsize=Pango.EllipsizeMode.END, width_chars=10))  # never fewer shown
             row.summary = label("", "dim small", ellipsize=Pango.EllipsizeMode.END)
             col.append(row.summary)
             box.append(col)
-            # One fixed-size slot on the right: a checkbox (Themes on) or the current mark (Themes off).
-            row.slot = Gtk.Stack(hhomogeneous=True, vhomogeneous=True, valign=Gtk.Align.CENTER)
+            # One fixed-size slot on the right: a checkbox (Themes on) or the current mark (Themes off),
+            # kept 18 px clear of the scrollbar so a click meant for the box doesn't grab the bar.
+            row.slot = Gtk.Stack(hhomogeneous=True, vhomogeneous=True, valign=Gtk.Align.CENTER, margin_end=18)
             row.check = Gtk.CheckButton(valign=Gtk.Align.CENTER, tooltip_text="Include this theme in the rotation")
             row.check.connect("toggled", lambda c, n=t.name: self._on_check(n, c.get_active()))
             row.slot.add_named(row.check, "check")
@@ -983,9 +1900,9 @@ class RotationPage(Gtk.Box):
             on = True
             row.slot.set_visible_child_name("mark" if row.theme_name == self.win.current_theme else "none")
         self._syncing = False
+        # Unticked themes are dimmed but can still be opened, to look at their backgrounds before
+        # adding them (owner, 2026-09-30); opening one doesn't tick it.
         (row.remove_css_class if on else row.add_css_class)("unchecked")
-        row.set_selectable(on)
-        row.set_activatable(on)
         bgs = self._backgrounds(row.theme_name)
         if p.themes and not on:
             text = "Not in the rotation"
@@ -996,9 +1913,9 @@ class RotationPage(Gtk.Box):
         row.summary.set_text(text)
 
     def _select(self, name=None):
-        """Keep `name` selected if it can still be opened, else the first theme that can."""
-        rows = [r for r in self.rows.values() if self.plan.can_open(r.theme_name)]
-        row = self.rows.get(name) if name and self.plan.can_open(name) else (rows[0] if rows else None)
+        """Keep `name` selected if it's still listed, else the first theme."""
+        rows = list(self.rows.values())
+        row = self.rows.get(name) if name in self.rows else (rows[0] if rows else None)
         if row:
             self.list.select_row(row)
             if self.selected == row.theme_name:
@@ -1011,37 +1928,48 @@ class RotationPage(Gtk.Box):
     def drop(self, name):
         """A theme is being removed: take it out of the rotation."""
         self.plan.drop(name)
+        self._changed()
         self._restyle()
 
     # ---- handlers
     def _on_switch(self, which, on):
-        was = self.plan.running()
+        if self._loading:
+            return
         setattr(self.plan, which, on)
+        self._changed()
         self._sync_strips()
         self.win.rotation_changed()
         for row in self.rows.values():
             self._style_row(row)
         self._select(self.selected)
-        if self.plan.running() != was:
-            self.win.toasts.add_toast(Adw.Toast(
-                title=f"Prototype, nothing changed. Rotation would {'start' if self.plan.running() else 'stop'}.",
-                timeout=4))
 
     def _sync_strips(self):
         p = self.plan
-        self.bg_timer.set_sensitive(p.backgrounds)
-        self.theme_timer.set_sensitive(p.themes)
-        self.row2.set_sensitive(p.themes)
-        self.times.set_sensitive(p.dawn_dusk)
+        self.interval.set_sensitive(p.themes or p.backgrounds)
+        self.dd_box.set_sensitive(p.themes)
+        self.mix_box.set_sensitive(p.themes and p.backgrounds)
         self.period_bar.set_sensitive(p.themes and p.dawn_dusk)
 
+    def _on_mix(self, on):
+        if self._loading:
+            return
+        self.plan.mix = on
+        self._changed()
+        self._show_detail()
+
     def _on_dawn_dusk(self, on):
+        if self._loading:
+            return
         self.plan.set_dawn_dusk(on)
+        self._changed()
         self._sync_strips()
         self._restyle()
 
     def _on_period(self, name):
+        if self._loading:
+            return
         self.plan.period = name
+        self._changed()
         self._restyle()
 
     def _restyle(self):
@@ -1053,6 +1981,7 @@ class RotationPage(Gtk.Box):
         if self._syncing:
             return
         self.plan.set_checked(name, on, self._backgrounds(name))
+        self._changed()
         self._style_row(self.rows[name])
         self._select(name if on else self.selected)
 
@@ -1062,9 +1991,10 @@ class RotationPage(Gtk.Box):
 
     def _toggle(self, child):
         p, name = self.plan, self.selected
-        if not name or not p.backgrounds:
-            return
+        if not name or not p.backgrounds or (p.themes and not p.is_checked(name)):
+            return  # an unticked theme's backgrounds are only for looking
         on = p.toggle(name, child.bgd, self._backgrounds(name))
+        self._changed()
         set_card_on(child, on)  # in place, so the grid doesn't jump back to the top
         self._style_row(self.rows[name])
         self._update_count()
@@ -1077,20 +2007,26 @@ class RotationPage(Gtk.Box):
 
     def _show_detail(self):
         p, name = self.plan, self.selected
-        self.hint.set_text(ROT_HINTS[(p.themes, p.backgrounds)])
+        # An unticked theme (Themes on) can be looked at: its backgrounds show greyed; ticking it brings
+        # back your saved bright / dim choices at once.
+        looking = bool(name) and p.themes and not p.is_checked(name)
+        self.hint.set_text(UNTICKED_HINT if looking else MIX_HINT if p.mix and p.themes and p.backgrounds
+                           else ROT_HINTS[(p.themes, p.backgrounds)])
         self.hint.set_size_request(-1, self.hint.create_pango_layout("x\nx").get_pixel_size()[1])
-        self.grid.set_sensitive(p.backgrounds)
+        self.grid.set_sensitive(p.backgrounds and not looking)
         self.grid.remove_all()
         t = self._theme(name) if name else None
         self.title.set_text(t.title if t else "")
         self._update_count()
+        if looking:
+            self.count.set_text("Not in the rotation")
         if not t:
             self.grid.append(Gtk.FlowBoxChild(child=label("Check a theme on the left to add it to the rotation.",
                                                           "empty")))
             return
         bgs = self._backgrounds(name)
         for b in bgs:
-            self.grid.append(rot_card(b, p.is_picked(name, b, bgs)))
+            self.grid.append(rot_card(b, not looking and p.is_picked(name, b, bgs)))
         if not bgs:
             self.grid.append(Gtk.FlowBoxChild(child=label("No backgrounds for this theme yet.", "empty")))
 
@@ -1107,11 +2043,14 @@ class Window(Adw.ApplicationWindow):
         self.not_mono = {}  # installed font packages with no monospace face: {package: [families]}
         self.builtin_pkg, self.removed_builtins, self.hidden_builtins = "", [], []
         self.current_theme = data.current_theme_name()
-        self._last_bg, self._theme_changed_at = data.current_background(), 0
+        self._last_bg = data.current_background()
         # Set when a theme gets applied while you're elsewhere: the next visit to Backgrounds opens on
         # the (new) current theme; otherwise Backgrounds keeps the theme you last looked at.
         self._bg_follow_current = False
-        self._own_change_until, self._running = 0, set()
+        self._running = set()
+        self.preview_rows, self._preview_queue, self._preview_busy = {}, [], False
+        self._asked_aether = False
+        self._load_cached_previews()
         self._quiet_until, self._pending = 0, set()
         self.current_font = ""
         self.font_base = 12
@@ -1122,10 +2061,17 @@ class Window(Adw.ApplicationWindow):
         self.css = Gtk.CssProvider()
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_USER)
+        # Transparency for OmaSkins itself: only its background (the previews, text and buttons on it stay
+        # solid; Hyprland leaves this window out of its whole-window fade). Its own small style layer, so a
+        # fade only rewrites two lines.
+        self.alpha_css = Gtk.CssProvider()
+        Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.alpha_css,
+                                                  Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
+        self._alpha, self._alpha_fade, self._bg = data.transparency_values(data.transparency_step())[:2], 0, None
         self.reload_theme()
 
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        main.append(label(TITLE, "window-title"))
+        main.append(label(TITLE, "window-title", xalign=0.5))  # centred (owner, 2026-10-02)
 
         # main tabs + search + share
         bar = Gtk.Box()
@@ -1148,11 +2094,14 @@ class Window(Adw.ApplicationWindow):
             else:
                 bar.append(btn)
             self.main_tabs[name] = btn
+        # Owner (2026-10-02): Top Picks … Update all sit at the right, Update all as far from the window's
+        # edge as the rows below end, so the space after the tabs shows the two groups apart. Same on
+        # every tab (one bar for all of them); in a narrow window at least 24 px stay between them.
         bar.append(Gtk.Box(hexpand=True))
         # Owner: how Themes and Fonts lists sort (Browse and Installed), kept between launches.
         # Greyed, never hidden, on the tabs it doesn't apply to (no-layout-shift rule).
         self.sort_mode = data.sort_mode()
-        self.sort_box = Gtk.Box(valign=Gtk.Align.CENTER, margin_end=8)
+        self.sort_box = Gtk.Box(valign=Gtk.Align.CENTER, margin_start=24, margin_end=8)
         self.sort_box.add_css_class("sortbar")
         first_sort = None
         for mode, text, tip in (("top", "Top Picks", "Most popular first: Omarchy's own themes, then GitHub "
@@ -1171,30 +2120,45 @@ class Window(Adw.ApplicationWindow):
         self.search = Gtk.SearchEntry(placeholder_text="Search themes…", valign=Gtk.Align.CENTER)
         self.search.connect("search-changed", self._on_search)
         bar.append(self.search)
-        share = button("Share…", "", lambda *_: self.show_export(), tooltip="Export your current setup as a zip")
-        share.set_valign(Gtk.Align.CENTER)
-        share.set_margin_start(8)
-        bar.append(share)
-        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Re-read everything",
+        share_btn = button("Share…", "", lambda *_: self.show_export(), tooltip="Export your themes, backgrounds, fonts and settings as one file")
+        share_btn.set_valign(Gtk.Align.CENTER)
+        share_btn.set_margin_start(8)
+        bar.append(share_btn)
+        import_btn = button("Import…", "", lambda *_: self.show_import(),
+                            tooltip="Bring in a setup someone shared (or your own backup)")
+        import_btn.set_valign(Gtk.Align.CENTER)
+        import_btn.set_margin_start(4)
+        bar.append(import_btn)
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic", tooltip_text="Update all",
                              valign=Gtk.Align.CENTER, margin_start=4)
         refresh.add_css_class("icon-btn")
-        refresh.connect("clicked", lambda *_: self.load(force=True))
+        refresh.connect("clicked", lambda *_: self.update_all())
         bar.append(refresh)
-        main.append(bar)
+        # The main bar and the current tab's own row scroll sideways TOGETHER, as one area (owner,
+        # 2026-10-01: two separate thin strips were hard to use in a narrow window).
+        self.tab_rows = Gtk.Stack(hhomogeneous=False, vhomogeneous=False,
+                                  transition_type=Gtk.StackTransitionType.NONE)
+        top_rows = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        top_rows.append(bar)
+        top_rows.append(self.tab_rows)
+        main.append(hstrip(top_rows))
 
+        # hhomogeneous off: each tab needs only its own width, not the widest tab's.
         self.main_stack = Gtk.Stack(vexpand=True, transition_type=Gtk.StackTransitionType.CROSSFADE,
-                                    transition_duration=100)
+                                    transition_duration=100, hhomogeneous=False)
         self.main_stack.add_named(self._build_themes(), "Themes")
         self.main_stack.add_named(self._build_backgrounds(), "Backgrounds")
         self.main_stack.add_named(self._build_fonts(), "Fonts")
         self.rotation = RotationPage(self)
+        self.tab_rows.add_named(self.rotation.top, "Rotation")
         self.main_stack.add_named(self.rotation, "Rotation")
         main.append(self.main_stack)
 
         self.status = label("Loading…", "statusbar")
         main.append(self.status)
 
-        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=120)
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE, transition_duration=120,
+                               hhomogeneous=False)
         self.stack.add_named(main, "main")
 
         frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -1218,7 +2182,7 @@ class Window(Adw.ApplicationWindow):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         bar, self.theme_counts, self.theme_sub_btns = sub_tabs(("Browse", "Installed"), self._on_theme_sub)
         bar.append(self._build_corners())
-        box.append(bar)
+        self.tab_rows.add_named(bar, "Themes")
         self.theme_stack = Gtk.Stack(vexpand=True)
         self.theme_flows = {}
         for name in ("Browse", "Installed"):
@@ -1237,8 +2201,9 @@ class Window(Adw.ApplicationWindow):
         self.bg_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
         self.bg_list.add_css_class("sidebar")
         self.bg_list.connect("row-selected", self._on_bg_theme)
-        side = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, width_request=230,
-                                  overlay_scrolling=True)
+        # 230 px wide when there's room; narrower (names end in "…") before the pictures lose a column.
+        side = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER, overlay_scrolling=True,
+                                  propagate_natural_width=True, max_content_width=230)
         side.set_child(self.bg_list)
         side.add_css_class("sidebar")
         pane.append(side)
@@ -1250,7 +2215,8 @@ class Window(Adw.ApplicationWindow):
         tools.append(button("Add backgrounds…", "", lambda *_: self.bg_theme and self._pick_backgrounds()))
         tools.append(button("Open folder", "flat", lambda *_: self.bg_theme and self.do_action(
             data.open_folder_action(self.bg_theme.name))))
-        right.append(tools)
+        tools.set_hexpand(True)
+        self.tab_rows.add_named(tools, "Backgrounds")
         self.bg_flow = flow()
         self.bg_flow.set_filter_func(lambda c: not self.search_text or self.search_text in c.bgd.path.name.lower())
         right.append(scrolled(self.bg_flow))
@@ -1265,19 +2231,142 @@ class Window(Adw.ApplicationWindow):
         box = Gtk.Box(spacing=10, margin_start=24, valign=Gtk.Align.CENTER,
                       tooltip_text="Round the corners of windows, menus and popups for every theme, "
                                    "rotating or not. Off = each theme's own corners.")
-        box.append(label("Global Rounded Corners", valign=Gtk.Align.CENTER))
+        box.append(label("Rounded Corners", valign=Gtk.Align.CENTER))
         sw = Gtk.Switch(active=on, valign=Gtk.Align.CENTER)
         box.append(sw)
+        self.corners_switch = sw
+        self._corners_syncing = False
         # Greyed, never hidden, while off (no-layout-shift rule).
         self.corner_size = Gtk.Box(spacing=8, sensitive=on)
-        self.corner_size.append(number_spin(self.corners["px"], 0, data.CORNERS_MAX,
-                                            lambda v: self._on_corners(px=v)))
+        self.corners_spin = number_spin(self.corners["px"], 0, data.CORNERS_MAX, lambda v: self._on_corners(px=v))
+        self.corner_size.append(self.corners_spin)
         self.corner_size.append(label("px", "dim", valign=Gtk.Align.CENTER))
         box.append(self.corner_size)
         sw.connect("notify::active", lambda w, _p: self._on_corners(on=w.get_active()))
+        box.append(self._build_transparency())
         return box
 
+    def _build_transparency(self):
+        """Transparency (owner, 2026-10-02): five steps, a fixed width so nothing moves; changing it fades
+        the windows over 1.5 s (no toast: the fade is the feedback)."""
+        box = Gtk.Box(spacing=10, margin_start=24, valign=Gtk.Align.CENTER,
+                      tooltip_text="How see-through windows are (unfocused ones a little more).\n"
+                                   "Far left: solid. Second: Omarchy's own. Far right: strongest, with blur behind.")
+        box.append(label("Transparency", valign=Gtk.Align.CENTER))
+        steps = len(data.TRANSPARENCY_STEPS)
+        self.transparency = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, steps - 1, 1)
+        self.transparency.set_draw_value(False)
+        self.transparency.set_size_request(130, -1)
+        self.transparency.set_valign(Gtk.Align.CENTER)
+        for i in range(steps):
+            self.transparency.add_mark(i, Gtk.PositionType.BOTTOM, None)
+        self._transparency_syncing = True
+        self.transparency.set_value(data.transparency_step())
+        self._transparency_syncing = False
+        self._transparency_at = data.transparency_step()
+        self.transparency.connect("value-changed", self._on_transparency)
+        box.append(self.transparency)
+        # Qt apps (VLC, KeePassXC, ...) in the theme's colours and transparency: on by default.
+        qt = Gtk.Box(spacing=10, margin_start=24, valign=Gtk.Align.CENTER,
+                     tooltip_text="Qt apps (VLC, KeePassXC, ...) in the theme's colours, see-through like the "
+                                  "rest. Applies to Qt apps opened from now on.")
+        qt.append(label("Qt apps", valign=Gtk.Align.CENTER))
+        self.qt_switch = Gtk.Switch(active=qtstyle.enabled(), valign=Gtk.Align.CENTER)
+        self.qt_switch.connect("notify::active", lambda w, _p: w.get_active() != qtstyle.enabled()
+                               and self.do_action(data.qt_apps_action(w.get_active())))
+        qt.append(self.qt_switch)
+        outer = Gtk.Box(valign=Gtk.Align.CENTER)
+        outer.append(box)
+        outer.append(qt)
+        return outer
+
+    def _on_transparency(self, scale):
+        step = int(round(scale.get_value()))
+        if scale.get_value() != step:
+            scale.set_value(step)   # snap to the five steps
+            return
+        if self._transparency_syncing or step == self._transparency_at:
+            return
+        self._transparency_at = step
+        self._debounce("transparency", 350, lambda: (self._fade_alpha(step),
+                                                     self.do_action(data.transparency_action(step))))
+
+    def _set_alpha(self, a, b):
+        """OmaSkins' own background at `a` (focused) / `b` (unfocused); nothing else in it changes."""
+        self._alpha = (a, b)
+        bg = self._bg or "#000000"
+        self.alpha_css.load_from_string(
+            "window.omaskins, window.omaskins.csd { background: none; }\n"
+            f".frame-root {{ background: {theme.rgba(bg, a)}; }}\n"
+            f"window.omaskins:backdrop .frame-root {{ background: {theme.rgba(bg, b)}; }}\n")
+
+    def _fade_alpha(self, step, seconds=1.5, frames=10):
+        """Fade OmaSkins' own background to a step, together with the other windows' fade."""
+        if self._alpha_fade:
+            GLib.source_remove(self._alpha_fade)
+        (a0, b0), (a1, b1) = self._alpha, data.transparency_values(step)[:2]
+        frame = [0]
+
+        def tick():
+            frame[0] += 1
+            k = frame[0] / frames
+            self._set_alpha(a0 + (a1 - a0) * k, b0 + (b1 - b0) * k)
+            if frame[0] >= frames:
+                self._alpha_fade = 0
+                return False
+            return True
+        self._alpha_fade = GLib.timeout_add(int(seconds * 1000 / frames), tick)
+
+    def _debug_widths(self):
+        """OMASKINS_DEBUG=1: each tab's own top row against the room the window gives the top rows."""
+        sw = self.tab_rows
+        while sw is not None and not isinstance(sw, Gtk.ScrolledWindow):
+            sw = sw.get_parent()
+        room = sw.get_hadjustment().get_page_size() if sw else 0
+        c = self.tab_rows.get_first_child()
+        while c is not None:
+            name = self.tab_rows.get_page(c).get_name()
+            dlog(f"top row {name}: needs {c.measure(Gtk.Orientation.HORIZONTAL, -1)[0]} px, room {room:.0f} px")
+            c = c.get_next_sibling()
+        bar = self.tab_rows.get_parent().get_first_child()
+        dlog(f"main bar: needs {bar.measure(Gtk.Orientation.HORIZONTAL, -1)[0]} px")
+        return False
+
+    def _sync_transparency(self):
+        """The slider shows the saved step (an import, or OmaSkins open twice); the Qt apps switch too."""
+        if self.qt_switch.get_active() != qtstyle.enabled():
+            self.qt_switch.set_active(qtstyle.enabled())
+        if "transparency" in self._timers or self._transparency_at == data.transparency_step():
+            return
+        self._transparency_syncing = True
+        try:
+            self._transparency_at = data.transparency_step()
+            self.transparency.set_value(self._transparency_at)
+        finally:
+            self._transparency_syncing = False
+        self._fade_alpha(self._transparency_at)
+
+    def _sync_corners(self):
+        """The corners controls show the file as it is now (an import, or Omarchy's own reload)."""
+        self._sync_transparency()
+        if "corners" in self._timers:
+            return  # your own change is about to be applied
+        on, px = data.corners_setting()
+        px = px or self.corners["px"]
+        if (on, px) == (self.corners["on"], self.corners["px"]):
+            return
+        self._corners_syncing = True
+        try:
+            self.corners.update(on=on, px=px)
+            self.corners_switch.set_active(on)
+            self.corners_spin.set_value(px)
+            self.corner_size.set_sensitive(on)
+        finally:
+            self._corners_syncing = False
+
     def _on_corners(self, on=None, px=None):
+        if self._corners_syncing:
+            return
         if on is not None:
             self.corners["on"] = on
             self.corner_size.set_sensitive(on)
@@ -1309,7 +2398,7 @@ class Window(Adw.ApplicationWindow):
     def _build_fonts(self):
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         bar, self.font_counts, self.font_sub_btns = sub_tabs(("Browse", "Installed"), self._on_font_sub)
-        box.append(bar)
+        self.tab_rows.add_named(bar, "Fonts")
         self.font_stack = Gtk.Stack(vexpand=True)
         self.font_lists = {}
         for name in ("Browse", "Installed"):
@@ -1331,6 +2420,15 @@ class Window(Adw.ApplicationWindow):
         return b
 
     # ---- data
+    def update_all(self):
+        """The ⟳ button: save the Rotation settings now (no waiting on the half-second pause after a
+        change), then re-scan what's installed and fetch omarchy.org's list now, not once a day."""
+        saved = self.rotation.save_now()
+        self.load(force=True)
+        self.toasts.add_toast(Adw.Toast(
+            title="Rotation settings saved; themes, backgrounds and fonts re-scanned; omarchy.org's list updated."
+            if saved else "Couldn't save the rotation settings (see the message above); lists updated.", timeout=4))
+
     def load(self, force=False):
         dlog("load (disk)")
         self.set_status("Loading…")
@@ -1371,6 +2469,55 @@ class Window(Adw.ApplicationWindow):
         if err:
             msg = f"omarchy.org unreachable ({err}); showing installed only · " + msg
         self.set_status(msg)
+        if not self._asked_aether:
+            self._asked_aether = True
+            self._offer_aether_merge()
+
+    def _offer_aether_merge(self):
+        """At launch: Aether's working copy and the theme it's a copy of are one theme in two folders
+        (Aether's plain Apply always writes themes/aether), so Omarchy's own menu lists both. Offer to
+        combine them (run.merge_aether); "Not now" asks again next launch."""
+        twin = data.aether_twin()
+        if not twin:
+            self._ask_which_aether_theme()
+            return
+        title = data.display_name(twin[0])
+        newer = "Aether's working copy" if twin[1] else f"“{title}”"
+        d = Adw.AlertDialog(
+            heading="Two Aether themes are the same theme",
+            body=f"“{title}” and Aether's working copy “Aether” are the same theme with different settings, "
+                 f"so Omarchy's theme menu lists it twice.\n\nCombine them into “{title}”? The newer colours "
+                 f"and settings (from {newer}) are kept, the pictures from both go into one list with no "
+                 f"picture twice, and the extra “Aether” is removed.")
+        d.add_response("later", "Not now")
+        d.add_response("combine", "Combine")
+        d.set_response_appearance("combine", Adw.ResponseAppearance.SUGGESTED)
+        d.set_default_response("combine")
+        d.set_close_response("later")
+        d.connect("response", lambda _d, r: r == "combine" and self.do_action(
+            data.merge_aether_action(twin[0]), on_done=lambda: self.load(), confirm=False, explained=True))
+        d.present(self)
+
+    def _ask_which_aether_theme(self):
+        """Aether's working copy is there but OmaSkins isn't sure which theme it's a copy of (maybe a
+        picture was copied between themes, or it's a new theme): ask, best match first; never guess."""
+        candidates = data.aether_candidates()[:3]
+        if not candidates:
+            return
+        d = Adw.AlertDialog(
+            heading="Which theme is Aether's “Aether” a copy of?",
+            body="Aether saved your latest changes as a theme called “Aether”, so Omarchy's theme menu "
+                 "shows an extra theme. Pick the theme it belongs to and the two are combined (the newer "
+                 "colours kept, every picture once). If it's a brand-new theme, choose Not now and save it "
+                 "under its own name in Aether.")
+        d.add_response("later", "Not now")
+        for c in candidates:
+            d.add_response(c["name"], data.display_name(c["name"]))
+        d.set_response_appearance(candidates[0]["name"], Adw.ResponseAppearance.SUGGESTED)
+        d.set_close_response("later")
+        d.connect("response", lambda _d, r: r != "later" and self.do_action(
+            data.merge_aether_action(r, picked=True), on_done=lambda: self.load(), confirm=False, explained=True))
+        d.present(self)
 
     def _stars_fetched(self, stars):
         if isinstance(stars, dict) and stars and stars != self.stars:
@@ -1448,7 +2595,7 @@ class Window(Adw.ApplicationWindow):
             row = Gtk.ListBoxRow()
             row.theme = t
             box = Gtk.Box(spacing=8)
-            box.append(label(t.title, hexpand=True, ellipsize=Pango.EllipsizeMode.END))
+            box.append(label(t.title, hexpand=True, ellipsize=Pango.EllipsizeMode.END, width_chars=10))
             bgs = data.backgrounds_for(t, self.current_theme, cur_bg)
             box.append(label(str(len(bgs)), "dim small"))
             if t.name == self.current_theme:
@@ -1497,10 +2644,49 @@ class Window(Adw.ApplicationWindow):
         learned = data.learned_not_mono() | set(self.not_mono)
         pkgs = sorted((p for p in self.font_pkgs if data.browsable_font_package(p.package, learned)),
                       key=lambda p: self._font_order(p.package))
+        self.preview_rows = {}
         for p in pkgs:
-            brow.append(FontPackageRow(self, p, [f.family for f in groups.get(p.package, [])], cur_pkg))
+            row = FontPackageRow(self, p, [f.family for f in groups.get(p.package, [])], cur_pkg)
+            brow.append(row)
+            if not p.installed and not data.preview_font(p.package):
+                self.preview_rows[p.package] = row
+        self._fetch_previews([p.package for p in pkgs if p.package in self.preview_rows])
         self.font_counts["Installed"].set_text(str(len(groups)))
         self.font_counts["Browse"].set_text(str(len(pkgs)))
+
+    def _load_cached_previews(self):
+        """Fonts downloaded for Browse in an earlier session: usable again at once (this app only)."""
+        for meta in data.PREVIEW_FONTS.glob("*.json"):
+            info = data.preview_font(meta.stem)
+            if info:
+                load_preview_font(info["file"])
+
+    def _fetch_previews(self, packages):
+        """Download the missing previews one at a time, in list order, in the background (each
+        package once; only its regular font file is kept). Rows fill in as they arrive."""
+        queue = [p for p in packages if p not in self._preview_queue]
+        self._preview_queue.extend(queue)
+        if self._preview_busy or not self._preview_queue:
+            return
+        self._preview_busy = True
+
+        def next_one():
+            if not self._preview_queue:
+                self._preview_busy = False
+                return
+            package = self._preview_queue.pop(0)
+            bg(lambda: data.fetch_preview_font(package), lambda res: arrived(package, res))
+
+        def arrived(package, res):
+            row = self.preview_rows.get(package)
+            if isinstance(res, Exception) or not res:
+                dlog("preview failed:", package, res)
+                if row:
+                    row.show_note("Preview couldn't be downloaded (tries again next time)")
+            elif load_preview_font(res["file"]) and row:
+                row.show_preview(res["family"])
+            next_one()
+        next_one()
 
     # ---- navigation
     def _on_main_tab(self, name):
@@ -1510,6 +2696,7 @@ class Window(Adw.ApplicationWindow):
             dlog("Backgrounds opens on the current theme:", self.current_theme)
             self._select_bg_theme(self.current_theme)
         self.main_stack.set_visible_child_name(name)
+        self.tab_rows.set_visible_child_name(name)
         self.search.set_sensitive(name != "Rotation")
         self.sort_box.set_sensitive(name in ("Themes", "Fonts"))  # greyed elsewhere, never moved
         self.search.set_placeholder_text({"Themes": "Search themes…", "Backgrounds": "Search backgrounds…",
@@ -1617,6 +2804,43 @@ class Window(Adw.ApplicationWindow):
 
     def show_export(self):
         ExportDialog(self).present(self)
+
+    def show_import(self):
+        bg(share.register_file_type)
+        zips = Gtk.FileFilter(name="OmaSkins setups")
+        zips.add_pattern(f"*{share.EXT}")
+        zips.add_pattern("*.zip")   # saved before setups had their own file type
+        filters = Gio.ListStore.new(Gtk.FileFilter)
+        filters.append(zips)
+        Gtk.FileDialog(title="Import a shared setup", filters=filters).open(self, None, self._import_chosen)
+
+    def _import_chosen(self, d, res):
+        try:
+            path = d.open_finish(res).get_path()
+        except GLib.Error:
+            return  # cancelled
+        self.import_file(path)
+
+    def import_file(self, path):
+        """The import window for a setup file (from Import…, or double-clicked in a file manager)."""
+        def shown(result):
+            if isinstance(result, Exception):
+                self.toasts.add_toast(Adw.Toast(title=f"Can't import {Path(path).name}: {result}", timeout=8))
+            else:
+                ImportDialog(self, path, result).present(self)
+        bg(lambda: share.read_zip(path), shown)
+
+    def progress_toast(self, title):
+        """A toast with an ASCII bar under its title; (toast, progress(pct) callable from any thread)."""
+        toast = Adw.Toast(title=title, timeout=0)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.append(Gtk.Label(label=title, xalign=0))
+        bar = Gtk.Label(label=data.ascii_bar(0), xalign=0)
+        bar.add_css_class("mono")
+        box.append(bar)
+        toast.set_custom_title(box)
+        self.toasts.add_toast(toast)
+        return toast, lambda pct: GLib.idle_add(lambda: (bar.set_label(data.ascii_bar(pct)), False)[1])
 
     def _on_key(self, _ctl, keyval, _code, state):
         if self.page and self.stack.get_visible_child_name() == "theme" and keyval in (Gdk.KEY_Left, Gdk.KEY_Right):
@@ -1733,9 +2957,6 @@ class Window(Adw.ApplicationWindow):
                 busy.set_custom_title(box)
                 progress = lambda pct: GLib.idle_add(lambda: (bar.set_label(data.ascii_bar(pct)), False)[1])
             self.toasts.add_toast(busy)
-        if any(st[0] == "run" and st[1][0] in ("omarchy-theme-set", "omarchy-theme-bg-set") for st in a.steps):
-            # OmaSkins' own change: not a manual pick, so it mustn't reset the rotation timers.
-            self._own_change_until = GLib.get_monotonic_time() + 15_000_000
 
         def finished(result):
             self._running.discard(a.command)
@@ -1751,7 +2972,7 @@ class Window(Adw.ApplicationWindow):
                     t.set_button_label("Remove")
                     t.connect("button-clicked", lambda *_: self.do_action(data._remove_font_package(pkg)))
                 self.toasts.add_toast(t)
-            elif a.done or a.label not in ("Open folder",):
+            elif a.done or a.label not in ("Open folder", "Transparency"):
                 self.toasts.add_toast(Adw.Toast(title=a.done or f"{a.label}: done.", timeout=4))
             if on_done:
                 on_done()
@@ -1780,6 +3001,10 @@ class Window(Adw.ApplicationWindow):
             return  # another action is still going; its own settle will do it
         pending, self._pending = self._pending, set()
         dlog("settle, pending:", sorted(pending))
+        if "rotation" in pending:
+            self.rotation.sync_from_disk()
+        if "corners" in pending or "local" in pending:
+            self._sync_corners()
         if "state" in pending or "font" in pending:
             self.reload_theme()
         if pending - {"state", "marks"}:
@@ -1800,6 +3025,9 @@ class Window(Adw.ApplicationWindow):
         r = data.current_rounding() or 0
         css = theme.build_css(t) + (f"\nwindow.omaskins, window.omaskins.csd, .frame-root {{ border-radius: {r}px; }}\n"
                                     if r else "")
+        if t.bg != self._bg:
+            self._bg = t.bg
+            self._set_alpha(*self._alpha)
         if css == self._last_css:
             return
         self._last_css = css
@@ -1848,26 +3076,9 @@ class Window(Adw.ApplicationWindow):
         def apply():
             dlog("state settled (Omarchy's picker)")
             self.reload_theme()
-            old_theme, old_bg = self.current_theme, self._last_bg
             self._show_current_marks()  # redraws only if the marks moved (theme.name may have done it)
-            self._manual_change(self.current_theme != old_theme, self._last_bg != old_bg)
         # omarchy-theme-set touches these files several times over a few seconds: wait until they settle.
         self._debounce("state", 1000, apply)
-
-    def _manual_change(self, theme_changed, bg_changed):
-        """Omarchy's own picker was used (in the prototype nothing else changes these): the matching
-        rotation timers start over. A theme change's own new background, landing a moment after
-        the theme, belongs to that change and doesn't get a second message."""
-        now = GLib.get_monotonic_time()
-        if now < self._own_change_until:
-            return  # OmaSkins made this change itself
-        if theme_changed:
-            self._theme_changed_at = now
-        elif bg_changed and now - self._theme_changed_at < 5_000_000:
-            return
-        _timers, msg = self.rotation.plan.manual_change(theme_changed, bg_changed)
-        if msg:
-            self.toasts.add_toast(Adw.Toast(title=f"Prototype: {msg}", timeout=6))
 
     def _watch(self, path, cb, only=None):
         """Watch a folder; `only` = react to that one file name in it."""
@@ -1891,6 +3102,19 @@ class Window(Adw.ApplicationWindow):
         # [font] base-size here, the same value the bar sizes itself from): the window follows live.
         self._watch(Path.home() / ".config/fontconfig", lambda: self._on_files_changed("font"))
         self._watch(Path.home() / ".config/omarchy", lambda: self._on_files_changed("font"), only="shell.toml")
+        # OmaSkins' own settings, whoever writes them (an import, the rotation engine, a set switch):
+        # every tab shows what's on disk now, never an old copy (owner, 2026-10-01).
+        self._watch(data.ROTATION_FILE.parent, lambda: self._on_files_changed("rotation"))
+        self._watch(data.HYPR_DIR, lambda: self._on_files_changed("corners"), only=data.CORNERS_FILE.name)
+        if _DEBUG:
+            GLib.timeout_add(5000, self._debug_widths)
+        self._watch(data.TRANSPARENCY_FILE.parent, lambda: self._on_files_changed("corners"),
+                    only=data.TRANSPARENCY_FILE.name)
+        self._watch(data.OMASKINS_STATE, lambda: self._on_files_changed("local"), only=data.BUILTIN_STATE.name)
+        self._watch(data.AETHER_BLUEPRINTS, lambda: self._on_files_changed("local"))
+        # Fonts and built-in themes come and go with packages (pacman's list of what's installed).
+        self._watch(Path("/var/lib/pacman/local"), lambda: self._on_files_changed("local"))
+        self._watch(share.IMPORTED_FONTS, lambda: self._on_files_changed("local"))
 
     def _on_files_changed(self, kind):
         """Omarchy's files changed. While OmaSkins' own action is still running (and briefly after),
@@ -1904,6 +3128,10 @@ class Window(Adw.ApplicationWindow):
             self._state_changed()
         elif kind == "font":
             self._debounce("font", 300, self._font_changed)  # a dragged slider writes many times
+        elif kind == "rotation":
+            self._debounce("rotation", 300, self.rotation.sync_from_disk)
+        elif kind == "corners":
+            self._debounce("corners-file", 300, self._sync_corners)
         else:
             self._debounce("local", 600, self.load)
 
@@ -1917,11 +3145,20 @@ class Window(Adw.ApplicationWindow):
 
 class App(Adw.Application):
     def __init__(self):
-        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        # HANDLES_OPEN: a double-clicked .omaskins file arrives here (in the OmaSkins already open, if any).
+        super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_OPEN)
+
+    def do_open(self, files, _n, _hint):
+        self.do_activate()
+        win = self.props.active_window
+        for f in files[:1]:   # one setup at a time
+            if f.get_path():
+                GLib.idle_add(lambda p=f.get_path(): (win.import_file(p), False)[1])
 
     def do_activate(self):
         win = self.props.active_window or Window(self)
         win.present()
+        bg(share.register_file_type)   # keeps the file type and double-click opening set up (yours only)
         if _DEBUG:  # which renderer GTK really uses (the VM launcher asks for software, reports 04c/07)
             GLib.timeout_add(800, lambda: (dlog("renderer:", type(win.get_renderer()).__name__,
                                                 "GSK_RENDERER=" + os.environ.get("GSK_RENDERER", ""),

@@ -7,6 +7,7 @@ suite refuses to start if any of them still points at the real home.
     python3 -m unittest discover -s tests -v
 """
 
+import itertools
 import json
 import os
 import shutil
@@ -20,6 +21,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 REAL_HOME = Path.home()
 SANDBOX = Path(tempfile.mkdtemp(prefix="omaskins-test-"))
+import atexit  # noqa: E402
+atexit.register(shutil.rmtree, SANDBOX, True)   # the tests leave nothing behind either
 for var, sub in (("HOME", "home"), ("XDG_CONFIG_HOME", "home/.config"), ("XDG_STATE_HOME", "home/.local/state"),
                  ("XDG_CACHE_HOME", "home/.cache"), ("OMARCHY_PATH", "omarchy"),
                  ("OMASKINS_HIDDEN_THEMES", "hidden-themes"), ("OMASKINS_PACMAN_CONF", "etc/pacman.conf")):
@@ -31,6 +34,25 @@ for var in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
 
 sys.path.insert(0, str(ROOT))
 from omaskins import data  # noqa: E402
+from omaskins import run as _run  # noqa: E402
+
+
+def _no_windows(argv):
+    # 2026-10-02: a test once ticked every import row, which on the real system included removing two
+    # installed fonts; it opened a real password terminal and the owner typed the password. A fake home
+    # doesn't fence off pacman or the desktop, so no test may open anything, ever.
+    raise AssertionError(f"a test tried to open a window or terminal: {argv}")
+
+
+_run.launch = _no_windows
+_run.hypr_eval = _no_windows      # the live Hyprland is off limits too (transparency fades, blur)
+_run.hypr_clients = _no_windows
+_run.nautilus_windows = lambda: {}   # never ask the real Nautilus what it has open...
+_NAUTILUS_RESTART = _run.nautilus_restart   # the real one, only ever driven with fakes in a test
+_run.nautilus_restart = _no_windows   # ...and never restart it
+_run.restart_dialog_service = _no_windows   # nor Omarchy's real dialog service
+_run.dialog_service_running = lambda: False
+data.theme_mode = lambda: "dark"   # never ask the real Omarchy (each test sets what it needs)
 
 HOME = SANDBOX / "home"
 OMARCHY = SANDBOX / "omarchy"
@@ -331,12 +353,17 @@ class Rotation(unittest.TestCase):
         p.set_checked("aura", True, self.bgs["aura"])
         self.assertFalse(p.is_picked("aura", self.bgs["aura"][0], self.bgs["aura"]))
 
-    def test_only_checked_themes_open_while_themes_rotate(self):
+    def test_looking_at_an_unticked_theme_keeps_it_out_and_keeps_its_picks(self):
         p = self.plan
-        self.assertTrue(p.can_open("aura"))  # themes off: any theme opens
         p.themes = True
-        self.assertFalse(p.can_open("aura"))
-        self.assertTrue(p.can_open("tokyo-night"))
+        aura = self.bgs["aura"]
+        p.set_checked("aura", True, aura)
+        p.toggle("aura", aura[0], aura)                  # dimmed one
+        p.set_checked("aura", False)
+        p.is_picked("aura", aura[0], aura)               # looking at it, unticked
+        self.assertFalse(p.is_checked("aura"), "opening it doesn't tick it")
+        p.set_checked("aura", True, aura)
+        self.assertFalse(p.is_picked("aura", aura[0], aura), "ticked again: the saved dim choice is back")
 
     def test_backgrounds_only_pool_starts_with_the_current_theme(self):
         p = self.plan
@@ -362,33 +389,806 @@ class Rotation(unittest.TestCase):
         p.period = "Dusk"
         self.assertFalse(p.is_checked("aura"))
 
-    def test_stock_picker_restarts_the_matching_timers(self):
-        p = self.plan
-        self.assertEqual(p.manual_change(True, True), ([], ""), "nothing rotating: nothing to say")
-        p.themes = True
-        self.assertEqual(p.manual_change(True, True),
-                         (["theme"], "Rotation timer reset: next theme in 1 h."))
-        self.assertEqual(p.manual_change(False, True), ([], ""), "background picks don't touch the theme timer")
-        p.backgrounds = True
-        self.assertEqual(p.manual_change(True, True),
-                         (["theme", "background"],
-                          "Rotation timers reset: next theme in 1 h and next background in 10 min."))
-        self.assertEqual(p.manual_change(False, True),
-                         (["background"], "Rotation timer reset: next background in 10 min."))
-        p.themes = False
-        self.assertEqual(p.manual_change(True, True)[0], ["background"],
-                         "a theme change brings a new background, so that timer restarts too")
-
-    def test_minutes_text(self):
-        self.assertEqual([data.minutes_text(m) for m in (1, 10, 60, 90, 1440)],
-                         ["1 min", "10 min", "1 h", "1 h 30 min", "24 h"])
-
     def test_removed_themes_are_forgotten(self):
         p = self.plan
         p.set_checked("aura", True, self.bgs["aura"])
         p.forget_missing({"tokyo-night"})
         self.assertFalse(p.is_checked("aura"))
         self.assertNotIn("aura", p.theme_picks)
+
+
+class FakeDesktop:
+    """Stands in for the running desktop: records changes instead of making them."""
+
+    def __init__(self):
+        self.hidden, self.full, self.set, self.themes, self.notes = "", False, [], [], []
+
+    def away(self, sure=False):
+        self.looks = getattr(self, "looks", 0) + 1
+        return self.hidden or ("fullscreen" if self.full else "")
+
+    def notify(self, headline, description):
+        self.notes.append(description)
+
+    def set_background(self, path):  # like omarchy-theme-bg-set: re-point the link
+        link = data.STATE_DIR / "background"
+        link.unlink()
+        link.symlink_to(os.path.realpath(path))
+        self.set.append(os.path.realpath(path))
+        return True
+
+    def set_theme(self, name, background=None):
+        """Like OMARCHY_THEME_SKIP_BACKGROUND=1 omarchy-theme-set: Omarchy's copy of the current theme
+        is replaced by the new one's and theme.name changes; the background link is left alone."""
+        copies = data.STATE_DIR / "theme"
+        shutil.rmtree(copies, ignore_errors=True)
+        theme = next(t for t in data.local_themes() if t.name == name)
+        (copies / "backgrounds").mkdir(parents=True)
+        for b in data.backgrounds_for(theme):
+            if not b.yours:
+                shutil.copy(b.path, copies / "backgrounds" / b.path.name)
+        (data.STATE_DIR / "theme.name").write_text(name + "\n")
+        self.themes.append((name, os.path.realpath(background) if background else None))
+        if background:
+            self.set_background(background)
+        return True
+
+
+def at(h, m, s=0, day=30):
+    return time.mktime((2026, 9, day, h, m, s, 0, 0, -1))
+
+
+class ClockBase(unittest.TestCase):
+    """A fake home on tokyo-night, backgrounds rotating every 5 min, and a clock the test drives."""
+
+    def setUp(self):
+        from omaskins import rotation
+        self.r = rotation
+        build_fixture()
+        self._sid = rotation.session_id
+        self.session = "login-1"
+        rotation.session_id = lambda: self.session
+        self.d = FakeDesktop()
+        self.local = {t.name: t for t in data.local_themes()}
+        self.bgs = {n: data.backgrounds_for(t) for n, t in self.local.items()}
+        self.tn = {b.path.name: os.path.realpath(b.path) for b in self.bgs["tokyo-night"]}
+        self.plan = data.RotationPlan("tokyo-night")
+        self.plan.seed_solo(self.bgs["tokyo-night"])
+        self.plan.backgrounds, self.plan.minutes = True, 5
+        self.save()
+        self.t = None
+        self._sun = data.sun_times_now
+        data.sun_times_now = lambda: {"rise": 7 * 60, "set": 19 * 60, "where": "test"}  # Dawn 07:00, Dusk 19:00
+
+    def tearDown(self):
+        self.r.session_id = self._sid
+        data.sun_times_now = self._sun
+
+    def save(self):
+        data.save_rotation(self.plan)
+
+    def arrive(self, t):
+        """Log in at `t` (the engine's first look in this desktop session), then jump to 8:59:55."""
+        self.run_until(t, start=t)
+        self.t = max(self.t, at(8, 59, 55))
+        self.r._LAST_LOOK.clear()
+
+    def run_until(self, end, start=None, step=5):
+        """Tick every `step` seconds (like the engine) from `start` (or where we are) to `end`. A new
+        `start` is a fresh engine (a jump in the test's clock isn't a sleep)."""
+        if start is not None:
+            self.r._LAST_LOOK.clear()
+        self.t = start if start is not None else self.t
+        st = None
+        while self.t <= end:
+            # The real clock is never on a whole second (18:05:00.4): test with fractions too, which
+            # a pick's skipped slot once failed on.
+            st = self.r.tick(self.d, now=self.t + 0.437)
+            self.t += step
+        return st
+
+
+
+class ClockRotation(ClockBase):
+    """Owner's design: changes land on the clock (multiples of the interval from midnight), skipped
+    for 5 min after arriving at the desktop or after your own pick, and while locked/screensaver/
+    fullscreen. One interval for both switches."""
+
+    def test_slots_are_multiples_of_the_interval_from_midnight(self):
+        hh = lambda ts: [time.strftime("%H:%M", time.localtime(t)) for t in ts]
+        first = lambda m, now: hh(list(itertools.islice(self.r.slot_times(now, m), 3)))
+        self.assertEqual(first(20, at(9, 1)), ["09:20", "09:40", "10:00"])
+        self.assertEqual(first(15, at(9, 16)), ["09:30", "09:45", "10:00"])
+        self.assertEqual(first(120, at(9, 0)), ["10:00", "12:00", "14:00"])
+        self.assertEqual(first(1440, at(9, 0)), ["00:00", "00:00", "00:00"])
+
+    def test_intervals_step_through_the_owners_values_only(self):
+        self.assertEqual(data.INTERVALS, (5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 480, 720, 1440))
+        self.assertEqual([data.snap_interval(m) for m in (1, 5, 7, 25, 45, 90, 5000, "x")],
+                         [5, 5, 10, 30, 60, 120, 1440, 60])
+        self.assertEqual([data.interval_text(m) for m in (5, 30, 60, 720)], ["5 min", "30 min", "1 h", "12 h"])
+
+    def test_old_two_timer_settings_convert(self):
+        f = data.RotationPlan.from_dict
+        self.assertEqual(f({"themes": True, "theme_minutes": 20, "bg_minutes": 1}).minutes, 20)
+        self.assertEqual(f({"backgrounds": True, "bg_minutes": 1}).minutes, 5)
+        self.assertEqual(f({"minutes": 25}).minutes, 30)
+        plan = data.load_rotation("tokyo-night")
+        self.assertEqual((plan.backgrounds, plan.minutes), (True, 5))
+        data.ROTATION_FILE.write_text("{oops")
+        self.assertFalse(data.load_rotation().backgrounds, "a broken file falls back to defaults (off)")
+
+    def test_changes_land_on_the_clock_only(self):
+        self.run_until(at(8, 50), start=at(8, 50))      # arrived at 8:50
+        self.run_until(at(9, 10, 30), start=at(8, 59))
+        self.assertEqual(len(self.d.set), 3, "9:00, 9:05, 9:10 and nothing in between")
+
+    def test_five_minute_grace_after_arriving(self):
+        # Owner's examples, 20 min: arrive 8:55 -> first change 9:20; arrive 8:50 -> 9:00.
+        self.plan.minutes = 20
+        self.save()
+        st = self.run_until(at(8, 55), start=at(8, 55))
+        self.assertEqual(time.strftime("%H:%M", time.localtime(st["next_change"])), "09:20")
+        self.run_until(at(9, 19, 55), start=at(8, 55, 5))
+        self.assertEqual(self.d.set, [], "9:00 is inside the grace: skipped")
+        self.run_until(at(9, 20))
+        self.assertEqual(len(self.d.set), 1)
+        self.session = "login-2"
+        self.d.set.clear()
+        st = self.run_until(at(9, 50), start=at(9, 50))
+        self.assertEqual(time.strftime("%H:%M", time.localtime(st["next_change"])), "10:00")
+        self.run_until(at(10, 0))
+        self.assertEqual(len(self.d.set), 1, "10 min after arriving is outside the grace")
+
+    def test_a_restart_in_the_same_session_is_not_an_arrival(self):
+        self.arrive(at(8, 30))
+        self.run_until(at(8, 30))
+        self.run_until(at(9, 0), start=at(8, 58))      # the engine restarted at 8:58, same login
+        self.assertEqual(len(self.d.set), 1)
+
+    def pick_background(self):
+        """What Omarchy's background switcher does: re-point the link (the engine only notices)."""
+        link = data.STATE_DIR / "background"
+        other = next(p for p in self.tn.values() if p != os.path.realpath(link))
+        link.unlink()
+        link.symlink_to(other)
+
+    def test_your_own_pick_skips_the_next_slot(self):
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 3))
+        self.pick_background()                          # Omarchy's switcher, 9:03
+        before = len(self.d.set)
+        self.run_until(at(9, 10))
+        self.assertEqual(self.d.notes, ["Your pick stays until 09:10."])
+        self.assertEqual(len(self.d.set), before + 1, "9:05 skipped, 9:10 changes")
+
+    def test_owners_pick_examples_at_20_minutes(self):
+        # Pick at 9:03 -> 9:20 skipped -> 9:40. Pick again at 9:30 -> counts from the latest: 9:40
+        # skipped -> 10:00.
+        self.plan.minutes = 20
+        self.save()
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 3))
+        self.pick_background()
+        n = len(self.d.set)
+        self.run_until(at(9, 20, 30))
+        self.assertEqual((len(self.d.set), self.d.notes), (n, ["Your pick stays until 09:40."]))
+        self.run_until(at(9, 30))
+        self.pick_background()
+        self.run_until(at(9, 40, 30))
+        self.assertEqual(len(self.d.set), n, "9:40 skipped for the second pick")
+        self.assertEqual(self.d.notes[-1], "Your pick stays until 10:00.")
+        self.run_until(at(10, 0, 30))
+        self.assertEqual(len(self.d.set), n + 1)
+
+    def test_locked_screensaver_or_fullscreen_skip_the_slot_and_five_minutes_after(self):
+        # 5 min slots: away over a slot -> skipped; back 4 min before the next -> skipped too (grace);
+        # the one after changes. Nothing is saved up.
+        for attr, value in (("hidden", "locked"), ("hidden", "screensaver"), ("full", True)):
+            with self.subTest(attr=attr, value=value):
+                build_fixture()                            # a fresh fake home and desktop per case
+                self.d = FakeDesktop()
+                self.save()
+                self.arrive(at(8, 30))
+                self.run_until(at(9, 1))
+                n = len(self.d.set)
+                setattr(self.d, attr, value)
+                self.run_until(at(9, 6))                  # away from 9:01 to 9:06: 9:05 skipped
+                setattr(self.d, attr, "" if attr == "hidden" else False)
+                self.run_until(at(9, 10, 30))
+                self.assertEqual(len(self.d.set), n, "9:10 is 4 min after coming back: skipped")
+                self.run_until(at(9, 15, 30))
+                self.assertEqual(len(self.d.set), n + 1, "9:15 changes it")
+
+    def test_coming_back_more_than_five_minutes_before_a_slot_changes_on_time(self):
+        self.plan.minutes = 20
+        self.save()
+        self.arrive(at(8, 30))
+        self.d.hidden = "locked"
+        self.run_until(at(9, 13))
+        self.d.hidden = ""                                # back at 9:13, 7 min before 9:20
+        self.run_until(at(9, 20, 30))
+        self.assertEqual(len(self.d.set), 1)
+        self.d.hidden = "screensaver"
+        self.run_until(at(9, 36))
+        self.d.hidden = ""                                # back at 9:36, 4 min before 9:40
+        self.run_until(at(9, 40, 30))
+        self.assertEqual(len(self.d.set), 1, "9:40 skipped")
+        self.run_until(at(10, 0, 30))
+        self.assertEqual(len(self.d.set), 2, "10:00 changes it")
+
+    def test_waking_from_sleep_is_coming_back(self):
+        # 2026-09-30: the VM paused 13:05 -> 16:55:22 and a change landed 22 s after waking.
+        self.arrive(at(12, 0))
+        self.run_until(at(13, 5, 30), start=at(12, 59, 55))
+        self.r._LAST_LOOK["at"] = at(13, 5, 30)          # the engine's last look before the pause
+        n = len(self.d.set)
+        self.t = at(16, 55, 22)                           # the VM wakes
+        self.run_until(at(17, 0, 30))
+        self.assertEqual(len(self.d.set), n, "16:55 and 17:00 are within 5 min of waking")
+        self.run_until(at(17, 5, 30))
+        self.assertEqual(len(self.d.set), n + 1, "17:05 changes it")
+
+    def test_every_background_gets_a_turn_before_any_repeats(self):
+        self.arrive(at(8, 30))
+        self.run_until(at(10, 0))
+        first_round = self.d.set[:2]                   # 3 picks; the starting one had its turn
+        self.assertEqual(len(set(first_round)), 2)
+        self.assertNotIn(self.tn["1-b.jpg"], first_round)
+        self.assertTrue(all(a != b for a, b in zip(self.d.set, self.d.set[1:])))
+
+    def test_state_copy_counts_as_the_themes_own_file(self):
+        self.assertEqual(self.r.canonical_background("tokyo-night"), self.tn["1-b.jpg"])
+
+    def test_off_empty_and_single(self):
+        self.plan.solo_picks = set()
+        self.save()
+        self.assertEqual(self.run_until(at(8, 30), start=at(8, 30))["bg_status"], "empty")
+        self.plan.solo_picks = {Path(self.tn["1-b.jpg"])}
+        self.save()
+        self.assertEqual(self.run_until(at(8, 31))["bg_status"], "single")
+        self.plan.backgrounds = False
+        self.save()
+        st = self.run_until(at(9, 30))
+        self.assertEqual((st["status"], self.d.set), ("off", []))
+
+    def test_quiet_between_slots(self):
+        """The desktop is only asked in the 5 min before a slot (every 30 s) and at the slot; the state
+        file is written at most once a minute."""
+        self.plan.minutes = 20
+        self.save()
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 1))
+        self.d.looks = 0
+        writes = []
+        save = self.r.save_state
+        self.r.save_state = lambda st: (writes.append(self.t), save(st))
+        try:
+            self.run_until(at(9, 14, 25))
+            self.assertEqual(self.d.looks, 0, "9:01-9:14: nothing asked")
+            self.assertLessEqual(len(writes), 14, "at most once a minute")
+            self.run_until(at(9, 19, 55))
+            self.assertEqual(self.d.looks, 11, "9:14:30-9:19:30: one glance every 30 s")
+        finally:
+            self.r.save_state = save
+
+    def test_status_line(self):
+        from omaskins import app  # needs GTK, like the app
+        plan = data.load_rotation("tokyo-night")
+        text = lambda st, alive=True: app.rotation_status_text(plan, st, alive)
+        self.assertEqual(text({}, alive=False), "Engine off: plugin enabled?")
+        self.assertEqual(text({"status": "running", "next_change": at(9, 20)}), "Next change at 09:20")
+        self.assertEqual(text({"status": "running", "bg_status": "single"}), "Select a few more backgrounds")
+        plan.themes = True
+        self.assertEqual(text({"status": "running", "theme_status": "single"}), "Check at least one more theme")
+        self.assertFalse(app.engine_alive({"pid": 999999999}))
+        self.assertFalse(app.engine_alive({}))
+
+    def test_update_all_saves_the_rotation_settings_at_once(self):
+        from omaskins import app  # needs GTK, like the app
+        page = app.RotationPage.__new__(app.RotationPage)   # just the saving part, no window
+        page.plan, page._save_id = data.RotationPlan("tokyo-night"), 0
+        page.plan.minutes = 20
+        page._changed = None
+        self.assertTrue(page.save_now())
+        self.assertEqual(data.load_rotation("tokyo-night").minutes, 20)
+
+    def test_interval_buttons_step_through_the_owners_values(self):
+        from omaskins import app  # needs GTK, like the app
+        saved = []
+        box = app.interval_stepper(20, saved.append)
+        seen = [box.text()]
+        for by in (-1, -1, -1, -1, +1, +1, +1, +1, +1):
+            box.step(by)
+            seen.append(box.text())
+        self.assertEqual(seen, ["20 min", "15 min", "10 min", "5 min", "5 min", "10 min", "15 min", "20 min",
+                                "30 min", "1 h"])
+        self.assertEqual(saved[-1], 60)
+
+    def test_engine_stops_when_the_plugin_is_disabled(self):
+        pid = "io.github.jesuslovesyou1013.omaskins"
+        self.assertTrue(self.r.plugin_enabled(pid), "no shell.json: keep going")
+        write(self.r.SHELL_JSON, json.dumps({"plugins": [{"id": pid}]}))
+        self.assertTrue(self.r.plugin_enabled(pid))
+        write(self.r.SHELL_JSON, json.dumps({"plugins": [{"id": "other"}]}))
+        self.assertFalse(self.r.plugin_enabled(pid))
+
+    def test_away_detection(self):
+        mon = [{"activeWorkspace": {"id": 1}, "specialWorkspace": {"id": 0}, "solitaryBlockedBy": ["WINDOWED"]}]
+        cases = [
+            ([{"fullscreen": 2, "workspace": {"id": 1}}], True),    # fullscreen on the shown workspace
+            ([{"fullscreen": 3, "workspace": {"id": 1}}], True),    # maximised + fullscreen
+            ([{"fullscreen": 1, "workspace": {"id": 1}}], False),   # maximised: the bar still shows
+            ([{"fullscreen": 2, "workspace": {"id": 2}}], False),   # fullscreen on a hidden workspace
+            ([], False),
+        ]
+        for clients, want in cases:
+            self.assertEqual(self.r.fullscreen_on_screen(mon, clients), want, clients)
+        d = self.r.Desktop()
+        d._shell_locked = lambda: False
+        for monitors, clients, want in (
+                (mon, [], ""),
+                ([dict(mon[0], solitaryBlockedBy=["LOCK"])], [], "locked"),
+                (mon, [{"class": "org.omarchy.screensaver", "workspace": {"id": 1}}], "screensaver"),
+                (mon, [{"fullscreen": 2, "workspace": {"id": 1}}], "fullscreen"),
+                ([], [], "")):                                       # hyprctl didn't answer: here
+            d._snapshot = lambda m=monitors, c=clients: (m, c)
+            self.assertEqual(d.away(), want)
+        d._shell_locked = lambda: True
+        d._snapshot = lambda: (mon, [])
+        self.assertEqual((d.away(), d.away(sure=True)), ("", "locked"), "the shell is asked only at a slot")
+
+    def test_sun_times_where_you_are_once_per_boot(self):
+        r, s = data.sun_times(40.714, -74.006, 2026, 9, 30, -240)       # New York, EDT
+        self.assertTrue(6 * 60 + 45 <= r <= 6 * 60 + 55 and 18 * 60 + 37 <= s <= 18 * 60 + 47, (r, s))
+        self.assertEqual(data._iso6709("+404251-0740023"), (40 + 42 / 60 + 51 / 3600, -(74 + 0 / 60 + 23 / 3600)))
+        loc = data.home_location()                                       # no weather location in the sandbox
+        self.assertTrue(loc is None or loc[2].endswith("from your time zone"), loc)
+        write(data.WEATHER_SETTINGS, json.dumps({"name": "Batesville", "latitude": 39.3, "longitude": -85.22}))
+        self.assertEqual(data.home_location(), (39.3, -85.22, "Batesville, from the weather widget"))
+        sun_now = self._sun                                              # the real one, not setUp's stand-in
+        data._SUN.clear()
+        write(data.SUN_STATE, json.dumps({"boot": "an-older-boot", "rise": 1, "set": 2, "where": "old"}))
+        first = dict(sun_now())
+        self.assertEqual(first["where"], "Batesville, from the weather widget", "a new boot works it out")
+        home = data.home_location
+        data.home_location = lambda: self.fail("worked out again in the same boot")
+        try:
+            data._SUN.clear()
+            self.assertEqual(sun_now(), first, "read back, not worked out again")
+        finally:
+            data.home_location = home
+
+    def test_plugin_files_are_valid(self):
+        m = json.loads((ROOT / "manifest.json").read_text())
+        self.assertEqual(m["entryPoints"]["service"], "Service.qml")
+        self.assertIn(m["id"], (ROOT / "Service.qml").read_text())
+        if shutil.which("omarchy-plugin-validate"):
+            r = subprocess.run(["omarchy-plugin-validate", str(ROOT)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+
+class ClockThemeRotation(ClockBase):
+    """Themes on: one slot, one change; with Backgrounds on too, the theme's bright backgrounds take
+    turns first and the next theme comes in after the last one."""
+
+    def themes_on(self, backgrounds=False):
+        self.plan.themes, self.plan.backgrounds, self.plan.minutes = True, backgrounds, 5
+        for name in ("tokyo-night", "aura", "nord"):
+            self.plan.set_checked(name, True, self.bgs[name])
+        self.save()
+
+    def test_themes_only_changes_the_colours_and_never_the_background(self):
+        self.themes_on()
+        before = self.r.canonical_background("tokyo-night")
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 10))
+        names = [n for n, _ in self.d.themes]
+        self.assertEqual(len(names), 3)
+        self.assertEqual(set(names[:2]), {"aura", "nord"}, "each checked theme once before repeats")
+        self.assertTrue(all(bg is None for _, bg in self.d.themes))
+        self.assertEqual(self.d.set, [before], "only the same-picture re-point, never another image")
+        self.assertEqual(os.path.realpath(data.STATE_DIR / "background"), before)
+
+    def test_both_cycle_the_themes_backgrounds_then_the_next_theme(self):
+        self.themes_on(backgrounds=True)
+        self.plan.checked["All day"] = ["tokyo-night", "aura"]
+        self.save()
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 5))
+        self.assertEqual(self.d.themes, [], "tokyo-night still has bright ones left")
+        self.assertEqual(len(self.d.set), 2, "its other two backgrounds, 9:00 and 9:05")
+        self.run_until(at(9, 10))
+        self.assertEqual(self.d.themes, [("aura", self.bgs and os.path.realpath(self.bgs["aura"][0].path))],
+                         "all shown: aura comes in with its own bright one")
+        self.run_until(at(9, 15))
+        self.assertEqual([n for n, _ in self.d.themes], ["aura", "tokyo-night"], "aura has only one: next theme")
+
+    def test_a_theme_with_no_picks_keeps_your_background(self):
+        self.themes_on(backgrounds=True)
+        self.plan.checked["All day"] = ["tokyo-night", "nord"]   # your nord has no backgrounds
+        tn = self.bgs["tokyo-night"]
+        self.plan.theme_picks["tokyo-night"] = {tn[1].path}       # only the current one bright
+        self.save()
+        before = self.r.canonical_background("tokyo-night")
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 0))
+        self.assertEqual(self.d.themes, [("nord", None)])
+        self.assertEqual(os.path.realpath(data.STATE_DIR / "background"), before)
+
+    def test_a_theme_picked_elsewhere_gets_one_notification(self):
+        self.themes_on()
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 2))
+        (data.STATE_DIR / "theme.name").write_text("nord\n")
+        self.run_until(self.t + 5)
+        link = data.STATE_DIR / "background"
+        link.unlink()
+        link.symlink_to(self.bgs["aura"][0].path)                # its background lands a moment later
+        self.run_until(self.t + 5)
+        self.assertEqual(self.d.notes, ["Your pick stays until 09:10."])
+
+    def test_only_the_current_theme_checked_means_nothing_to_do(self):
+        self.themes_on()
+        self.plan.checked["All day"] = ["tokyo-night"]
+        self.save()
+        self.arrive(at(8, 30))
+        st = self.run_until(at(9, 30))
+        self.assertEqual((st["theme_status"], self.d.themes), ("single", []))
+
+    def test_mix_it_up_pairs_any_theme_with_any_bright_background(self):
+        self.themes_on(backgrounds=True)
+        self.plan.mix = True
+        self.plan.checked["All day"] = ["tokyo-night", "aura"]
+        self.save()
+        self.assertTrue(data.load_rotation("tokyo-night").mix, "saved with the settings")
+        everything = {os.path.realpath(p) for p in self.plan.mixed_pool(["tokyo-night", "aura"])}
+        self.assertEqual(len(everything), 4, "tokyo-night's three + aura's one, as one pool")
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 20, 30))
+        self.assertEqual(len(self.d.themes), 5, "every slot (9:00 ... 9:20) changes the theme")
+        bgs = [bg for _name, bg in self.d.themes]
+        self.assertTrue(all(bg in everything for bg in bgs), "only bright backgrounds from the list's themes")
+        first_round = bgs[:3]   # 4 in the pool; the one showing at the start had its turn
+        self.assertEqual(len(set(first_round)), 3, "no background repeats within its round")
+        self.assertTrue(all(a != b for a, b in zip(bgs, bgs[1:])), "never the same background twice in a row")
+        names = [n for n, _ in self.d.themes]
+        self.assertTrue(all(a != b for a, b in zip(names, names[1:])), "theme changes every slot")
+
+    def test_mix_it_up_needs_both_switches(self):
+        self.themes_on(backgrounds=False)
+        self.plan.mix = True
+        self.save()
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 0, 30))
+        self.assertEqual(self.d.themes[-1][1], None, "Backgrounds off: plain theme rotation, your background stays")
+
+    def test_sunset_only_decides_the_list_for_the_next_slot(self):
+        # Owner's rule: no change of its own at sunrise or sunset (setUp's sun: 07:00 / 19:00); the
+        # next regular slot picks from the new period's list.
+        self.themes_on()
+        self.plan.minutes = 120
+        self.plan.set_dawn_dusk(True)
+        self.plan.checked["Dusk"] = ["aura"]
+        self.save()
+        self.arrive(at(17, 0))
+        self.run_until(at(19, 59, 55), start=at(18, 50))
+        self.assertEqual(self.d.themes, [], "19:00 (sunset) isn't a 2 h slot: nothing changes then")
+        self.run_until(at(20, 0, 5))
+        self.assertEqual([n for n, _ in self.d.themes], ["aura"], "20:00 picks from the Dusk list")
+
+    def test_a_pick_just_before_sunset_is_not_cut_short(self):
+        # setUp's sunset is 19:00, 20 min slots. A pick at 18:53 (Dawn still): the next slot, 19:00,
+        # is skipped for the pick, although Dusk began then; 19:20 brings a Dusk theme.
+        self.themes_on()
+        self.plan.minutes = 20
+        self.plan.set_dawn_dusk(True)
+        self.plan.checked["Dusk"] = ["aura"]
+        self.save()
+        self.arrive(at(18, 0))
+        self.run_until(at(18, 53), start=at(18, 45))
+        (data.STATE_DIR / "theme.name").write_text("nord\n")   # Omarchy's theme switcher
+        n = len(self.d.themes)
+        self.run_until(at(19, 0, 30))
+        self.assertEqual(len(self.d.themes), n, "19:00 skipped: your pick stays past sunset")
+        self.assertEqual(self.d.notes[-1], "Your pick stays until 19:20.")
+        self.run_until(at(19, 20, 30))
+        self.assertEqual(self.d.themes[-1][0], "aura", "19:20 picks from the Dusk list")
+
+    def test_taking_the_current_theme_out_of_the_list_changes_the_theme_at_the_next_slot(self):
+        # Owner's case, 2026-09-30: both on, 5 min, Dawn & Dusk switched on at 11:40 (no extra change
+        # then), and at 11:44 the current dark theme was moved out of Dawn: 11:45 must bring a Dawn
+        # theme, not another background of the dark one.
+        self.themes_on(backgrounds=True)
+        self.plan.checked["All day"] = ["tokyo-night", "aura", "nord"]
+        self.save()
+        self.arrive(at(11, 0))
+        self.run_until(at(11, 40, 30), start=at(11, 39, 55))
+        changes = len(self.d.themes) + len(self.d.set)
+        self.plan.set_dawn_dusk(True)                   # Dawn starts as a copy of the everyday list
+        self.save()
+        self.run_until(at(11, 43))
+        self.assertEqual(len(self.d.themes) + len(self.d.set), changes, "switching it on changes nothing by itself")
+        current = data.current_theme_name()
+        self.plan.checked["Dawn"] = [n for n in ("tokyo-night", "aura", "nord") if n != current]
+        self.save()
+        self.run_until(at(11, 45, 30))
+        self.assertIn(self.d.themes[-1][0], self.plan.checked["Dawn"], "11:45 brings a Dawn theme")
+        self.assertNotEqual(self.d.themes[-1][0], current)
+
+    def test_grace_only_delays_when_the_list_decides_what(self):
+        # Owner's rule: grace decides WHEN a change lands, never WHICH list it comes from. Switching
+        # Dawn & Dusk off, the next change (whenever it lands) comes from the everyday list.
+        self.themes_on()
+        self.plan.set_dawn_dusk(True)
+        self.plan.checked["Dawn"] = ["tokyo-night", "aura"]
+        self.plan.checked["All day"] = ["tokyo-night", "nord"]
+        self.save()
+        self.arrive(at(11, 0))
+        self.run_until(at(11, 38))
+        self.plan.dawn_dusk = False                      # off at 11:38
+        self.save()
+        link = data.STATE_DIR / "background"
+        link.unlink()
+        link.symlink_to(self.bgs["aura"][0].path)        # and a pick of your own: grace until 11:43
+        before = len(self.d.themes)
+        self.run_until(at(11, 40, 30))
+        self.assertEqual(len(self.d.themes), before, "11:40 is inside the grace: no change")
+        self.run_until(at(11, 45, 30))
+        self.assertEqual(len(self.d.themes), before + 1, "11:45 changes it")
+        self.assertIn(self.d.themes[-1][0], self.plan.checked["All day"], "from the everyday list, not Dawn's")
+
+    def test_period_by_the_sun(self):
+        p = data.RotationPlan()
+        tm = lambda h, m: time.struct_time((2026, 9, 30, h, m, 0, 2, 273, 1))
+        self.assertEqual(p.period_now(tm(3, 0)), "All day")
+        p.dawn_dusk = True                                    # setUp's sun: rise 07:00, set 19:00
+        self.assertEqual([p.period_now(tm(h, m)) for h, m in ((6, 59), (7, 0), (18, 59), (19, 0))],
+                         ["Dusk", "Dawn", "Dawn", "Dusk"])
+        self.assertNotIn("dawn", p.to_dict(), "no adjustable times any more")
+
+
+class AetherThemes(unittest.TestCase):
+    def test_a_theme_made_with_aether_is_recognised_by_its_marker(self):
+        build_fixture()
+        write(HOME / ".config/omarchy/themes/oil-paintings/colors.toml", 'accent = "#99a4c0"\n')
+        write(HOME / ".config/omarchy/themes/oil-paintings/.aether-managed", "aether\n")
+        themes = {t.name: t for t in data.local_themes()}
+        self.assertEqual(themes["oil-paintings"].title, "Oil Paintings")
+        self.assertTrue(themes["oil-paintings"].aether)
+        self.assertFalse(themes["aura"].aether)
+        self.assertFalse(themes["tokyo-night"].aether, "built-ins never")
+
+
+class RotationSets(unittest.TestCase):
+    """Saved Rotation sets: whole Rotation setups under a name, to switch between."""
+
+    def setUp(self):
+        build_fixture()
+        tn = [b for b in data.backgrounds_for(next(t for t in data.local_themes() if t.name == "tokyo-night"))]
+        self.calm = data.RotationPlan("tokyo-night")
+        self.calm.themes, self.calm.minutes = True, 60
+        self.calm.set_checked("tokyo-night", True, tn)
+        self.calm.toggle("tokyo-night", tn[0], tn)               # one background dimmed
+        self.tn = tn
+
+    def test_save_then_switch_between_sets(self):
+        data.save_rotation_set("Calm evenings", self.calm)
+        self.assertEqual(data.load_rotation().set_name, "Calm evenings", "saved as current too")
+        wild = data.RotationPlan("tokyo-night")
+        wild.themes, wild.backgrounds, wild.mix, wild.minutes = True, True, True, 5
+        data.save_rotation_set("  Chaos   mode ", wild)
+        self.assertEqual(list(data.rotation_sets()), ["Calm evenings", "Chaos mode"], "names tidied")
+        plan = data.use_rotation_set("Calm evenings", "tokyo-night")
+        self.assertEqual((plan.themes, plan.backgrounds, plan.mix, plan.minutes), (True, False, False, 60))
+        self.assertFalse(plan.is_picked("tokyo-night", self.tn[0], self.tn), "its dimmed background came back")
+        self.assertEqual(data.load_rotation().minutes, 60, "and it's the setup in use now")
+        self.assertFalse(data.set_has_changes(plan))
+        plan.minutes = 20
+        self.assertTrue(data.set_has_changes(plan), "edited since saved")
+
+    def test_delete_and_names(self):
+        data.save_rotation_set("One", self.calm)
+        data.delete_rotation_set("One")
+        self.assertEqual(data.rotation_sets(), {})
+        with self.assertRaises(ValueError):
+            data.save_rotation_set("   ", self.calm)
+        self.assertEqual(len(data.clean_set_name("x" * 100)), data.SET_NAME_MAX)
+        self.assertTrue(data.set_has_changes(data.RotationPlan()), "never saved = something to save")
+
+
+class AetherWorkingCopy(unittest.TestCase):
+    """Aether's scratch folder `aether` and the named theme it's a copy of: one theme in OmaSkins."""
+
+    def setUp(self):
+        build_fixture()
+        self.themes = HOME / ".config/omarchy/themes"
+        self.named = self.make("oil-paintings", "#99a4c0", "painting-bytes")
+        os.utime(self.named / "colors.toml", (time.time() - 3600,) * 2)   # saved an hour ago
+
+    def make(self, name, accent, picture):
+        d = self.themes / name
+        write(d / ".aether-managed", "aether\n")
+        write(d / "colors.toml", f'accent = "{accent}"\n')
+        write(d / "backgrounds/wallhaven-5yyq53.jpg", picture)
+        return d
+
+    def listed(self):
+        return {t.name: t for t in data.local_themes()}
+
+    def test_the_working_copy_is_tied_by_the_same_picture_and_shown_once(self):
+        self.make("aether", "#a5aec7", "painting-bytes")                 # live-applied in Aether just now
+        self.assertEqual(data.aether_twin(), ("oil-paintings", True))
+        themes = self.listed()
+        self.assertNotIn("aether", themes, "no duplicate")
+        t = themes["oil-paintings"]
+        self.assertEqual((t.apply_as, t.colors.get("accent")), ("aether", "#a5aec7"), "the newer copy's look")
+        self.assertEqual(data.theme_folder_for("oil-paintings"), "aether")
+        write(data.STATE_DIR / "theme.name", "aether\n")
+        self.assertEqual(data.current_theme_name(), "oil-paintings", "applied = this theme is current")
+
+    def test_when_the_named_folder_is_newer_it_wins(self):
+        self.make("aether", "#a5aec7", "painting-bytes")
+        os.utime(self.themes / "aether/colors.toml", (time.time() - 7200,) * 2)
+        t = self.listed()["oil-paintings"]
+        self.assertEqual((t.apply_as, t.colors.get("accent")), ("", "#99a4c0"))
+        self.assertEqual(data.theme_folder_for("oil-paintings"), "oil-paintings")
+        self.assertNotIn("aether", self.listed(), "still one entry")
+
+    def test_the_blueprint_ties_them_when_the_picture_changed(self):
+        self.make("aether", "#a5aec7", "edited-picture-bytes")
+        self.assertIsNone(data.aether_twin(), "no blueprint yet: a different picture is a new theme")
+        self.assertIn("aether", self.listed(), "shown as its own (unsaved) theme")
+        write(data.AETHER_BLUEPRINTS / "oil-paintings.json",
+              json.dumps({"name": "oil-paintings", "palette": {"extendedColors": {"accent": "#A5AEC7"}}}))
+        self.assertEqual(data.aether_twin(), ("oil-paintings", True))
+        self.assertNotIn("aether", self.listed())
+
+    def test_a_picture_copied_into_another_theme_is_not_a_false_match(self):
+        # Owner, 2026-10-01: you may copy a picture you like from one theme into another.
+        self.make("sea-glass", "#20c080", "painting-bytes")               # same picture, its own colours
+        self.make("aether", "#a5aec7", "painting-bytes")                  # an edit of Oil Paintings
+        self.assertEqual(data.aether_twin(), ("oil-paintings", True), "the colours decide, not the picture")
+        self.assertIn("sea-glass", self.listed(), "sea-glass untouched and listed")
+
+    def test_a_new_theme_with_a_borrowed_picture_is_not_hidden(self):
+        self.make("aether", "#e0402a", "painting-bytes")                  # new colours, a borrowed picture
+        self.assertIsNone(data.aether_twin(), "a shared picture alone is never proof")
+        self.assertIn("aether", self.listed(), "shown as its own theme until you say otherwise")
+        self.assertEqual(data.aether_candidates()[0]["name"], "oil-paintings", "but offered first when asked")
+
+    def test_two_themes_that_fit_equally_means_asking(self):
+        self.make("oil-paintings-2", "#99a4c1", "painting-bytes")
+        self.make("aether", "#a5aec7", "painting-bytes")
+        self.assertIsNone(data.aether_twin(), "never guess between two")
+        self.assertEqual({c["name"] for c in data.aether_candidates()[:2]}, {"oil-paintings", "oil-paintings-2"})
+
+    def test_a_theme_you_pick_can_be_combined(self):
+        from omaskins import run
+        self.make("aether", "#e0402a", "new-picture")
+        with self.assertRaises(run.NotAllowed):
+            run.merge_aether("oil-paintings")                             # not sure: no silent combine
+        run.merge_aether("oil-paintings", picked=True)                    # you chose it when asked
+        self.assertFalse((self.themes / "aether").exists())
+        self.assertEqual(data._accent(self.named / "colors.toml"), "#e0402a")
+
+    def test_remove_takes_both_copies(self):
+        self.make("aether", "#a5aec7", "painting-bytes")
+        steps = data.remove_theme_action(self.listed()["oil-paintings"]).steps
+        taken = [s[1].name for s in steps if s[0] == "take_out"]
+        self.assertEqual(sorted(taken), ["aether", "oil-paintings"])
+
+    def test_combine_keeps_the_newer_settings_and_every_picture_once(self):
+        from omaskins import run
+        scratch = self.make("aether", "#a5aec7", "painting-bytes")        # newer, same picture
+        write(scratch / "backgrounds/second.jpg", "second-picture")       # a picture only the copy has
+        write(scratch / "backgrounds/clash.jpg", "copy-version")          # same name, different picture
+        write(self.named / "backgrounds/clash.jpg", "named-version")
+        write(scratch / "icons.theme", "Yaru-blue\n")
+        write(self.named / "kitty.conf", "old override\n")                # the older settings' extra file
+        write(data.STATE_DIR / "theme.name", "aether\n")                  # the working copy is applied
+        link = data.STATE_DIR / "background"
+        link.unlink()
+        link.symlink_to(scratch / "backgrounds/second.jpg")
+        plan = data.RotationPlan()
+        plan.themes, plan.checked["All day"] = True, ["aether", "tokyo-night"]
+        plan.theme_picks["aether"] = {scratch / "backgrounds/second.jpg"}
+        data.save_rotation(plan)
+        calls = []
+
+        def fake(argv, **kw):
+            calls.append((argv, kw.get("env", {}).get("OMARCHY_THEME_SKIP_BACKGROUND")))
+            if argv[0] == "omarchy-theme-bg-set":
+                link.unlink()
+                link.symlink_to(argv[1])
+            if argv[0] == "omarchy-theme-set":
+                (data.STATE_DIR / "theme.name").write_text(argv[1] + "\n")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        real_run, run.subprocess.run = run.subprocess.run, fake
+        try:
+            run.merge_aether("oil-paintings")
+        finally:
+            run.subprocess.run = real_run
+        self.assertFalse(scratch.exists(), "the extra folder is gone")
+        self.assertEqual(data._accent(self.named / "colors.toml"), "#a5aec7", "the newer colours")
+        self.assertEqual((self.named / "icons.theme").read_text(), "Yaru-blue\n")
+        self.assertFalse((self.named / "kitty.conf").exists(), "settings are the newer folder's, whole")
+        pics = sorted(p.name for p in data._images(self.named / "backgrounds"))
+        self.assertEqual(pics, ["clash-2.jpg", "clash.jpg", "second.jpg", "wallhaven-5yyq53.jpg"],
+                         "every picture once; the same name with another picture kept as -2")
+        self.assertEqual((self.named / "backgrounds/clash.jpg").read_text(), "named-version", "nothing overwritten")
+        self.assertEqual(data.current_theme_name(), "oil-paintings")
+        self.assertEqual(os.path.realpath(link), os.path.realpath(self.named / "backgrounds/second.jpg"),
+                         "the very same background, now from the combined theme")
+        self.assertEqual(calls[-1], (["omarchy-theme-set", "oil-paintings"], "1"), "Omarchy picked no background")
+        plan = data.load_rotation()
+        self.assertEqual(plan.checked["All day"], ["oil-paintings", "tokyo-night"])
+        self.assertEqual({p.name for p in plan.theme_picks["oil-paintings"]}, {"second.jpg"})
+        self.assertTrue(any(run.AETHER_MERGED.glob("*/aether/colors.toml")), "a copy kept in the cache")
+
+    def test_combine_refuses_anything_but_the_tied_pair(self):
+        from omaskins import run
+        self.make("aether", "#a5aec7", "another-picture")                  # not a copy of oil-paintings
+        with self.assertRaises(run.NotAllowed):
+            run.merge_aether("oil-paintings")
+        self.assertTrue((self.themes / "aether").exists())
+
+    def test_no_working_copy_nothing_changes(self):
+        self.assertIsNone(data.aether_twin())
+        self.assertEqual(self.listed()["oil-paintings"].apply_as, "")
+        self.assertEqual(data.theme_folder_for("oil-paintings"), "oil-paintings")
+
+
+class FontSetup(unittest.TestCase):
+    """OmaSkins' own font config (each font as itself) and the font previews for Browse."""
+
+    def test_private_fontconfig_leaves_out_only_omarchys_user_rule(self):
+        conf = SANDBOX / "etc-fonts"
+        (conf / "conf.d").mkdir(parents=True, exist_ok=True)
+        write(conf / "fonts.conf", '<fontconfig>\n\t<dir>/usr/share/fonts</dir>\n'
+                                   '\t<include ignore_missing="yes">conf.d</include>\n</fontconfig>\n')
+        for name in ("10-hinting.conf", "50-omarchy.conf", "50-user.conf", "60-latin.conf"):
+            write(conf / "conf.d" / name, "<fontconfig/>")
+        old = data.SYSTEM_FONTCONFIG
+        data.SYSTEM_FONTCONFIG = conf / "fonts.conf"
+        try:
+            text = data.private_fontconfig().read_text()
+        finally:
+            data.SYSTEM_FONTCONFIG = old
+        self.assertNotIn("conf.d/50-user.conf</include>", text, "Omarchy's every-monospace-font rule is loaded from it")
+        self.assertNotIn('prefix="xdg">fontconfig/fonts.conf', text)
+        for name in ("10-hinting.conf", "50-omarchy.conf", "60-latin.conf"):
+            self.assertIn(str(conf / "conf.d" / name), text)
+        self.assertIn('prefix="xdg">fontconfig/conf.d</include>', text, "your own conf.d stays")
+        self.assertIn("<dir>/usr/share/fonts</dir>", text)
+
+    def test_programs_started_get_the_normal_font_setup(self):
+        os.environ["FONTCONFIG_FILE"], os.environ["OMASKINS_FONTCONFIG"] = "/x/fonts.conf", "1"
+        try:
+            env = data.child_env()
+            self.assertNotIn("FONTCONFIG_FILE", env)
+            self.assertNotIn("OMASKINS_FONTCONFIG", env)
+            del os.environ["OMASKINS_FONTCONFIG"]
+            self.assertEqual(data.child_env()["FONTCONFIG_FILE"], "/x/fonts.conf", "one you set yourself stays")
+        finally:
+            os.environ.pop("FONTCONFIG_FILE", None)
+            os.environ.pop("OMASKINS_FONTCONFIG", None)
+
+    def test_the_preview_keeps_the_plain_regular_face(self):
+        names = ["usr/share/fonts/TTF/AgaveNerdFont-Bold.ttf", "usr/share/fonts/TTF/AgaveNerdFontMono-Regular.ttf",
+                 "usr/share/fonts/TTF/AgaveNerdFont-Regular.ttf", "usr/share/fonts/TTF/AgaveNerdFontPropo-Regular.ttf",
+                 "usr/share/licenses/x/LICENSE"]
+        self.assertEqual(data._preview_file_in(names), "usr/share/fonts/TTF/AgaveNerdFont-Regular.ttf")
+        self.assertEqual(data._preview_file_in(["a/XMono-Regular.otf", "a/X-Bold.otf"]), "a/XMono-Regular.otf")
+        self.assertIsNone(data._preview_file_in(["usr/share/licenses/x/LICENSE"]))
+
+    def test_preview_font_needs_its_file(self):
+        build_fixture()
+        f = write(data.PREVIEW_FONTS / "AgaveNerdFont-Regular.ttf", "font")
+        write(data.PREVIEW_FONTS / "ttf-agave-nerd.json", json.dumps({"family": "Agave Nerd Font", "file": str(f)}))
+        self.assertEqual(data.preview_font("ttf-agave-nerd")["family"], "Agave Nerd Font")
+        f.unlink()
+        self.assertIsNone(data.preview_font("ttf-agave-nerd"), "file gone (cache cleared): download again")
 
 
 class ThemeStars(unittest.TestCase):
@@ -856,7 +1656,7 @@ class CommandRunner(unittest.TestCase):
         for kind in ("hide", "unhide"):
             self.run.check([t, data.builtin_terminal_command(kind, "nord")])
         good = data.builtin_terminal_command("hide", "nord")
-        for bad in (good + "; rm -rf ~", good.replace("nord", "../x", 1), "echo 'Hiding nord...'; sudo rm -rf /",
+        for bad in (good + "; rm -rf ~", good.replace("nord", "../x", 1), "echo 'Removing nord...'; sudo rm -rf /",
                     good.replace("sudo mv", "sudo cp")):
             with self.assertRaises(self.run.NotAllowed, msg=bad):
                 self.run.check([t, bad])
@@ -1052,6 +1852,947 @@ class Thumbnails(unittest.TestCase):
 def tearDownModule():
     shutil.rmtree(SANDBOX, ignore_errors=True)
 
+
+class DownloadStall(unittest.TestCase):
+    """A theme download has no overall time limit; it's stopped only when nothing arrives."""
+
+    def setUp(self):
+        from omaskins import run
+        self.run, self._check = run, run.check
+        run.check = lambda argv: None
+
+    def tearDown(self):
+        self.run.check = self._check
+
+    def test_still_arriving_keeps_going(self):
+        r = self.run.run_with_progress(["sh", "-c", "for i in 1 2 3 4; do echo x >&2; sleep 0.8; done"],
+                                       lambda pct: None, stall=1)
+        self.assertEqual(r.returncode, 0, "3+ seconds in all, but never 1 second without news")
+
+    def test_twenty_minute_cap(self):
+        r = self.run.run_with_progress(["sh", "-c", "while true; do echo x >&2; sleep 0.3; done"],
+                                       lambda pct: None, stall=60, limit=2)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("still not finished after", r.stderr)
+        self.assertEqual(self.run.DOWNLOAD_LIMIT, 20 * 60)
+
+    def test_reads_gits_amount_and_speed(self):
+        heard = []
+        line = "Receiving objects:  66% (40/60), 2.58 MiB | 2.52 MiB/s"
+        self.run.run_with_progress(["sh", "-c", f"printf '{line}\\r' >&2"], lambda pct: None,
+                                   transfer=lambda got, rate: heard.append((got, rate)))
+        self.assertEqual(heard, [(int(2.58 * 1024 ** 2), 2.52 * 1024 ** 2)])
+        self.assertIsNone(self.run.clone_transfer("Receiving objects:  16% (10/60)"))
+
+    def test_nothing_arriving_is_stopped(self):
+        t = time.monotonic()
+        r = self.run.run_with_progress(["sh", "-c", "sleep 30"], lambda pct: None, stall=1)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("nothing arrived", r.stderr)
+        self.assertLess(time.monotonic() - t, 10)
+
+
+class ShareImport(unittest.TestCase):
+    """Share zip in, merged: nothing of yours is overwritten, a matching name merges, never a copy."""
+
+    def setUp(self):
+        build_fixture()
+        from omaskins import share
+        self.share = share
+        self.zip = SANDBOX / "share.zip"
+        self.ran = []
+        self._fonts = share._font_entries
+        share._font_entries = lambda: ([], [])         # no pacman / fc-list from the tests
+        # The import list is built from what's installed: never the real system's fonts or built-ins.
+        self._installed = (data.installed_fonts, data.shipped_builtins)
+        data.installed_fonts = lambda: [data.Font("JetBrainsMono Nerd Font", "ttf-jetbrains-mono-nerd", True)]
+        data.shipped_builtins = lambda pkg: []
+        from omaskins import run
+        self._set_theme = run.set_theme
+        run.set_theme = lambda name, bg=None: self.ran.append(("theme", name, str(bg)))
+
+    def tearDown(self):
+        from omaskins import run
+        run.set_theme = self._set_theme
+        self.share._font_entries = self._fonts
+        data.installed_fonts, data.shipped_builtins = self._installed
+
+    def make(self, manifest, files):
+        import zipfile
+        manifest = dict({"format": self.share.FORMAT, "themes": [], "backgrounds": [], "fonts": [],
+                         "rotation_sets": {}, "rotation": {}}, **manifest)
+        with zipfile.ZipFile(self.zip, "w") as z:
+            z.writestr(self.share.MANIFEST, json.dumps(manifest))
+            for name, payload in files.items():
+                z.writestr(name, payload)
+        return self.share.read_zip(self.zip)
+
+    def test_round_trip_brings_back_a_lost_theme_without_code(self):
+        mine = HOME / ".config/omarchy/themes/painted"
+        write(mine / "colors.toml", 'accent = "#123456"\n')
+        (mine / "backgrounds").mkdir()
+        (mine / "backgrounds/p1.jpg").write_bytes(b"picture one")
+        write(mine / "hyprland.lua", "os.execute('x')")
+        manifest, _ = self.share.write_zip(self.zip, [])
+        self.assertNotIn("location", manifest, "the location is never shared")
+        shutil.rmtree(mine)
+        manifest = self.share.read_zip(self.zip)
+        rows = self.share.items(manifest)
+        self.assertEqual(next(r for r in rows if r["id"] == "theme:painted")["state"], "new")
+        done, note, failed = self.share.run_import(self.zip, manifest, {r["id"] for r in rows}, apply=False)
+        self.assertEqual((mine / "backgrounds/p1.jpg").read_bytes(), b"picture one")
+        self.assertFalse((mine / "hyprland.lua").exists(), "code-running files stay out")
+        self.assertTrue(any("hyprland.lua" in n for n in note))
+
+    def test_a_matching_name_merges_pictures_into_yours(self):
+        mine = HOME / ".config/omarchy/themes/oil-paintings"
+        write(mine / "colors.toml", 'accent = "#mine"\n')
+        (mine / "backgrounds").mkdir()
+        (mine / "backgrounds/a.jpg").write_bytes(b"A")
+        manifest = self.make({"themes": [{"name": "Oil_Paintings", "kind": "folder"}]}, {
+            "themes/Oil_Paintings/colors.toml": 'accent = "#theirs"\n',
+            "themes/Oil_Paintings/backgrounds/a-copy.jpg": b"A",      # same picture, other name
+            "themes/Oil_Paintings/backgrounds/a.jpg": b"B",           # other picture, same name
+            "themes/Oil_Paintings/backgrounds/c.jpg": b"C"})
+        row = next(r for r in self.share.items(manifest) if r["id"] == "theme:Oil_Paintings")
+        self.assertEqual(row["state"], "merge")
+        self.share.run_import(self.zip, manifest, {"theme:Oil_Paintings"}, apply=False)
+        themes = HOME / ".config/omarchy/themes"
+        self.assertEqual(sorted(p.name for p in themes.iterdir()), ["aura", "nord", "oil-paintings", "secret"],
+                         "no second theme")
+        self.assertEqual((mine / "colors.toml").read_text(), 'accent = "#mine"\n', "your colours stay")
+        added = HOME / ".config/omarchy/backgrounds/oil-paintings"
+        self.assertEqual(sorted((p.name, p.read_bytes()) for p in added.iterdir()),
+                         [("a.jpg", b"B"), ("c.jpg", b"C")], "only the new pictures, nothing twice")
+        self.share.run_import(self.zip, manifest, {"theme:Oil_Paintings"}, apply=False)
+        self.assertEqual(len(list(added.iterdir())), 2, "importing again adds nothing")
+
+    def test_a_set_with_your_set_name_combines(self):
+        calm = data.RotationPlan("tokyo-night")
+        calm.themes, calm.minutes = True, 60
+        calm.checked = {"All day": ["tokyo-night"], "Dawn": [], "Dusk": []}
+        data.save_rotation_set("Calm", calm)
+        theirs = dict(calm.to_dict(), minutes=5, checked={"All day": ["nord", "tokyo-night"], "Dawn": [], "Dusk": []})
+        manifest = self.make({"themes": [{"name": "nord", "kind": "builtin"}],
+                              "rotation_sets": {"Calm": self.share.portable(theirs)}}, {})
+        rows = self.share.items(manifest)
+        row = next(r for r in rows if r["id"] == "set:Calm")
+        self.assertEqual((row["state"], row["needs"]), ("merge", ["theme:nord"]))
+        self.assertIn("theme:nord", self.share.with_needs({"set:Calm"}, rows), "its themes come with it")
+        self.share.run_import(self.zip, manifest, {"set:Calm"}, apply=False)
+        sets = data.rotation_sets()
+        self.assertEqual(list(sets), ["Calm"], "one set, not a copy")
+        self.assertEqual(sets["Calm"]["checked"]["All day"], ["tokyo-night", "nord"])
+        self.assertEqual(sets["Calm"]["minutes"], 60, "your interval stays")
+
+    def test_apply_mirrors_the_theme_and_background(self):
+        manifest = self.make({"themes": [{"name": "nord", "kind": "builtin"}],
+                              "current": {"theme": "nord", "background": {"zip": "current/x.png"}}},
+                             {"current/x.png": b"X"})
+        done, note, failed = self.share.run_import(self.zip, manifest, {"theme:nord"}, apply=True)
+        self.assertEqual(self.ran[0][1], "nord")
+        self.assertTrue(self.ran[0][2].endswith("/backgrounds/nord/x.png"), self.ran)
+
+    def test_a_failed_export_leaves_nothing(self):
+        out = SANDBOX / "out"
+        out.mkdir(exist_ok=True)
+        real = self.share.collect
+        self.share.collect = lambda c: ({"format": self.share.FORMAT}, [(SANDBOX / "missing.jpg", "x/missing.jpg")])
+        try:
+            with self.assertRaises(OSError):
+                self.share.write_zip(out / "setup.omaskins", [])
+        finally:
+            self.share.collect = real
+        self.assertEqual(list(out.iterdir()), [], "no half-written file")
+        self.share.write_zip(out / "setup.omaskins", [])
+        self.assertEqual([p.name for p in out.iterdir()], ["setup.omaskins"], "just the file")
+
+    def test_a_theme_download_leaves_no_holding_folder(self):
+        """A real download through OmaSkins' own steps (a local git repo): the theme lands in themes/
+        and the holding folder that took it in is gone afterwards, not left empty."""
+        from omaskins import run
+        src = SANDBOX / "repo-ok"
+        shutil.rmtree(src, ignore_errors=True)
+        write(src / "colors.toml", 'accent = "#123456"\n')
+        subprocess.run(["git", "init", "-q", str(src)], check=True)
+        subprocess.run(["git", "-C", str(src), "-c", "user.name=t", "-c", "user.email=t@t", "add", "."], check=True)
+        subprocess.run(["git", "-C", str(src), "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"],
+                       check=True)
+        tmp, dest = data.PARTIAL_THEMES / "repo-ok", data.USER_THEMES / "repo-ok"
+        run.perform((("clear_partial", tmp), ("run", ["git", "clone", "--progress", "--", src.as_uri(), str(tmp)]),
+                     ("move_in", tmp, dest)), lambda pct: None)
+        self.assertTrue((dest / "colors.toml").is_file())
+        self.assertFalse(data.PARTIAL_THEMES.exists(), "no empty holding folder left")
+
+    def test_a_failed_import_leaves_nothing(self):
+        manifest = self.make({"themes": [{"name": "fresh", "kind": "folder"}]},
+                             {"themes/fresh/colors.toml": "x", "themes/fresh/backgrounds/a.jpg": b"A"})
+        real = self.share.shutil.copyfileobj
+        def boom(src, dst):
+            if "a.jpg" in getattr(dst, "name", ""):
+                raise OSError("disk full")
+            return real(src, dst)
+        self.share.shutil.copyfileobj = boom
+        try:
+            with self.assertRaises(OSError):
+                self.share.run_import(self.zip, manifest, {"theme:fresh"}, apply=False)
+        finally:
+            self.share.shutil.copyfileobj = real
+        self.assertFalse((HOME / ".config/omarchy/themes/fresh").exists())
+        self.assertFalse(data.PARTIAL_THEMES.exists(), "no half-unpacked theme left")
+        self.share.run_import(self.zip, manifest, {"theme:fresh"}, apply=False)
+        self.assertFalse(data.PARTIAL_THEMES.exists())
+        self.assertEqual(self.share._IN_PROGRESS, set())
+
+    def test_file_type_keeps_file_managers_from_unpacking_it(self):
+        self.share.register_file_type()
+        self.assertIn('<glob pattern="*.omaskins"', self.share.MIME_PACKAGE.read_text())
+        self.assertTrue(str(self.share.MIME_PACKAGE).startswith(str(HOME)), "yours only, never system-wide")
+        entry = self.share.APP_DESKTOP.read_text()
+        self.assertIn("MimeType=application/x-omaskins-setup;\nNoDisplay=true", entry, "hidden, that type only")
+        self.assertIn("application/x-omaskins-setup=io.github.jesuslovesyou1013.omaskins.desktop",
+                      self.share.MIMEAPPS.read_text())
+        self.share.MIMEAPPS.write_text("[Default Applications]\napplication/x-omaskins-setup=other.desktop\n")
+        self.share.register_file_type()
+        self.assertIn("=other.desktop", self.share.MIMEAPPS.read_text(), "your own choice is left alone")
+
+    def test_import_reports_each_step(self):
+        """The overall bar: every step counted up front, then reported one by one, ending at total."""
+        calm = dict(data.RotationPlan("tokyo-night").to_dict(), checked={"All day": ["nord"], "Dawn": [], "Dusk": []})
+        manifest = self.make({"themes": [{"name": "fresh", "kind": "folder"}, {"name": "nord", "kind": "builtin"}],
+                              "backgrounds": [{"theme": "nord", "file": "x.png", "zip": "backgrounds/nord/x.png"}],
+                              "rotation_sets": {"Calm": self.share.portable(calm)}, "rotation": {"set": "Calm"},
+                              "aether_blueprints": ["aether-blueprints/fresh.json"],
+                              "current": {"theme": "nord"}},
+                             {"themes/fresh/colors.toml": "x", "backgrounds/nord/x.png": b"X",
+                              "aether-blueprints/fresh.json": "{}"})
+        heard = []
+        chosen = {r["id"] for r in self.share.items(manifest)}
+        done, note, failed = self.share.run_import(self.zip, manifest, chosen, apply=True, progress=heard.append)
+        steps = [h["step"] for h in heard]
+        total = heard[0]["total"]
+        # fresh, nord, the background, blueprints, the set, the rotation in use, the apply
+        self.assertEqual(total, 7)
+        self.assertEqual(steps, sorted(steps), "never goes backwards")
+        self.assertEqual(sorted(set(steps)), list(range(1, total + 1)), "every step reported, none skipped")
+        self.assertEqual((heard[-1]["step"], heard[-1]["text"]), (total, "Finished"))
+        self.assertIn("Adding Fresh", [h["text"] for h in heard])
+        self.assertTrue(all(h["download"] is None for h in heard), "nothing was downloaded")
+        self.assertEqual(failed, [])
+
+    def test_unsafe_names_are_ignored(self):
+        manifest = self.make({"themes": [{"name": "../evil", "kind": "folder"}, {"name": ".x", "kind": "folder"}],
+                              "backgrounds": [{"theme": "..", "file": "a.jpg", "zip": "backgrounds/a.jpg"}]}, {})
+        self.assertEqual(self.share.items(manifest), [])
+
+
+class ImportPassword(unittest.TestCase):
+    """Built-ins and font packages to match a file: offered as rows (Password tagged), and everything
+    that needs the password done in ONE terminal, so it's typed once."""
+
+    def setUp(self):
+        build_fixture()
+        from omaskins import run, share
+        self.run, self.share = run, share
+        self.saved = (data.builtin_package, data.shipped_builtins, data.installed_fonts, run.perform,
+                      run.wait_import_password)
+        data.builtin_package = lambda: "omarchy"
+        data.shipped_builtins = lambda pkg: ["gruvbox", "nord", "tokyo-night"]   # gruvbox removed here
+        data.installed_fonts = lambda: [data.Font("JetBrainsMono Nerd Font", "ttf-jetbrains-mono-nerd", True),
+                                        data.Font("Iosevka Nerd Font", "ttf-iosevka-nerd"),
+                                        data.Font("Liberation Mono", "ttf-liberation")]
+        self.zip = SANDBOX / "pw.omaskins"
+
+    def tearDown(self):
+        (data.builtin_package, data.shipped_builtins, data.installed_fonts, self.run.perform,
+         self.run.wait_import_password) = self.saved
+
+    def make(self, manifest):
+        import zipfile
+        manifest = dict({"format": self.share.FORMAT, "themes": [], "backgrounds": [], "fonts": [],
+                         "rotation_sets": {}, "rotation": {}}, **manifest)
+        with zipfile.ZipFile(self.zip, "w") as z:
+            z.writestr(self.share.MANIFEST, json.dumps(manifest))
+        return self.share.read_zip(self.zip)
+
+    def rows(self, manifest):
+        return {r["id"]: r for r in self.share.items(manifest)}
+
+    def test_one_command_and_the_safety_check(self):
+        cmd = data.password_terminal_command(["ttf-ubuntu-mono-nerd", "otf-hermit-nerd"], ["ttf-iosevka-nerd"],
+                                             ["tokyo-night"], [], ["gruvbox"], "omarchy")
+        self.assertEqual(cmd.count("sudo -v"), 1, "the password is asked once, at the start")
+        self.assertIn("omarchy-pkg-add otf-hermit-nerd ttf-ubuntu-mono-nerd", cmd, "both fonts, one pacman")
+        self.assertTrue(self.run._font_terminal(["omarchy-launch-floating-terminal-with-presentation", cmd]))
+        bad = cmd.replace("sudo mv", "sudo rm -rf /; sudo mv", 1)
+        self.assertFalse(self.run._font_terminal(["omarchy-launch-floating-terminal-with-presentation", bad]))
+        with self.assertRaises(ValueError):
+            data.password_terminal_command(["x;rm"], [], [], [], [], "omarchy")
+        with self.assertRaises(ValueError):
+            data.password_terminal_command([], [], [], [], [], "omarchy")
+
+    def test_rows_for_built_ins(self):
+        m = self.make({"themes": [{"name": "gruvbox", "kind": "builtin"}, {"name": "nord", "kind": "builtin"}],
+                       "hidden_builtins": ["nord"], "removed_builtins": ["tokyo-night"]})
+        rows = self.rows(m)
+        self.assertEqual(rows["restore:gruvbox"]["state"], "password", "installed there, removed here")
+        self.assertEqual(rows["hide:nord"]["state"], "new", "hidden there: no password")
+        choice = rows["builtin:tokyo-night"]["choice"]
+        self.assertEqual([(c[0], c[3]) for c in choice], [("hide:tokyo-night", ""), ("remove:tokyo-night", "password")])
+        # plain words for what will happen (owner, 2026-10-02: "installed there, removed here" said nothing)
+        self.assertEqual(rows["restore:gruvbox"]["detail"], "will be reinstalled")
+        self.assertEqual(rows["hide:nord"]["detail"], "will be hidden from OmaSkins")
+        self.assertEqual(rows["builtin:tokyo-night"]["detail_for"],
+                         {"hide:tokyo-night": "will be hidden from OmaSkins", "remove:tokyo-night": "will be uninstalled"})
+
+    def test_older_files_listed_hidden_and_removed_together(self):
+        m = self.make({"themes": [{"name": "nord", "kind": "builtin"}], "hidden_builtins": ["nord", "tokyo-night"]})
+        rows = self.rows(m)
+        self.assertIn("hide:nord", rows, "still among its themes: only hidden there")
+        self.assertIn("builtin:tokyo-night", rows, "not among its themes: removed there")
+
+    def test_font_removals_are_offered_but_never_ticked_or_protected_ones(self):
+        m = self.make({"fonts": [{"family": "Liberation Mono", "package": "ttf-liberation", "source": "repo"}]})
+        rows = self.rows(m)
+        self.assertEqual(rows["dropfont:ttf-iosevka-nerd"].get("opt_in"), True)
+        self.assertNotIn("dropfont:ttf-jetbrains-mono-nerd", rows, "Omarchy's default font / the one in use")
+
+    def test_everything_needing_the_password_goes_in_one_terminal(self):
+        m = self.make({"themes": [{"name": "gruvbox", "kind": "builtin"}],
+                       "fonts": [{"family": "UbuntuMono Nerd Font", "package": "ttf-ubuntu-mono-nerd", "source": "repo"},
+                                 {"family": "Hurmit Nerd Font", "package": "otf-hermit-nerd", "source": "repo"}],
+                       "removed_builtins": ["tokyo-night"]})
+        terminals = []
+        self.run.perform = lambda steps, *a, **k: terminals.extend(s[1] for s in steps if s[0] == "terminal")
+
+        def fake_wait(lists, *a, **k):
+            return ({("add-font", "otf-hermit-nerd"): True, ("add-font", "ttf-ubuntu-mono-nerd"): True,
+                     ("drop-font", "ttf-iosevka-nerd"): False, ("remove-theme", "tokyo-night"): True,
+                     ("restore-theme", "gruvbox"): True}, "terminal finished: done")
+        self.run.wait_import_password = fake_wait
+        chosen = {"font:UbuntuMono Nerd Font", "font:Hurmit Nerd Font", "dropfont:ttf-iosevka-nerd",
+                  "remove:tokyo-night", "restore:gruvbox"}
+        heard = []
+        done, note, failed = self.share.run_import(self.zip, m, chosen, apply=False, progress=heard.append)
+        self.assertEqual(len(terminals), 1, "one terminal, one password")
+        lists = data.parse_password_terminal_head(terminals[0])
+        self.assertEqual(lists, {"add-fonts": ["otf-hermit-nerd", "ttf-ubuntu-mono-nerd"],
+                                 "drop-fonts": ["ttf-iosevka-nerd"], "remove-themes": ["tokyo-night"],
+                                 "unhide-themes": [], "reinstall-themes": ["gruvbox"]})
+        self.assertIn("Removed Tokyo Night entirely", done)
+        self.assertIn("Restored Gruvbox", done)
+        self.assertTrue(any(n.startswith("ttf-iosevka-nerd: not removed") for n in note), "each item reported")
+        self.assertEqual(heard[-1]["step"], heard[-1]["total"])
+
+    def test_a_restore_clears_the_removed_at_entry(self):
+        st = data._builtin_state()
+        st["removed_at"]["gruvbox"] = "1.0-1"
+        data._save_builtin_state(st)
+        m = self.make({"themes": [{"name": "gruvbox", "kind": "builtin"}]})
+        self.run.perform = lambda steps, *a, **k: None
+        self.run.wait_import_password = lambda lists, *a, **k: ({("restore-theme", "gruvbox"): True}, "all done")
+        done, note, failed = self.share.run_import(self.zip, m, {"restore:gruvbox"}, apply=False)
+        self.assertEqual(done, ["Restored Gruvbox"])
+        self.assertNotIn("gruvbox", data._builtin_state()["removed_at"], "the import's restore clears it")
+        steps = data.builtin_restore_action("gruvbox", "omarchy").steps
+        self.assertEqual(steps[-1], ("forget_removed_version", "gruvbox"), "and so does the Restore button")
+
+    def test_terminal_says_how_to_cancel_and_cancelling_changes_nothing(self):
+        cmd = data.password_terminal_command(["otf-hermit-nerd"], [], [], [], [], "omarchy")
+        self.assertIn("Press Ctrl+C to cancel. Nothing will be changed.", cmd)
+        self.assertIn("sudo -v || { echo 'Cancelled: nothing was changed.'; echo cancelled > ", cmd,
+                      "Ctrl+C at the password: nothing runs, and the window closes (130 skips Omarchy's Done screen)")
+        self.assertIn("  - Install font: otf-hermit-nerd", cmd, "plain words, not the internal list")
+
+    def test_cancel_closes_only_the_password_window(self):
+        killed = []
+        procs = lambda: [(1, 0, "systemd --user"), (50, 1, "ghostty --class=org.omarchy.terminal -e bash -c THE-CMD"),
+                         (51, 50, "bash -c omarchy-show-logo; THE-CMD"), (52, 51, "sudo -v"),
+                         (60, 1, "ghostty --class=org.omarchy.agent -e claude")]
+        self.run.close_terminal("THE-CMD", procs=procs, kill=lambda pid, sig: killed.append(pid))
+        self.assertEqual(killed, [50], "the window's own process, nothing else")
+
+    def test_cancelled_items_say_so(self):
+        m = self.make({"fonts": [{"family": "UbuntuMono Nerd Font", "package": "ttf-ubuntu-mono-nerd", "source": "repo"}]})
+        self.run.perform = lambda steps, *a, **k: None
+
+        def wait(lists, *a, **k):
+            self.share._PASSWORD["cancelled"] = True   # Cancel was pressed meanwhile
+            return {("add-font", "ttf-ubuntu-mono-nerd"): False}, "terminal closed"
+        self.run.wait_import_password = wait
+        heard = []
+        done, note, failed = self.share.run_import(self.zip, m, {"font:UbuntuMono Nerd Font"}, apply=False,
+                                                   progress=heard.append)
+        self.assertEqual(note, ["ttf-ubuntu-mono-nerd: not installed (cancelled)"])
+        self.assertTrue(any(h.get("cancel") for h in heard), "Cancel is usable while the terminal is open")
+        self.assertFalse(heard[-1].get("cancel"), "and not after")
+
+    def test_a_font_a_terminal_is_set_to_use_is_never_offered_for_removal(self):
+        write(HOME / ".config/ghostty/config", 'font-family = "Iosevka Nerd Font"\n')
+        try:
+            rows = self.rows(self.make({"fonts": []}))
+            self.assertNotIn("dropfont:ttf-iosevka-nerd", rows)
+        finally:
+            (HOME / ".config/ghostty/config").unlink()
+
+    def test_waiting_ends_with_each_item_reported(self):
+        """The terminal tells OmaSkins it started and how it ended; each way of ending is reported."""
+        lists = {"add-fonts": ["a-nerd"], "drop-fonts": [], "remove-themes": [], "unhide-themes": [],
+                 "reinstall-themes": []}
+        mark = SANDBOX / "pw-mark"
+        started, finished = Path(f"{mark}.started"), Path(f"{mark}.done")
+        not_done = {("add-font", "a-nerd"): lambda: False}
+
+        def go(**k):
+            k.setdefault("window_open", lambda: False)
+            k.setdefault("settle", 0)
+            return self.run.wait_import_password(lists, mark, poll=0, checks=k.pop("checks", not_done), **k)
+        self.run.clear_password_marks(mark)
+        self.assertEqual(go(checks={("add-font", "a-nerd"): lambda: True}), ({("add-font", "a-nerd"): True}, "all done"))
+        started.write_text("4242")
+        finished.write_text("cancelled")
+        self.assertEqual(go(), ({("add-font", "a-nerd"): False}, "terminal finished: cancelled"))
+        finished.unlink()
+        self.assertEqual(go(alive=lambda pid: False), ({("add-font", "a-nerd"): False}, "terminal closed"))
+        self.run.clear_password_marks(mark)
+        self.assertEqual(go(grace=0)[1], "terminal never started")
+        self.assertFalse(started.exists() or finished.exists(), "markers cleared")
+
+    def test_waiting_is_patient_while_the_terminal_comes_up_and_rechecks_at_the_end(self):
+        """2026-10-02: the wait gave up 30 s in while Omarchy's terminal was still coming up, and
+        reported a restore that happened 18 s later as not done."""
+        lists = {"add-fonts": [], "drop-fonts": [], "remove-themes": [], "unhide-themes": ["miasma"],
+                 "reinstall-themes": []}
+        mark = SANDBOX / "pw-mark2"
+        started, finished = Path(f"{mark}.started"), Path(f"{mark}.done")
+        self.run.clear_password_marks(mark)
+        t0 = time.monotonic()
+        # 0-0.3 s: window up, script not started yet (the wait must not give up); 0.3 s: started;
+        # 0.5 s: says done; 0.6 s: the restore lands on disk (the final look must still see it)
+
+        def restored():
+            el = time.monotonic() - t0
+            if el > 0.3 and not started.exists():
+                started.write_text("4242")
+            if el > 0.5 and not finished.exists():
+                finished.write_text("done")
+            return el > 0.6
+        r, why = self.run.wait_import_password(lists, mark, poll=0.01, grace=0.05, settle=2, give_up=10,
+                                               checks={("restore-theme", "miasma"): restored},
+                                               window_open=lambda: True, alive=lambda pid: True)
+        self.assertEqual((r, why), ({("restore-theme", "miasma"): True}, "terminal finished: done"))
+        self.run.clear_password_marks(mark)
+
+    def test_the_terminal_writes_its_markers(self):
+        cmd = data.password_terminal_command(["otf-hermit-nerd"], [], [], [], [], "omarchy")
+        self.assertIn(f"echo $$ > {data.PASSWORD_MARK}.started; sudo -v", cmd)
+        self.assertIn(f"echo cancelled > {data.PASSWORD_MARK}.done; exit 130", cmd)
+        self.assertTrue(cmd.endswith(f"kill $keep; echo done > {data.PASSWORD_MARK}.done"))
+
+
+class Transparency(unittest.TestCase):
+    """Five steps; step 2 is exactly Omarchy's own; changes fade in live, never a Hyprland reload."""
+
+    def setUp(self):
+        build_fixture()
+        data.TRANSPARENCY_FILE.unlink(missing_ok=True)
+        self.calls = []
+        self.windows = [{"address": "0xa", "tags": ["default-opacity*"]},
+                        {"address": "0xb", "tags": ["default-opacity*", "terminal*"]},
+                        {"address": "0xc", "tags": []}]                      # Omarchy keeps this one solid
+
+    def fade(self, step):
+        _run.apply_transparency(step, evaluate=self.calls.append, clients=lambda: self.windows, sleep=lambda s: None)
+
+    def test_steps_and_saving(self):
+        self.assertEqual(data.transparency_step(), 1, "nothing saved: Omarchy's own")
+        self.assertEqual(data.transparency_values(1), (0.985, 0.96, False))
+        for step in (0, 2, 3, 4):
+            data.save_transparency(step)
+            self.assertEqual(data.transparency_step(), step)
+        data.save_transparency(1)
+        self.assertFalse(data.TRANSPARENCY_FILE.exists(), "the default step leaves no file at all")
+        a, b, _ = data.transparency_values(4)
+        self.assertLess(b, a, "unfocused windows are a little more see-through")
+
+    def hyprland(self):
+        """Run every Lua call the fades made, in order, in a real Lua with a stand-in Hyprland that keeps
+        rules (newest-wins, switchable) and window tags; returns (rules, enabled rules, tags per window)."""
+        if not shutil.which("lua"):
+            self.skipTest("no lua")
+        lua = SANDBOX / "fade.lua"
+        stand_in = r"""
+rules, tags = {}, { ["0xa"] = {}, ["0xb"] = {} }
+local Rule = {}
+Rule.__index = Rule
+function Rule:set_enabled(on) self.on = on end
+hl = { dsp = { window = { tag = function(t) return t end } }, config = function() end }
+function hl.window_rule(r) r.on = true; setmetatable(r, Rule); rules[#rules + 1] = r; return r end
+function hl.dispatch(t)
+  local w = t.window:sub(9)
+  local sign, name = t.tag:sub(1, 1), t.tag:sub(2)
+  tags[w] = tags[w] or {}
+  tags[w][name] = (sign == "+") or nil
+end
+"""
+        body = "\n".join(f"do\n{c}\nend" for c in self.calls if not c.startswith("hl.config"))
+        report = r"""
+local on, names = 0, {}
+for _, r in ipairs(rules) do if r.on then on = on + 1 end end
+for w, t in pairs(tags) do for n in pairs(t) do names[#names + 1] = w .. ":" .. n end end
+table.sort(names)
+-- what window 0xa looks like now: the newest switched-on rule matching one of its tags or default-opacity
+local seen = "none"
+for _, r in ipairs(rules) do
+  local m = r.match and r.match.tag
+  if r.on and r.opacity and (m == "default-opacity" or (m and tags["0xa"][m])) then seen = r.opacity end
+end
+print(#rules, on, table.concat(names, " "), seen)
+"""
+        lua.write_text(stand_in + body + report)
+        out = subprocess.run(["lua", str(lua)], capture_output=True, text=True)
+        self.assertEqual(out.stderr, "")
+        n, on, names, seen = out.stdout.rstrip("\n").split("\t")
+        return int(n), int(on), names, seen
+
+    def test_fade_to_step_3(self):
+        write(HOME / ".config/hypr/looknfeel.lua", "-- looknfeel\n")
+        self.fade(2)
+        self.assertEqual(self.calls[0], data.TRANSPARENCY_BLUR, "blur from step 3 up (owner, 2026-10-02)")
+        self.assertTrue(all("0xc" not in c for c in self.calls), "only windows Omarchy makes see-through")
+        rules, on, names, seen = self.hyprland()
+        self.assertEqual(seen, "0.8500 0.8000", "ends on step 3's values, for new windows too")
+        self.assertEqual(names, "", "no fade tags left on any window")
+        self.assertEqual(data.transparency_step(), 2)
+        self.assertIn("omaskins/transparency", data.CORNERS_FILE.read_text(), "omaskins.lua reads the step")
+
+    def test_moving_the_slider_all_day_piles_nothing_up(self):
+        write(HOME / ".config/hypr/looknfeel.lua", "-- looknfeel\n")
+        for step in (4, 2, 4, 2, 4, 2):
+            self.fade(step)
+        rules_after_3, _, _, _ = self.hyprland()
+        for step in (4, 2) * 10:
+            self.fade(step)
+        rules, on, names, seen = self.hyprland()
+        self.assertEqual(rules, rules_after_3, "the same moves again: no new rules in Hyprland")
+        self.assertEqual(seen, "0.8500 0.8000")
+        self.assertEqual(names, "")
+        self.assertEqual(rules - on, 1, "of our two default-opacity rules (step 3 and 5) only one is switched on")
+
+    def test_blur_on_the_strong_steps_and_back_to_omarchys_own(self):
+        write(HOME / ".config/hypr/looknfeel.lua", "-- looknfeel\n")
+        self.fade(4)
+        self.assertEqual(self.calls[0], data.TRANSPARENCY_BLUR, "blur first, then the fade")
+        self.calls.clear()
+        self.windows[0]["tags"] += ["omaskins-t1-10*"]   # left by the fade before 2026-10-02
+        self.fade(1)
+        self.assertTrue(any("blur = { enabled = false }" in c for c in self.calls), "blur off again")
+        self.assertIn("hl.dispatch(hl.dsp.window.tag({ window = 'address:0xa', tag = '-omaskins-t1-10' }))", self.calls,
+                      "old tags cleared")
+        self.assertFalse(data.TRANSPARENCY_FILE.exists())
+
+    def test_hyprland_reads_the_step(self):
+        """Run omaskins.lua's reader in a real Lua with stand-ins for Hyprland's o.window / hl.config."""
+        if not shutil.which("lua"):
+            self.skipTest("no lua")
+        lua = SANDBOX / "reader.lua"
+        data.save_transparency(4)
+        lua.write_text("o = { window = function(m, r) print('rule', m.class or m.tag, r.tag or r.opacity, r.tag and r.opacity or '') end }\n"
+                       "hl = { config = function(c) print('blur', c.decoration.blur.enabled) end }\n"
+                       + data.TRANSPARENCY_LUA)
+        out = subprocess.run(["lua", str(lua)], capture_output=True, text=True,
+                             env=dict(os.environ, XDG_CONFIG_HOME=str(HOME / ".config"))).stdout
+        self.assertEqual(out.split("\n")[:4], ["rule\t^io.github.jesuslovesyou1013.omaskins$\t-default-opacity\t1 1",
+                                               "rule\t^org.gnome.Nautilus$\t-default-opacity\t1 1",
+                                               "rule\tdefault-opacity\t0.75 0.68\t", "blur\ttrue"],
+                         "OmaSkins out of the whole-window fade (it fades only its background), then the step")
+        data.save_transparency(1)
+        out = subprocess.run(["lua", str(lua)], capture_output=True, text=True,
+                             env=dict(os.environ, XDG_CONFIG_HOME=str(HOME / ".config"))).stdout
+        self.assertEqual(out.strip(), "rule\t^io.github.jesuslovesyou1013.omaskins$\t-default-opacity\t1 1",
+                         "no file: only OmaSkins' own opt-out; every other window as Omarchy and the theme have it")
+
+    def test_shared_and_applied_by_an_import(self):
+        from omaskins import share
+        data.save_transparency(3)
+        self.assertEqual(share.collect([])[0]["transparency"], 3)
+        rows = {r["id"]: r for r in share.items({"format": share.FORMAT, "transparency": 3})}
+        self.assertEqual(rows["transparency"]["detail"], "step 4 of 5")
+        ran = []
+        saved = _run.perform
+        _run.perform = lambda steps, *a, **k: ran.extend(steps)
+        try:
+            share.apply_look({"transparency": 0}, {"transparency"}, {}, {}, None, [])
+        finally:
+            _run.perform = saved
+        self.assertIn(("apply_transparency", 0), ran)
+
+
+class NautilusTransparency(unittest.TestCase):
+    """Nautilus does its own transparency (sidebar 10 points more solid, icons solid) through GTK's
+    stylesheet, which it reads only when it starts: OmaSkins reopens it on the same folders."""
+
+    def setUp(self):
+        build_fixture()
+        data.TRANSPARENCY_FILE.unlink(missing_ok=True)
+        data.GTK4_CSS.unlink(missing_ok=True)
+        write(HOME / ".config/hypr/looknfeel.lua", "-- looknfeel\n")
+
+    def test_levels_and_the_sidebar(self):
+        css = data.nautilus_css(2)
+        # The whole window carries the level (a narrow Nautilus folds its sidebar away and its panes stop
+        # painting); the sidebar's own layer on top makes it 10 points more solid: 0.85 + 0.15 * 0.667 = 0.95.
+        # The file dialogs' greys, light and dark, switched by GTK itself (no restart on a theme change).
+        self.assertIn("window.nautilus-window, window.nautilus-window.background { background-color: alpha(#ffffff, 0.85); }", css)
+        self.assertIn("@media (prefers-color-scheme: dark) {\n  window.nautilus-window, window.nautilus-window.background "
+                      "{ background-color: alpha(#1d1d20, 0.85); }", css)
+        self.assertIn("window.nautilus-window:backdrop, window.nautilus-window.background:backdrop { background-color: alpha(#1d1d20, 0.8); }", css)
+        self.assertIn("window.nautilus-window .sidebar-pane { background-color: alpha(#2e2e32, 0.667); }", css)
+        self.assertIn("window.nautilus-window:backdrop .sidebar-pane { background-color: alpha(#2e2e32, 0.5); }", css)
+        self.assertEqual(data.DIALOG_GREYS["dark"][0], "#1d1d20", "the same grey as the file dialogs")
+        self.assertEqual(data.nautilus_css(data.TRANSPARENCY_DEFAULT), "", "Omarchy's default: nothing of ours")
+        self.assertIn("alpha(#1d1d20, 1)", data.nautilus_css(0), "step 1: solid")
+
+    def test_the_rest_of_gtk_css_is_left_alone(self):
+        write(data.GTK4_CSS, "/* mine */\nlabel { color: red; }\n")
+        self.assertTrue(data.write_nautilus_css(2))
+        self.assertFalse(data.write_nautilus_css(2), "same step: no change, so no Nautilus restart")
+        self.assertTrue(data.write_nautilus_css(4))
+        text = data.GTK4_CSS.read_text()
+        self.assertEqual(text.count(data.NAUTILUS_CSS_START), 1, "one block, replaced")
+        self.assertTrue(text.startswith("/* mine */\nlabel { color: red; }"))
+        data.write_nautilus_css(data.TRANSPARENCY_DEFAULT)
+        self.assertEqual(data.GTK4_CSS.read_text().strip(), "/* mine */\nlabel { color: red; }")
+        data.GTK4_CSS.write_text("")
+        data.write_nautilus_css(2)
+        data.write_nautilus_css(data.TRANSPARENCY_DEFAULT)
+        self.assertFalse(data.GTK4_CSS.exists(), "only ours was in it: the file goes too")
+
+    def test_nautilus_is_reopened_not_faded(self):
+        calls, restarted = [], []
+        clients = [{"address": "0xn", "class": "org.gnome.Nautilus", "tags": ["default-opacity*"]},
+                   {"address": "0xa", "class": "foot", "tags": ["default-opacity*"]}]
+        saved = (_run.nautilus_windows, _run.nautilus_restart)
+        _run.nautilus_windows = lambda: {"/org/gnome/Nautilus/window/1": ["file:///home/x/Downloads"]}
+        _run.nautilus_restart = lambda windows, *a, **k: restarted.append(windows)
+        try:
+            _run.apply_transparency(2, evaluate=calls.append, clients=lambda: clients, sleep=lambda s: None)
+            self.assertTrue(any("retag({ '0xa' }" in c for c in calls))
+            self.assertFalse(any("0xn" in c for c in calls), "Nautilus isn't faded by Hyprland")
+            self.assertTrue(calls[-1].endswith("nautilus(true)"), "its own: out of Hyprland's fade")
+            self.assertEqual(restarted, [{"/org/gnome/Nautilus/window/1": ["file:///home/x/Downloads"]}])
+            restarted.clear()
+            _run.apply_transparency(2, evaluate=calls.append, clients=lambda: clients, sleep=lambda s: None)
+            self.assertEqual(restarted, [], "its stylesheet didn't change: no restart")
+        finally:
+            _run.nautilus_windows, _run.nautilus_restart = saved
+
+    def test_restart_puts_windows_back(self):
+        opened, moved, quit_ = [], [], []
+        state = {"open": [{"address": "0xold", "class": "org.gnome.Nautilus", "title": "Downloads",
+                           "workspace": {"name": "1"}}]}
+
+        def clients():
+            return state["open"]
+
+        def open_(uris):
+            opened.append(uris)
+            state["open"] = state["open"] + [{"address": "0xnew", "class": "org.gnome.Nautilus", "title": "Downloads",
+                                              "workspace": {"name": "special:scratchpad"}}]
+
+        def quit_now():
+            quit_.append(1)
+            state["open"] = []
+        saved = _run.nautilus_restart
+        _run.nautilus_restart = _NAUTILUS_RESTART   # the real one, with fakes for everything it touches
+        try:
+            _run.nautilus_restart({"/w/1": ["file:///home/x/Downloads"]}, evaluate=moved.append, clients=clients,
+                                  sleep=lambda s: None, quit_=quit_now, open_=open_)
+        finally:
+            _run.nautilus_restart = saved
+        self.assertEqual((quit_, opened), ([1], [["file:///home/x/Downloads"]]))
+        self.assertEqual(moved, ["hl.dispatch(hl.dsp.window.move({ workspace = '1', follow = false, "
+                                 "window = 'address:0xnew' }))"], "back on its workspace")
+
+    def test_restart_two_windows_on_the_same_folder(self):
+        """Two "Home" windows on workspaces 1 and 2 come back on 1 and 2, not both on 1 (owner, 2026-10-02)."""
+        moved = []
+        state = {"open": [{"address": "0xa", "class": "org.gnome.Nautilus", "title": "Home", "workspace": {"name": "1"}},
+                          {"address": "0xb", "class": "org.gnome.Nautilus", "title": "Home", "workspace": {"name": "2"}}]}
+
+        def open_(uris):
+            n = len(state["open"])
+            state["open"] = state["open"] + [{"address": f"0xn{n}", "class": "org.gnome.Nautilus", "title": "Home",
+                                              "workspace": {"name": "special:scratchpad"}}]
+
+        def quit_now():
+            state["open"] = []
+        saved = _run.nautilus_restart
+        _run.nautilus_restart = _NAUTILUS_RESTART
+        try:
+            _run.nautilus_restart({"/w/1": ["file:///home/x"], "/w/2": ["file:///home/x"]}, evaluate=moved.append,
+                                  clients=lambda: state["open"], sleep=lambda s: None, quit_=quit_now, open_=open_)
+        finally:
+            _run.nautilus_restart = saved
+        self.assertEqual(sorted(m.split("workspace = '")[1][0] for m in moved), ["1", "2"])
+
+    def test_restart_puts_an_untitled_window_back_too(self):
+        """A new window without its title yet (or one that doesn't match): the workspace Nautilus was on."""
+        moved = []
+        state = {"open": [{"address": "0xold", "class": "org.gnome.Nautilus", "title": "Home", "workspace": {"name": "2"}}]}
+
+        def open_(uris):
+            state["open"] = [{"address": "0xnew", "class": "org.gnome.Nautilus", "title": "",
+                              "workspace": {"name": "special:scratchpad"}}]
+
+        def quit_now():
+            state["open"] = []
+        saved = _run.nautilus_restart
+        _run.nautilus_restart = _NAUTILUS_RESTART
+        try:
+            _run.nautilus_restart({"/w/1": ["file:///home/x"]}, evaluate=moved.append, clients=lambda: state["open"],
+                                  sleep=lambda s: None, quit_=quit_now, open_=open_)
+        finally:
+            _run.nautilus_restart = saved
+        self.assertEqual(moved, ["hl.dispatch(hl.dsp.window.move({ workspace = '2', follow = false, "
+                                 "window = 'address:0xnew' }))"])
+
+
+class FileDialogs(unittest.TestCase):
+    """File dialogs (GTK3, Omarchy's dialog service) look like Nautilus, at the slider's level."""
+
+    def setUp(self):
+        build_fixture()
+        data.TRANSPARENCY_FILE.unlink(missing_ok=True)
+        data.GTK3_CSS.unlink(missing_ok=True)
+        self.dark = HOME / ".local/share/themes/Adwaita-dark/gtk-3.0/gtk.css"
+        shutil.rmtree(HOME / ".local/share/themes", ignore_errors=True)
+        data.GTK3_DARK_THEME = [self.dark]   # never what the real system has installed
+
+    def test_like_nautilus_at_the_step(self):
+        write(self.dark, "/* GTK3's dark theme */")
+        css = data.dialog_css(4, "dark")
+        self.assertIn("dialog.background, dialog.background.csd, dialog headerbar.titlebar, dialog .titlebar headerbar "
+                      "{ background-color: alpha(#1d1d20, 0.75);", css, "Nautilus's grey, title bar included")
+        self.assertIn("alpha(#1d1d20, 0.68)", css, "unfocused a little more see-through")
+        self.assertIn("dialog filechooser placessidebar { background-color: alpha(#2e2e32, 0.4); }", css,
+                      "sidebar 10 points more solid, like Nautilus's")
+        self.assertIn("alpha(#ffffff, 0.75)", data.dialog_css(4, "light"), "light themes: Nautilus's light grey")
+        self.assertEqual(data.dialog_css(data.TRANSPARENCY_DEFAULT, "dark"), "", "Omarchy's default: nothing of ours")
+
+    def test_dark_needs_gtk3s_dark_theme(self):
+        self.assertEqual(data.dialog_css(4, "dark"), "", "no Adwaita-dark: dark text on dark grey, so nothing")
+        self.assertTrue(data.dialog_css(4, "light"), "light needs nothing extra")
+
+    def test_the_rest_of_gtk3_css_is_left_alone(self):
+        write(self.dark, "x")
+        write(data.GTK3_CSS, "/* mine */\n")
+        self.assertTrue(data.write_dialog_css(4, "dark"))
+        self.assertFalse(data.write_dialog_css(4, "dark"), "same: no change, so no restart")
+        self.assertTrue(data.write_dialog_css(data.TRANSPARENCY_DEFAULT, "dark"))
+        self.assertEqual(data.GTK3_CSS.read_text(), "/* mine */\n")
+
+    def engine(self, open_classes, running=True):
+        from omaskins import rotation
+        self.restarts, self.evals = [], []
+        return rotation.DialogLook(clients=lambda: [{"class": c} for c in open_classes], evaluate=self.evals.append,
+                                   running=lambda: running, restart=lambda: self.restarts.append(1))
+
+    def test_service_restarted_only_with_no_dialog_open(self):
+        write(self.dark, "x")
+        open_now = ["xdg-desktop-portal-gtk"]
+        look = self.engine(open_now)
+        data.save_transparency(4)
+        look.glance()
+        self.assertTrue(data.GTK3_CSS.exists())
+        self.assertTrue(self.evals[-1].endswith("dialogs(true)"), "out of Hyprland's fade")
+        self.assertEqual(self.restarts, [], "a dialog is open: it waits")
+        open_now.clear()
+        look.glance()
+        self.assertEqual(self.restarts, [1], "closed: restarted (nothing on screen)")
+        look.glance()
+        self.assertEqual(self.restarts, [1], "once")
+
+    def test_nautilus_look_follows_an_update_without_a_restart(self):
+        write(self.dark, "x")
+        write(data.GTK4_CSS, data.NAUTILUS_CSS_START + "\nold look\n" + data.NAUTILUS_CSS_END + "\n")
+        data.save_transparency(4)
+        look = self.engine(["org.gnome.Nautilus"])
+        look.glance()
+        self.assertEqual(data.GTK4_CSS.read_text(), data.nautilus_css(4), "today's look, for its next start")
+
+    def test_service_not_running_reads_it_when_it_starts(self):
+        write(self.dark, "x")
+        look = self.engine([], running=False)
+        data.save_transparency(3)
+        look.glance()
+        look.glance()
+        self.assertEqual(self.restarts, [])
+        data.save_transparency(data.TRANSPARENCY_DEFAULT)
+        look.glance()
+        self.assertTrue(self.evals[-1].endswith("dialogs(false)"), "default step: Hyprland's fade, as Omarchy has it")
+
+    def test_hyprland_file_keeps_its_fade_off_only_with_our_block(self):
+        if not shutil.which("lua"):
+            self.skipTest("no lua")
+        lua = SANDBOX / "dialogs.lua"
+        lua.write_text("o = { window = function(m, r) print('rule', m.class or m.tag) end }\n"
+                       "hl = { config = function() end }\n" + data.TRANSPARENCY_LUA)
+        run_lua = lambda: subprocess.run(["lua", str(lua)], capture_output=True, text=True,
+                                         env=dict(os.environ, XDG_CONFIG_HOME=str(HOME / ".config"))).stdout
+        data.save_transparency(4)
+        self.assertNotIn("xdg-desktop-portal-gtk", run_lua())
+        write(self.dark, "x")
+        data.write_dialog_css(4, "dark")
+        self.assertIn("rule\t^xdg-desktop-portal-gtk$", run_lua())
+
+
+class QtStyle(unittest.TestCase):
+    """Qt apps in the theme's colours and transparency (OmaSkins' own Qt style): one recipe for every theme,
+    built as you, no packages; switched off, everything of it goes."""
+
+    def setUp(self):
+        build_fixture()
+        from omaskins import qtstyle
+        self.q = qtstyle
+        # Never the real runtime folder or pacman's records.
+        qtstyle.MARKS = SANDBOX / "run/omaskins-qt"
+        shutil.rmtree(qtstyle.MARKS, ignore_errors=True)
+        qtstyle.PACKAGES = SANDBOX / "pacman-local"
+        shutil.rmtree(qtstyle.PACKAGES, ignore_errors=True)
+        (qtstyle.PACKAGES / "qt5-base-5.15.18+kde+r1-1").mkdir(parents=True)
+        for f in (qtstyle.SETTING, qtstyle.PALETTE, data.TRANSPARENCY_FILE):
+            f.unlink(missing_ok=True)
+        shutil.rmtree(qtstyle.PLUGINS, ignore_errors=True)
+
+    def theme(self, text):
+        write(data.STATE_DIR / "theme/colors.toml", text)
+
+    def roles(self, group):
+        line = next(l for l in self.q.PALETTE.read_text().splitlines() if l.startswith(group + "="))
+        return line.split("=", 1)[1].split(", ")
+
+    def test_palette_any_colour_set_and_the_step(self):
+        self.theme('mode = "dark"\nbackground = "#1a1b26"\nforeground = "#a9b1d6"\naccent = "#7aa2f7"\n')  # few colours
+        write(data.STATE_DIR / "theme/icons.theme", "Yaru-blue\n")
+        data.save_transparency(4)
+        self.assertTrue(self.q.rebuild())
+        active, inactive = self.roles("active_colors"), self.roles("inactive_colors")
+        self.assertEqual(len(active), 21, "all of Qt's colour roles")
+        self.assertEqual(active[0], "#ffa9b1d6", "text in the theme's foreground")
+        self.assertEqual((active[10], inactive[10]), ("#bf1a1b26", "#ad1a1b26"), "the window colour carries the step")
+        self.assertIn("[Icons]\ntheme=Yaru-blue", self.q.PALETTE.read_text())
+        data.save_transparency(0)
+        self.q.rebuild()
+        self.assertEqual(self.roles("active_colors")[10], "#ff1a1b26", "step 1: solid")
+
+    def test_unchanged_palette_is_not_rewritten(self):
+        self.theme('background = "#1a1b26"\nforeground = "#a9b1d6"\n')
+        self.q.rebuild()
+        before = self.q.PALETTE.stat().st_mtime_ns
+        time.sleep(0.01)
+        self.q.rebuild()
+        self.assertEqual(self.q.PALETTE.stat().st_mtime_ns, before, "open apps don't reload for nothing")
+
+    def test_switched_off_writes_nothing_and_removes_it_all(self):
+        self.theme('background = "#1a1b26"\nforeground = "#a9b1d6"\n')
+        self.q.rebuild()
+        write(self.q.LIBRARY, "built")
+        self.q.save_enabled(False)
+        self.assertFalse(self.q.enabled())
+        self.assertFalse(self.q.rebuild())
+        self.assertFalse(self.q.needs_build())
+        _run.set_qt_apps(False)
+        self.assertFalse(self.q.PALETTE.exists() or self.q.PLUGINS.exists(), "nothing of it left")
+        _run.set_qt_apps(True)
+        self.assertTrue(self.q.enabled())
+        self.assertFalse(self.q.SETTING.exists(), "on is the default: no file")
+
+    def test_built_once_per_source_and_qt_version(self):
+        if not (shutil.which(self.q.QMAKE) and shutil.which("make")):
+            self.skipTest("no Qt5 build kit here")
+        self.assertTrue(self.q.needs_build())
+        ran = []
+
+        def runner(argv, cwd, **kw):
+            ran.append(argv[0])
+            if argv[0] == "make":
+                (Path(cwd) / "libomaskins.so").write_text("lib")
+            return subprocess.CompletedProcess(argv, 0)
+        self.assertEqual(self.q.build(runner), (True, "built"))
+        self.assertEqual(ran, [self.q.QMAKE, "make"])
+        self.assertEqual(self.q.LIBRARY.read_text(), "lib")
+        self.assertFalse(self.q.BUILD_DIR.exists(), "no build leftovers")
+        self.assertFalse(self.q.needs_build())
+        shutil.rmtree(self.q.PACKAGES / "qt5-base-5.15.18+kde+r1-1")
+        (self.q.PACKAGES / "qt5-base-5.15.19+kde+r1-1").mkdir()
+        self.assertTrue(self.q.needs_build(), "a Qt5 update: built again")
+        shutil.rmtree(self.q.PACKAGES / "qt5-base-5.15.19+kde+r1-1")
+        self.assertFalse(self.q.needs_build(), "no Qt5 (no Qt5 apps): nothing to build")
+
+    def test_failed_build_keeps_the_old_one(self):
+        write(self.q.LIBRARY, "old")
+        fail = lambda argv, cwd, **kw: subprocess.CompletedProcess(argv, 1 if argv[0] == "make" else 0)
+        ok, why = self.q.build(fail)
+        self.assertFalse(ok)
+        self.assertIn("make failed", why)
+        self.assertEqual(self.q.LIBRARY.read_text(), "old")
+
+    def test_shared_and_applied_by_an_import(self):
+        from omaskins import share
+        self.q.save_enabled(False)
+        self.assertIs(share.collect([])[0]["qt_apps"], False)
+        rows = {r["id"]: r for r in share.items({"format": share.FORMAT, "qt_apps": True, "transparency": 2})}
+        self.assertEqual((rows["qt_apps"]["group"], rows["qt_apps"]["detail"]), ("Settings", "on"))
+        self.assertIn("transparency", rows, "each with its own checkbox")
+        ran = []
+        saved = _run.perform
+        _run.perform = lambda steps, *a, **k: ran.extend(steps)
+        try:
+            share.apply_look({"qt_apps": True}, {"qt_apps"}, {}, {}, None, [])
+            share.apply_look({"qt_apps": False}, set(), {}, {}, None, [])   # not ticked: left alone
+        finally:
+            _run.perform = saved
+        self.assertEqual(ran, [("qt_apps", True)])
+
+    def test_marked_apps_leave_hyprlands_fade(self):
+        self.q.MARKS.mkdir(parents=True)
+        (self.q.MARKS / "100").touch()
+        (self.q.MARKS / "200").touch()   # closed since
+        windows = [{"address": "0xa", "pid": 100, "tags": ["default-opacity*"]},
+                   {"address": "0xb", "pid": 100, "tags": ["omaskins-qt"]},        # done already
+                   {"address": "0xc", "pid": 300, "tags": ["default-opacity*"]}]   # another app: left alone
+        calls = []
+        changed = self.q.unfade_windows(lambda: windows, calls.append, alive=lambda pid: pid == 100)
+        self.assertEqual(changed, ["0xa"])
+        self.assertEqual(calls, ["hl.dispatch(hl.dsp.window.tag({ window = 'address:0xa', tag = '-default-opacity' }))",
+                                 "hl.dispatch(hl.dsp.window.tag({ window = 'address:0xa', tag = '+omaskins-qt' }))"])
+        self.assertFalse((self.q.MARKS / "200").exists(), "closed apps' markers cleared")
+
+    def test_hyprland_turns_it_on_only_when_everything_is_there(self):
+        """Run omaskins.lua's Qt part in a real Lua with stand-ins for Hyprland's o.window / hl.env."""
+        if not shutil.which("lua"):
+            self.skipTest("no lua")
+        lua = SANDBOX / "qt.lua"
+        lua.write_text("o = { window = function(m, r) print('rule', m.tag, r.opacity) end }\n"
+                       "hl = { env = function(k, v) print('env', k, v) end }\n" + data.QT_LUA)
+
+        def run_lua(**env):
+            return subprocess.run(["lua", str(lua)], capture_output=True, text=True,
+                                  env=dict(os.environ, HOME=str(HOME), XDG_CONFIG_HOME=str(HOME / ".config"),
+                                           **env)).stdout.rstrip("\n").split("\n")
+        plugins = str(HOME / ".local/share/omaskins/qt5")
+        self.assertEqual(run_lua(), ["rule\tomaskins-qt\t1 1"], "not built: nothing set")
+        write(self.q.LIBRARY, "lib")
+        self.assertEqual(run_lua(), ["rule\tomaskins-qt\t1 1"], "OmaSkins itself removed: nothing set")
+        write(HOME / ".config/omarchy/plugins/io.github.jesuslovesyou1013.omaskins/manifest.json", "{}")
+        self.assertEqual(run_lua(QT_PLUGIN_PATH="/x"), ["rule\tomaskins-qt\t1 1", f"env\tQT_PLUGIN_PATH\t{plugins}:/x",
+                                                       "env\tQT_STYLE_OVERRIDE\tOmaSkins"])
+        self.assertEqual(run_lua(QT_PLUGIN_PATH=plugins)[1], "env\tQT_STYLE_OVERRIDE\tOmaSkins",
+                         "a reload doesn't add the path twice")
+        self.q.save_enabled(False)
+        self.assertEqual(run_lua(QT_STYLE_OVERRIDE="OmaSkins"), ["rule\tomaskins-qt\t1 1", "env\tQT_STYLE_OVERRIDE\t"],
+                         "switched off: cleared for apps opened from then on")
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,3 +5,6 @@ __pycache__/
 HANDOFF.md
 history/
 ALL-SESSIONS-HANDOFF.md
+
+# Qt style build output (OmaSkins builds it on each machine)
+qt-style/build*/

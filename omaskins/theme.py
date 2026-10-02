@@ -100,7 +100,12 @@ def _num(value, default):
 
 def current_font():
     try:
-        out = subprocess.run(["omarchy-font-current"], capture_output=True, text=True, timeout=3).stdout.strip()
+        # Your real font setup, not OmaSkins' own font config (data.child_env)
+        env = {k: v for k, v in os.environ.items() if k != "OMASKINS_FONTCONFIG"}
+        if os.environ.get("OMASKINS_FONTCONFIG"):
+            env.pop("FONTCONFIG_FILE", None)
+        out = subprocess.run(["omarchy-font-current"], capture_output=True, text=True, timeout=3,
+                             env=env).stdout.strip()
         if out:
             return out
     except (OSError, subprocess.SubprocessError):
@@ -211,10 +216,12 @@ window.omaskins, window.omaskins.csd {{
   border-radius: 0;
 }}
 
-.window-title {{ color: {dim}; padding: 14px 18px 4px 18px; }}
+/* The app's name: the theme's accent, bold, centred (owner, 2026-10-02: the dim name wasn't clear). */
+.window-title {{ color: {accent}; font-weight: bold; padding: 14px 18px 4px 18px; }}
 
 /* tabs */
-.tabbar {{ padding: 2px 18px 0 18px; border-bottom: 1px solid {line}; }}
+/* Right side 14 px like the rows below (.toolbar), so Update all lines up with their right edge. */
+.tabbar {{ padding: 2px 14px 0 18px; border-bottom: 1px solid {line}; }}
 button.tab {{
   background: none; background-image: none; box-shadow: none; outline: none;
   border: none; border-bottom: 2px solid transparent; border-radius: 0;
@@ -289,6 +296,12 @@ listview > row:focus-visible {{ outline: 1px solid {sel_border}; outline-offset:
 
 .badge {{ padding: 0 6px; border: 1px solid {rgba(fg, 0.3)}; color: {dim}; font-size: {t.font_px * 0.85:.1f}px; }}
 .badge-enabled {{ color: {t.green}; border-color: {rgba(t.green, 0.6)}; }}
+/* Import window: the download bar under the overall one. The theme's own accent like every other bar
+   (owner, 2026-10-01: nothing in OmaSkins has colours of its own), told apart by being thinner and
+   softer. Idle (no download in this step) it stays exactly where and as big as it is, only dimmed. */
+progressbar.download-bar > trough {{ min-height: 4px; }}
+progressbar.download-bar > trough > progress {{ min-height: 4px; background-color: {rgba(t.accent, 0.7)}; }}
+progressbar.download-bar.idle, label.idle {{ opacity: 0.45; }}
 .badge-disabled {{ color: {dim}; }}
 .badge-verified {{ color: {accent}; border-color: {rgba(accent, 0.6)}; }}
 .badge-warn {{ color: {t.yellow}; border-color: {rgba(t.yellow, 0.6)}; }}
@@ -296,7 +309,8 @@ listview > row:focus-visible {{ outline: 1px solid {sel_border}; outline-offset:
 
 .statusbar {{ padding: 6px 18px; border-top: 1px solid {line}; color: {dim}; }}
 .banner {{ background: {rgba(t.yellow, 0.12)}; color: {t.yellow}; padding: 6px 18px; }}
-.empty {{ color: {dim}; padding: 40px; }}
+/* "No backgrounds yet" messages only: GTK also marks a progress bar's track at 0% as .empty */
+label.empty {{ color: {dim}; padding: 40px; }}
 
 .carousel-frame {{ background: {rgba(fg, 0.05)}; border: 1px solid {frame}; }}
 .carousel-arrow {{
@@ -383,13 +397,19 @@ gridview > child:focus-visible {{ outline: 1px solid {sel_border}; outline-offse
 .font-row {{ padding: 12px 18px; }}
 .export-list row {{ padding: 6px 4px; background: none; border-bottom: 1px solid {line}; }}
 
-/* Rotation: a background left out of the rotation is dimmed and greyed; picked = full colour */
-.tile.off .thumb {{ filter: grayscale(100%) brightness(45%); }}
+/* Rotation: a background left out of the rotation is dimmed and half-saturated (its colours still
+   show, to match against the theme); picked = full colour */
+.tile.off .thumb {{ filter: saturate(50%) brightness(45%); }}
+/* 🔍+ on pictures: opens the big view; a small dark disc so it reads on any picture */
+.zoom-btn {{ min-width: 26px; min-height: 26px; padding: 2px; border-radius: 999px; border: none;
+            background: rgba(0, 0, 0, 0.55); color: #ffffff; box-shadow: none; }}
+.zoom-btn:hover {{ background: rgba(0, 0, 0, 0.8); }}
+/* the big view: covers the screen, see-through and lightly dimmed; the picture sits in the middle */
+window.image-preview {{ background: rgba(0, 0, 0, 0.30); }}
 .tile.off label {{ color: {dim}; }}
 .rot-grid:disabled .tile {{ opacity: 0.55; }}
-/* themes left out while Themes rotation is on: greyed, and clicking them does nothing */
+/* themes left out while Themes rotation is on: greyed, but they still open (to look at their backgrounds) */
 .sidebar row.unchecked label {{ color: {rgba(fg, 0.4)}; }}
-.sidebar row.unchecked:hover {{ background: none; }}
 .toolbar :disabled label {{ color: {rgba(fg, 0.35)}; }}
 
 /* theme page flip book: the neighbouring cards sit dimmed at the sides and brighten on hover */

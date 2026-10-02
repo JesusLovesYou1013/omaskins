@@ -105,10 +105,16 @@ class LocalTheme:
     repo_url: str = ""         # for themes you added (read from .git/config)
     preview: Path | None = None
     colors: dict = field(default_factory=dict)
+    apply_as: str = ""         # folder Omarchy applies for it, when not its own (Aether's newer working copy)
 
     @property
     def title(self):
         return display_name(self.name)
+
+    @property
+    def aether(self):
+        """Made with Aether (Omarchy's theme maker): it marks the theme folders it writes."""
+        return not self.builtin and (self.path / ".aether-managed").is_file()
 
 
 @dataclass
@@ -426,10 +432,140 @@ def find_preview(path):
 
 
 def current_theme_name():
+    """The current theme, as OmaSkins lists it: Aether's working copy counts as the theme it's a copy of."""
     try:
-        return (STATE_DIR / "theme.name").read_text().strip()
+        name = (STATE_DIR / "theme.name").read_text().strip()
     except OSError:
         return ""
+    if name == AETHER_SCRATCH:
+        twin = aether_twin()
+        return twin[0] if twin else name
+    return name
+
+
+# --------------------------------------------------------------------------- Aether's working copy
+#
+# Aether's plain Apply (and live apply while editing) always writes ONE fixed folder, themes/aether,
+# whatever theme you're editing; only "Save and Apply" with a name writes your named theme folder. So
+# an edited Aether theme exists twice: its named folder and the scratch `aether`. Aether copies your
+# picture into both, so the same picture file ties them (Aether's blueprint, saved under the theme's
+# name with the same colours, is the backup clue). OmaSkins shows them as ONE theme, under the name,
+# always using the newer of the two (owner, 2026-10-01). Only one scratch folder exists, so however many
+# Aether themes there are, at most one is "being edited". A scratch with a picture of its own isn't a
+# copy of anything: it's a new unsaved theme and shows as "Aether".
+
+AETHER_SCRATCH = "aether"
+AETHER_BLUEPRINTS = HOME / ".config/aether/blueprints"
+_DIGESTS = {}
+
+
+def _picture_digests(folder):
+    """Fingerprints of the pictures in a theme's backgrounds/ (cached by size and time)."""
+    out = set()
+    for p in _images(folder / "backgrounds"):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        key = (str(p), st.st_size, st.st_mtime_ns)
+        if key not in _DIGESTS:
+            try:
+                _DIGESTS[key] = hashlib.sha1(p.read_bytes()).hexdigest()
+            except OSError:
+                continue
+        out.add(_DIGESTS[key])
+    return out
+
+
+def _accent(path):
+    return str(read_toml(path).get("accent", "")).lower()
+
+
+def _hex_rgb(value):
+    m = re.fullmatch(r"#?([0-9a-fA-F]{6})", str(value).strip())
+    return tuple(int(m.group(1)[i:i + 2], 16) for i in (0, 2, 4)) if m else None
+
+
+def _colour_closeness(a, b):
+    """0..1: how alike two colors.toml palettes are (1 = identical), over the colours both have."""
+    pairs = [(_hex_rgb(a[k]), _hex_rgb(b[k])) for k in a if k in b]
+    pairs = [(x, y) for x, y in pairs if x and y]
+    if not pairs:
+        return 0.0
+    dist = sum(sum((p - q) ** 2 for p, q in zip(x, y)) ** 0.5 for x, y in pairs) / len(pairs)
+    return max(0.0, 1 - dist / 120)   # on average within ~120 (of 441) per colour: still "the same theme"
+
+
+def aether_candidates():
+    """Which named Aether theme Aether's working copy (themes/aether) is a copy of, best first:
+    [{"name", "score", "sure", "newer", "why"}]. Only that one folder is ever compared, so pictures
+    copied between your other themes never count. A shared picture alone is never proof (you may have
+    copied it into another theme): sure = the same picture AND close colours, or Aether's blueprint of
+    that name with exactly these colours; and only when no other theme fits as well."""
+    scratch = USER_THEMES / AETHER_SCRATCH
+    if not (scratch / ".aether-managed").is_file():
+        return []
+    try:
+        named = [d for d in USER_THEMES.iterdir()
+                 if d.is_dir() and d.name != AETHER_SCRATCH and (d / ".aether-managed").is_file()]
+    except OSError:
+        return []
+    colours = read_toml(scratch / "colors.toml")
+    pictures = _picture_digests(scratch)
+    picture_names = {p.name for p in _images(scratch / "backgrounds")}
+    out = []
+    for d in named:
+        why, score = [], 0.0
+        same_picture = bool(pictures & _picture_digests(d))
+        if same_picture:
+            score += 40
+            why.append("same picture")
+        elif picture_names & {p.name for p in _images(d / "backgrounds")}:
+            score += 15
+            why.append("a picture with the same name")
+        close = _colour_closeness(colours, read_toml(d / "colors.toml"))
+        score += 50 * close
+        blueprint_match = False
+        try:
+            bp = json.loads((AETHER_BLUEPRINTS / f"{d.name}.json").read_text())
+            score += 5
+            bp_accent = str(bp.get("palette", {}).get("extendedColors", {}).get("accent", "")).lower()
+            blueprint_match = bool(bp_accent) and bp_accent == str(colours.get("accent", "")).lower()
+            if blueprint_match:
+                score += 80
+                why.append("Aether's blueprint of that name has these colours")
+        except (OSError, ValueError, AttributeError):
+            pass
+        if close >= 0.5:
+            why.append("close colours")
+        out.append({"name": d.name, "score": round(score, 1), "why": why,
+                    "sure": blueprint_match or (same_picture and close >= 0.5),
+                    "newer": _mtime(scratch / "colors.toml") > _mtime(d / "colors.toml")})
+    out.sort(key=lambda c: -c["score"])
+    if sum(c["sure"] for c in out) > 1:      # two themes fit: don't guess, ask
+        for c in out:
+            c["sure"] = False
+    return out
+
+
+def aether_twin():
+    """(name, the working copy is newer) for the theme Aether's working copy is SURELY a copy of, else
+    None (then it shows as its own theme, and OmaSkins asks at launch which theme it belongs to)."""
+    best = next(iter(aether_candidates()), None)
+    return (best["name"], best["newer"]) if best and best["sure"] else None
+
+
+def _mtime(path):
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def theme_folder_for(name):
+    """The folder Omarchy should apply for a theme: Aether's working copy when it's that theme's newer copy."""
+    twin = aether_twin()
+    return AETHER_SCRATCH if twin and twin == (name, True) else name
 
 
 def local_themes():
@@ -446,6 +582,13 @@ def local_themes():
             themes[d.name] = LocalTheme(name=d.name, path=d, builtin=builtin,
                                         repo_url="" if builtin else _git_remote(d),
                                         preview=find_preview(d), colors=read_toml(d / "colors.toml"))
+    twin = aether_twin()
+    if twin and twin[0] in themes:
+        # Aether's working copy and the theme it's a copy of: one entry, under the name, the newer copy's look
+        scratch = themes.pop(AETHER_SCRATCH, None)
+        if twin[1] and scratch:
+            t = themes[twin[0]]
+            t.apply_as, t.preview, t.colors = AETHER_SCRATCH, scratch.preview, scratch.colors
     return sorted(themes.values(), key=lambda t: t.name)
 
 
@@ -492,9 +635,120 @@ def backgrounds_for(theme, current_theme="", current_bg=None):
 
 def _run(cmd, timeout=15):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=child_env()).stdout
     except (OSError, subprocess.SubprocessError):
         return ""
+
+
+# --------------------------------------------------------------------------- OmaSkins' own font config
+#
+# Omarchy's `omarchy-font-set` writes ~/.config/fontconfig/fonts.conf with "prepend the chosen font
+# whenever `monospace` is asked for" (qual="any", binding strong). Fontconfig tags every known monospace
+# family with `monospace`, so EVERY monospace font asked for by name comes out as the chosen one, in
+# every app: OmaSkins drew every font name in the current font, and couldn't match sizes. OmaSkins (its
+# own process only, set up by the launcher) uses the system's font config without that one user file,
+# so each font draws as itself; Omarchy's files are untouched. Programs OmaSkins starts get the normal
+# environment back (child_env), so they, the shell above all, keep the user's real font setup.
+
+PRIVATE_FONTCONFIG = CACHE_DIR / "fontconfig" / "fonts.conf"
+SYSTEM_FONTCONFIG = Path("/etc/fonts/fonts.conf")
+
+
+def private_fontconfig():
+    """Write OmaSkins' font config: /etc/fonts/fonts.conf with its conf.d listed file by file, minus
+    50-user.conf's ~/.config/fontconfig/fonts.conf (your conf.d folder stays). None if it can't."""
+    try:
+        base = SYSTEM_FONTCONFIG.read_text()
+    except OSError:
+        return None
+    marker = '<include ignore_missing="yes">conf.d</include>'
+    confd = SYSTEM_FONTCONFIG.parent / "conf.d"
+    if marker not in base or not confd.is_dir():
+        return None
+    parts = [f'\t<include ignore_missing="yes">{p}</include>' for p in sorted(confd.glob("*.conf"))
+             if p.name != "50-user.conf"]
+    parts.append('\t<include ignore_missing="yes" prefix="xdg">fontconfig/conf.d</include>')
+    text = base.replace(marker, "<!-- OmaSkins: conf.d without 50-user.conf's fonts.conf (Omarchy's "
+                                "every-monospace-font rule) -->\n" + "\n".join(parts))
+    try:
+        PRIVATE_FONTCONFIG.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PRIVATE_FONTCONFIG.with_suffix(".tmp")
+        tmp.write_text(text)
+        os.replace(tmp, PRIVATE_FONTCONFIG)
+    except OSError:
+        return None
+    return PRIVATE_FONTCONFIG
+
+
+def child_env():
+    """The environment for programs OmaSkins starts: without OmaSkins' own font config."""
+    env = dict(os.environ)
+    if env.pop("OMASKINS_FONTCONFIG", None):
+        env.pop("FONTCONFIG_FILE", None)
+    return env
+
+
+# --------------------------------------------------------------------------- font previews (Browse)
+#
+# A font you haven't installed is previewed from its own file: the package is downloaded once from the
+# Arch mirrors (the same one `pacman` would install), only its regular font file is kept, and the
+# package is deleted. The app loads that file privately (not installed, only OmaSkins sees it).
+
+PREVIEW_FONTS = CACHE_DIR / "font-previews"
+MAX_FONT_PACKAGE = 200 * 1024 * 1024
+
+
+def preview_font(package):
+    """{"family", "file"} for a downloaded preview, or None."""
+    try:
+        meta = json.loads((PREVIEW_FONTS / f"{package}.json").read_text())
+        return meta if Path(meta.get("file", "")).is_file() and meta.get("family") else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def _preview_file_in(names):
+    """The package's plain regular face: <Name>NerdFont-Regular (not Mono / Propo), else any regular."""
+    fonts = [n for n in names if n.lower().endswith((".ttf", ".otf"))]
+    for pattern in (r"NerdFont-Regular\.(ttf|otf)$", r"-Regular\.(ttf|otf)$", r"Regular"):
+        hit = [n for n in fonts if re.search(pattern, n) and not re.search(r"(Mono|Propo)-Regular", n)]
+        hit = hit or [n for n in fonts if re.search(pattern, n)]
+        if hit:
+            return sorted(hit, key=len)[0]
+    return fonts[0] if fonts else None
+
+
+def fetch_preview_font(package):
+    """Download the package, keep its regular font file, delete the package. Returns preview_font()."""
+    urls = [u for u in _run(["pacman", "-Sp", package], 30).splitlines() if "://" in u]
+    if not urls:
+        raise ValueError(f"no download link for {package}")
+    PREVIEW_FONTS.mkdir(parents=True, exist_ok=True)
+    tmp = PREVIEW_FONTS / f".{package}.pkg"
+    try:
+        req = urllib.request.Request(urls[-1], headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=60) as r, tmp.open("wb") as out:
+            total = 0
+            while chunk := r.read(1 << 20):
+                total += len(chunk)
+                if total > MAX_FONT_PACKAGE:
+                    raise ValueError(f"{package} is larger than {MAX_FONT_PACKAGE >> 20} MB")
+                out.write(chunk)
+        name = _preview_file_in(_run(["bsdtar", "-tf", str(tmp)], 60).splitlines())
+        if not name:
+            raise ValueError(f"no font file in {package}")
+        dest = PREVIEW_FONTS / Path(name).name
+        with dest.open("wb") as out:
+            if subprocess.run(["bsdtar", "-xOf", str(tmp), name], stdout=out, timeout=120,
+                              env=child_env()).returncode != 0:
+                raise ValueError(f"couldn't unpack {package}")
+        family = _run(["fc-scan", "--format", "%{family[0]}", str(dest)], 10).strip()
+        if not family:
+            raise ValueError(f"unreadable font in {package}")
+        (PREVIEW_FONTS / f"{package}.json").write_text(json.dumps({"family": family, "file": str(dest)}))
+    finally:
+        tmp.unlink(missing_ok=True)
+    return preview_font(package)
 
 
 def current_font():
@@ -625,6 +879,7 @@ def normalized_size(base_px, x_height_ratio, reference_ratio):
 # (font_heights.py); a font that isn't in that table is measured the first time and remembered.
 
 REFERENCE_X = 550            # JetBrains Mono: x-height in px at 1000 pt
+REFERENCE_FAMILY = "JetBrainsMono Nerd Font"   # Omarchy's default font: every font is sized to match it
 SCALE_MIN, SCALE_MAX = 0.8, 1.25
 TERM_DEFAULT_PT, SHELL_DEFAULT_PX = 9, 12   # Omarchy's anchors: 12 px text size == 9 pt terminals
 LEARNED_HEIGHTS = CACHE_DIR / "font-x-heights.json"
@@ -692,8 +947,9 @@ def theme_actions(local=None, community=None, current=""):
         acts.append(add_theme_action(community))
     if local:
         if local.name != current:
-            apply = Action("Apply", f"omarchy-theme-set {q(local.name)}",
-                           steps=(("run", ["omarchy-theme-set", local.name]),),
+            folder = local.apply_as or local.name   # Aether's newer working copy, if that's what it is
+            apply = Action("Apply", f"omarchy-theme-set {q(folder)}",
+                           steps=(("run", ["omarchy-theme-set", folder]),),
                            busy=f"Applying {local.title}…", done=f"{local.title} applied.")
             if not local.builtin and not theme_has_files(local.path):
                 # Applying now would stage an empty theme (it happened once, mid-download).
@@ -733,10 +989,25 @@ def remove_theme_action(local):
     a half-deleted theme, and is then deleted file by file so the bar can count down to 0%."""
     folder, gone = USER_THEMES / local.name, REMOVING_THEMES / local.name
     cmd = f"rm -rf ~/.config/omarchy/themes/{q(local.name)} && omarchy-notification-send 'Theme removed' {q(local.name)}"
+    steps = [("take_out", folder, gone), ("delete_counting", gone)]
+    twin = aether_twin()
+    if twin and twin[0] == local.name:  # its Aether working copy goes too, or it would pop up on its own
+        scratch, scratch_gone = USER_THEMES / AETHER_SCRATCH, REMOVING_THEMES / AETHER_SCRATCH
+        steps = [("take_out", scratch, scratch_gone), ("delete_counting", scratch_gone)] + steps
+        cmd = f"rm -rf ~/.config/omarchy/themes/{AETHER_SCRATCH} && " + cmd
     return Action("Remove", cmd, busy=f"Removing {local.title}…", bar=100,
                   done=f"{local.title} removed. You can add it again from Browse.",
-                  steps=(("take_out", folder, gone), ("delete_counting", gone),
-                         ("run", ["omarchy-notification-send", "Theme removed", local.name])))
+                  steps=tuple(steps) + (("run", ["omarchy-notification-send", "Theme removed", local.name]),))
+
+
+def merge_aether_action(named, picked=False):
+    """Combine Aether's working copy into the named theme (run.merge_aether): asked for at launch.
+    picked = you chose the theme when OmaSkins asked which one it belongs to."""
+    title = display_name(named)
+    return Action("Combine", f"(combine themes/{AETHER_SCRATCH} into themes/{named})",
+                  busy=f"Combining the two {title} themes…",
+                  done=f"Combined: one {title}, with the newer colours and every picture from both.",
+                  steps=(("merge_aether", named, picked),))
 
 
 def add_theme_action(community):
@@ -842,6 +1113,13 @@ def note_removed_version(name, package):
     _save_builtin_state(st)
 
 
+def forget_removed_version(name):
+    """A restored built-in isn't removed any more: drop its "removed at" entry (owner, 2026-10-02)."""
+    st = _builtin_state()
+    if st["removed_at"].pop(name, None) is not None:
+        _save_builtin_state(st)
+
+
 def removed_at_version(name):
     return _builtin_state()["removed_at"].get(name, "")
 
@@ -864,7 +1142,7 @@ def builtin_terminal_command(kind, name, package=""):
     rule, themes, hidden, conf = _no_extract(name), BUILTIN_THEMES, HIDDEN_BUILTINS, PACMAN_CONF
     drop_rule = f"sudo sed -i '\\|^{rule.replace('*', '[*]')}$|d' {conf}"
     if kind == "hide":
-        return (f"echo 'Hiding {name}...'; [ ! -e {hidden}/{name} ] && sudo mkdir -p {hidden} && "
+        return (f"echo 'Removing {name}...'; [ ! -e {hidden}/{name} ] && sudo mkdir -p {hidden} && "
                 f"sudo mv {themes}/{name} {hidden}/{name} && "
                 f"(grep -qxF '{rule}' {conf} || sudo sed -i '/^\\[options\\]/a {rule}' {conf})")
     if kind == "unhide":
@@ -916,7 +1194,7 @@ def builtin_restore_action(name, package, hidden_only=False):
         shown = f"sudo pacman -S {package}  (- NoExtract in pacman.conf; fresh copy, Omarchy updated it)"
     return Action("Restore", shown, password=PASSWORD_BUILTIN,
                   busy=f"Restoring {title}: type your password in the terminal…", done=f"{title} is back.",
-                  steps=(("terminal", cmd), ("wait_builtin", name, False, cmd)))
+                  steps=(("terminal", cmd), ("wait_builtin", name, False, cmd), ("forget_removed_version", name)))
 
 
 def background_actions(bg, theme_name):
@@ -982,6 +1260,85 @@ def font_terminal_command(verb, package):
     presentation omarchy-install-font uses). `verb` is "add" or "drop"."""
     doing = {"add": "Installing", "drop": "Removing"}[verb]
     return f"echo '{doing} {package}...'; omarchy-pkg-{verb} {package}"
+
+
+OMARCHY_DEFAULT_FONT_PKG = "ttf-jetbrains-mono-nerd"
+# The password terminal tells OmaSkins itself that it started (its process id) and how it ended ("done" or
+# "cancelled"), instead of OmaSkins having to find its process (2026-10-02: that wait once gave up 15 s in
+# and reported a removal that then happened as not done).
+PASSWORD_MARK = Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}") / "omaskins-password"   # Omarchy's own default: an import never removes it
+
+_IMPORT_KEYS = ("add-fonts", "drop-fonts", "remove-themes", "unhide-themes", "reinstall-themes")
+
+
+def fonts_in_use():
+    """Every font family set up to be used: Omarchy's (fontconfig) and each terminal's own setting. An
+    import never offers to remove a package holding one of these (2026-10-02: removing UbuntuMono while
+    the terminals still named it scrambled Omarchy's logo in its own terminal)."""
+    out = {current_font()}
+    cfg = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config"))
+    pats = (("ghostty/config", r'^font-family\s*=\s*"?([^"\n]+?)"?\s*$'),
+            ("alacritty/alacritty.toml", r'family\s*=\s*"([^"]+)"'),
+            ("kitty/kitty.conf", r"^font_family\s+(.+?)\s*$"),
+            ("foot/foot.ini", r"^font=([^:\n]+)"))
+    for rel, pat in pats:
+        try:
+            out.update(re.findall(pat, (cfg / rel).read_text(), flags=re.M))
+        except OSError:
+            pass
+    return {f.strip() for f in out if f and f.strip()}
+
+
+def password_terminal_command(add_fonts=(), drop_fonts=(), remove_themes=(), unhide_themes=(),
+                              reinstall_themes=(), package=""):
+    """Everything an import needs the password for, in ONE terminal (owner, 2026-10-02: one password for
+    all of it, as the two fonts earlier): fonts added/removed and built-ins removed/restored to match the
+    file. sudo asks once at the start (sudo -v) and is kept fresh while the work runs, so a long download
+    can't make it ask again. The first line names every item, so run.py can rebuild the whole command
+    from that list and accept it only if the text comes out identical."""
+    lists = [sorted(set(x)) for x in (add_fonts, drop_fonts, remove_themes, unhide_themes, reinstall_themes)]
+    for name in lists[0] + lists[1]:
+        if not FONT_PKG_OK.fullmatch(name):
+            raise ValueError(f"unexpected font package: {name!r}")
+    for name in lists[2] + lists[3] + lists[4]:
+        if not NAME_OK.fullmatch(name):
+            raise ValueError(f"unexpected theme folder name: {name!r}")
+    if not any(lists):
+        raise ValueError("nothing to do")
+    parts = []
+    if lists[0]:
+        parts.append(font_terminal_command("add", " ".join(lists[0])))
+    if lists[1]:
+        parts.append(font_terminal_command("drop", " ".join(lists[1])))
+    parts += [builtin_terminal_command("hide", n) for n in lists[2]]
+    parts += [builtin_terminal_command("unhide", n) for n in lists[3]]
+    parts += [builtin_terminal_command("reinstall", n, package) for n in lists[4]]
+    head = " ".join(f"{k}={','.join(v)}" for k, v in zip(_IMPORT_KEYS, lists))
+    say = ([f"Install font: {p}" for p in lists[0]] + [f"Remove font: {p}" for p in lists[1]]
+           + [f"Remove built-in theme: {display_name(n)}" for n in lists[2]]
+           + [f"Restore built-in theme: {display_name(n)}" for n in lists[3] + lists[4]])
+    # Line 1 is for OmaSkins' safety check only (":" does nothing); what you see is plain words, and
+    # Ctrl+C at the password closes the window with nothing changed (exit 130: Omarchy's wrapper then
+    # skips its "Done" screen).
+    return (f": 'OmaSkins import: {head}'; echo 'OmaSkins: one password covers all of this:'; "
+            + "; ".join(f"echo '  - {x}'" for x in say)
+            + "; echo; echo 'Press Ctrl+C to cancel. Nothing will be changed.'; echo; "
+            f"echo $$ > {PASSWORD_MARK}.started; "
+            f"sudo -v || {{ echo 'Cancelled: nothing was changed.'; echo cancelled > {PASSWORD_MARK}.done; exit 130; }}; "
+            f"(while sleep 50; do sudo -n -v; done) & keep=$!; "
+            + "; ".join(f"( {p} )" for p in parts) + f"; kill $keep; echo done > {PASSWORD_MARK}.done")
+
+
+def parse_password_terminal_head(cmd):
+    """The item lists from a password_terminal_command's first line, or None."""
+    m = re.match(r": 'OmaSkins import: (\S+(?: \S+){4})'; ", cmd)
+    if not m:
+        return None
+    out = {}
+    for pair in m.group(1).split(" "):
+        k, _, v = pair.partition("=")
+        out[k] = [x for x in v.split(",") if x]
+    return out if tuple(out) == _IMPORT_KEYS else None
 
 
 def font_actions(font=None, package=None, current_package=""):
@@ -1095,7 +1452,7 @@ def thumbnail(src, width=480):
     tmp = dest.with_suffix(".part.png")
     try:
         subprocess.run(["magick", f"{src}[0]", "-thumbnail", f"{width}x", "-strip", str(tmp)],
-                       capture_output=True, timeout=30, check=True)
+                       capture_output=True, timeout=30, check=True, env=child_env())
         tmp.replace(dest)
         return dest
     except (OSError, subprocess.SubprocessError):
@@ -1105,10 +1462,132 @@ def thumbnail(src, width=480):
 
 # --------------------------------------------------------------------------- rotation (prototype: in memory only)
 
-def minutes_text(m):
-    """10 -> '10 min', 60 -> '1 h', 90 -> '1 h 30 min'."""
-    h, m = divmod(int(m), 60)
-    return " ".join(p for p in (f"{h} h" if h else "", f"{m} min" if m or not h else "") if p)
+# Dawn & Dusk follow the sun where you are: sunrise to sunset is Dawn's theme set, sunset to sunrise
+# Dusk's. Where you are = the weather widget's location (Omarchy's own setting, with coordinates), else
+# your time zone's reference city (tzdata), else 07:00 / 19:00. Worked out ONCE PER BOOT (owner's rule:
+# a laptop may change time zones between boots, not while it's up) and kept in SUN_STATE; no network.
+WEATHER_SETTINGS = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy/settings/weather.json"
+ZONEINFO = Path("/usr/share/zoneinfo")
+SUN_STATE = OMASKINS_STATE / "sun.json"
+
+
+def _iso6709(text):
+    """'+404251-0740023' -> (40.714, -74.006)."""
+    m = re.fullmatch(r"([+-])(\d{2})(\d{2})(\d{2})?([+-])(\d{3})(\d{2})(\d{2})?", text)
+    if not m:
+        return None
+    lat = int(m[2]) + int(m[3]) / 60 + int(m[4] or 0) / 3600
+    lon = int(m[6]) + int(m[7]) / 60 + int(m[8] or 0) / 3600
+    return (lat if m[1] == "+" else -lat, lon if m[5] == "+" else -lon)
+
+
+def home_location():
+    """(latitude, longitude, where it came from), or None."""
+    try:
+        w = json.loads(WEATHER_SETTINGS.read_text())
+        if isinstance(w.get("latitude"), (int, float)) and isinstance(w.get("longitude"), (int, float)):
+            return w["latitude"], w["longitude"], f"{w.get('name') or 'your location'}, from the weather widget"
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        zone = os.path.realpath("/etc/localtime").split("/zoneinfo/", 1)[1]
+    except (OSError, IndexError):
+        return None
+    try:  # an old-style name (US/Eastern) is a link to the real zone (America/New_York)
+        for line in (ZONEINFO / "tzdata.zi").read_text().splitlines():
+            parts = line.split()
+            if len(parts) == 3 and parts[0] == "L" and parts[2] == zone:
+                zone = parts[1]
+                break
+    except OSError:
+        pass
+    for table in ("zone1970.tab", "zone.tab"):
+        try:
+            for line in (ZONEINFO / table).read_text().splitlines():
+                parts = line.split("\t")
+                if not line.startswith("#") and len(parts) >= 3 and parts[2] == zone:
+                    coords = _iso6709(parts[1])
+                    if coords:
+                        return coords[0], coords[1], f"{zone.split('/')[-1].replace('_', ' ')}, from your time zone"
+        except OSError:
+            continue
+    return None
+
+
+def sun_times(lat, lon, year, month, day, utc_offset_min):
+    """Sunrise and sunset as local minutes of the day (NOAA's approximation, within a couple of
+    minutes). None where the sun doesn't rise or set that day."""
+    import math
+    doy = time.localtime(time.mktime((year, month, day, 12, 0, 0, 0, 0, -1))).tm_yday
+    g = 2 * math.pi / 365 * (doy - 1)
+    eqtime = 229.18 * (0.000075 + 0.001868 * math.cos(g) - 0.032077 * math.sin(g)
+                       - 0.014615 * math.cos(2 * g) - 0.040849 * math.sin(2 * g))
+    decl = (0.006918 - 0.399912 * math.cos(g) + 0.070257 * math.sin(g) - 0.006758 * math.cos(2 * g)
+            + 0.000907 * math.sin(2 * g) - 0.002697 * math.cos(3 * g) + 0.00148 * math.sin(3 * g))
+    la = math.radians(lat)
+    cos_ha = math.cos(math.radians(90.833)) / (math.cos(la) * math.cos(decl)) - math.tan(la) * math.tan(decl)
+    if not -1 <= cos_ha <= 1:
+        return None
+    ha = math.degrees(math.acos(cos_ha))
+    return (round(720 - 4 * (lon + ha) - eqtime + utc_offset_min),
+            round(720 - 4 * (lon - ha) - eqtime + utc_offset_min))
+
+
+def _boot_id():
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+    except OSError:
+        return ""
+
+
+_SUN = {}
+
+
+def sun_times_now():
+    """{"rise", "set" (local minutes), "where"}: worked out on the first call after a boot, then read
+    back from SUN_STATE until the next boot."""
+    boot = _boot_id()
+    if _SUN.get("boot") == boot:
+        return _SUN
+    try:
+        saved = json.loads(SUN_STATE.read_text())
+        if saved.get("boot") == boot and {"rise", "set", "where"} <= saved.keys():
+            _SUN.clear()
+            _SUN.update(saved)
+            return _SUN
+    except (OSError, ValueError, AttributeError):
+        pass
+    t = time.localtime()
+    loc = home_location()
+    times = loc and sun_times(loc[0], loc[1], t.tm_year, t.tm_mon, t.tm_mday, t.tm_gmtoff // 60)
+    rise, down = times or (7 * 60, 19 * 60)
+    _SUN.clear()
+    _SUN.update(boot=boot, rise=rise, set=down, where=loc[2] if times else "07:00 / 19:00 (location unknown)")
+    try:
+        SUN_STATE.parent.mkdir(parents=True, exist_ok=True)
+        SUN_STATE.write_text(json.dumps(_SUN))
+    except OSError:
+        pass
+    return _SUN
+
+
+# Rotation runs on the clock, not a timer: changes land when the time of day is a multiple of the
+# interval, counted from midnight (20 min = :00, :20, :40). Only intervals that divide the hour or
+# the day evenly, so every slot lines up. The − / + buttons step through exactly these.
+INTERVALS = (5, 10, 15, 20, 30, 60, 120, 180, 240, 360, 480, 720, 1440)
+
+
+def snap_interval(minutes):
+    """The allowed interval nearest above (a saved 1 min becomes 5, 25 becomes 30)."""
+    try:
+        m = int(minutes)
+    except (TypeError, ValueError):
+        return 60
+    return next((i for i in INTERVALS if i >= m), INTERVALS[-1])
+
+
+def interval_text(minutes):
+    return f"{minutes} min" if minutes < 60 else f"{minutes // 60} h"
 
 
 class RotationPlan:
@@ -1130,8 +1609,10 @@ class RotationPlan:
     def __init__(self, current_theme=""):
         self.themes = False
         self.backgrounds = False
-        self.bg_minutes, self.theme_minutes = 10, 60
-        self.dawn_dusk, self.dawn, self.dusk = False, "07:00", "19:00"
+        self.minutes = 60                  # one interval for both switches (see INTERVALS)
+        self.dawn_dusk = False             # Dawn = sunrise to sunset where you are (see sun_times_now)
+        self.mix = False                   # "Mix it up!": any theme with any bright background (mixed_pool)
+        self.set_name = ""                 # the saved Rotation set this setup came from or was saved as
         self.period = "Dawn"
         self.checked = {p: [] for p in self.PERIODS}   # theme names, in the order they were checked
         self.theme_picks = {}                          # theme name -> set of background paths
@@ -1145,6 +1626,14 @@ class RotationPlan:
 
     def active_period(self):
         return self.period if self.dawn_dusk else "All day"
+
+    def period_now(self, t):
+        """Which theme set the clock calls for (t = time.struct_time): "All day", or Dawn (sunrise to
+        sunset) / Dusk (sunset to sunrise)."""
+        if not self.dawn_dusk:
+            return "All day"
+        sun = sun_times_now()
+        return "Dawn" if sun["rise"] <= t.tm_hour * 60 + t.tm_min < sun["set"] else "Dusk"
 
     def set_dawn_dusk(self, on):
         self.dawn_dusk = on
@@ -1163,10 +1652,6 @@ class RotationPlan:
                 self.theme_picks[name] = {b.path for b in backgrounds}
         elif not on and name in names:
             names.remove(name)
-
-    def can_open(self, name):
-        """Themes on: only checked themes open. Themes off: any theme does."""
-        return not self.themes or self.is_checked(name)
 
     def _picks(self, name, backgrounds):
         if self.themes:
@@ -1191,22 +1676,6 @@ class RotationPlan:
         paths = {b.path for b in backgrounds}
         return len(paths & self._picks(name, backgrounds))
 
-    def manual_change(self, theme_changed, bg_changed):
-        """Omarchy's own theme/background picker was used. It keeps working as normal; the matching
-        rotation timers just start over so the pick gets a full turn. Omarchy's theme change always
-        brings a new background too, so it restarts the background timer as well.
-        Returns (timers restarted, message for the notification), or ([], "") if nothing is rotating."""
-        resets = []
-        if self.themes and theme_changed:
-            resets.append(("theme", self.theme_minutes))
-        if self.backgrounds and (bg_changed or theme_changed):
-            resets.append(("background", self.bg_minutes))
-        if not resets:
-            return [], ""
-        which = "timers" if len(resets) > 1 else "timer"
-        return ([what for what, _m in resets],
-                f"Rotation {which} reset: " + " and ".join(f"next {what} in {minutes_text(m)}" for what, m in resets) + ".")
-
     def in_rotation(self, name):
         return any(name in names for names in self.checked.values())
 
@@ -1221,6 +1690,154 @@ class RotationPlan:
         for p in self.PERIODS:
             self.checked[p] = [n for n in self.checked[p] if n in names]
         self.theme_picks = {n: s for n, s in self.theme_picks.items() if n in names}
+
+    def pool(self, current_theme):
+        """The backgrounds that take turns now: the current theme's picks while themes rotate, else the
+        backgrounds-only pool. Only files that still exist."""
+        if not self.themes:
+            paths = self.solo_picks or set()
+        elif current_theme in self.theme_picks:
+            paths = self.theme_picks[current_theme]
+        else:
+            # Never opened on the Rotation tab: all its backgrounds are bright, as the tab shows them
+            # (a checked theme starts with all of them). Found directly, without listing every theme.
+            folder = next((r / current_theme for r in (USER_THEMES, BUILTIN_THEMES) if (r / current_theme).is_dir()),
+                          None)
+            paths = ({b.path for b in backgrounds_for(LocalTheme(current_theme, folder, folder.parent == BUILTIN_THEMES))}
+                     if folder else set())
+        return sorted(str(p) for p in paths if Path(p).is_file())
+
+    def mixed_pool(self, theme_names):
+        """Mix it up!: every bright background of every theme in the list, as one pool."""
+        return sorted({p for name in theme_names for p in self.pool(name)})
+
+    def to_dict(self):
+        return {"version": 1, "themes": self.themes, "backgrounds": self.backgrounds,
+                "minutes": self.minutes,
+                "dawn_dusk": self.dawn_dusk, "mix": self.mix, "period": self.period, "set_name": self.set_name,
+                "checked": self.checked,
+                "theme_picks": {n: sorted(str(p) for p in s) for n, s in self.theme_picks.items()},
+                "solo_picks": None if self.solo_picks is None else sorted(str(p) for p in self.solo_picks)}
+
+    @classmethod
+    def from_dict(cls, d, current_theme=""):
+        plan = cls(current_theme)
+        for key in ("themes", "backgrounds", "dawn_dusk", "mix"):
+            setattr(plan, key, bool(d.get(key, getattr(plan, key))))
+        # One interval; settings saved before it (a timer per switch) keep the one that was in use.
+        old = d.get("theme_minutes") if plan.themes or not plan.backgrounds else d.get("bg_minutes")
+        plan.minutes = snap_interval(d.get("minutes", old if old is not None else plan.minutes))
+        if isinstance(d.get("set_name"), str):
+            plan.set_name = d["set_name"]
+        if d.get("period") in ("Dawn", "Dusk"):
+            plan.period = d["period"]
+        checked = d.get("checked")
+        if isinstance(checked, dict):
+            plan.checked = {p: [n for n in checked.get(p, []) if isinstance(n, str)] for p in cls.PERIODS}
+        picks = d.get("theme_picks")
+        if isinstance(picks, dict):
+            plan.theme_picks = {n: {Path(p) for p in ps} for n, ps in picks.items() if isinstance(ps, list)}
+        if isinstance(d.get("solo_picks"), list):
+            plan.solo_picks = {Path(p) for p in d["solo_picks"]}
+        return plan
+
+
+# The Rotation tab's settings, read by the rotation engine (omaskins-rotate) that keeps running with
+# OmaSkins closed. The engine's own bookkeeping (timers, what was shown) lives in ROTATION_STATE.
+ROTATION_FILE = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omaskins" / "rotation.json"
+ROTATION_STATE = OMASKINS_STATE / "rotation-state.json"
+
+
+def load_rotation(current_theme=""):
+    try:
+        return RotationPlan.from_dict(json.loads(ROTATION_FILE.read_text()), current_theme)
+    except (OSError, ValueError, AttributeError):
+        return RotationPlan(current_theme)
+
+
+def save_rotation(plan):
+    """Atomic, so the engine never reads half a file."""
+    ROTATION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ROTATION_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(plan.to_dict(), indent=1, sort_keys=True))
+    os.replace(tmp, ROTATION_FILE)
+
+
+# Saved Rotation sets (owner, 2026-10-01): whole Rotation setups under a name, to switch between
+# without re-ticking everything. One file, so Share / backup can carry them.
+ROTATION_SETS = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omaskins" / "rotation-sets.json"
+SET_NAME_MAX = 40
+
+
+def _setup(plan):
+    """What a set holds: everything on the Rotation tab, without the set's own name."""
+    d = plan.to_dict()
+    d.pop("set_name", None)
+    return d
+
+
+def rotation_sets():
+    """{name: setup}, in the order they were saved."""
+    try:
+        sets = json.loads(ROTATION_SETS.read_text())
+        return {k: v for k, v in sets.items() if isinstance(k, str) and isinstance(v, dict)}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+def _write_sets(sets):
+    ROTATION_SETS.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ROTATION_SETS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sets, indent=1))
+    os.replace(tmp, ROTATION_SETS)
+
+
+def clean_set_name(name):
+    return " ".join(str(name).split())[:SET_NAME_MAX]
+
+
+def save_rotation_set(name, plan):
+    """Store the current setup as `name` (new, or replacing that set); it becomes the current set."""
+    name = clean_set_name(name)
+    if not name:
+        raise ValueError("a set needs a name")
+    sets = rotation_sets()
+    sets[name] = _setup(plan)
+    _write_sets(sets)
+    plan.set_name = name
+    save_rotation(plan)
+
+
+def use_rotation_set(name, current_theme=""):
+    """Switch the whole Rotation setup to a saved set; returns the new plan (also saved as current)."""
+    setup = rotation_sets().get(name)
+    if setup is None:
+        raise ValueError(f"no saved set called {name!r}")
+    plan = RotationPlan.from_dict(setup, current_theme)
+    plan.set_name = name
+    save_rotation(plan)
+    return plan
+
+
+def delete_rotation_set(name):
+    sets = rotation_sets()
+    if sets.pop(name, None) is not None:
+        _write_sets(sets)
+
+
+def set_has_changes(plan):
+    """True when the setup differs from its saved set (or it isn't a saved set yet)."""
+    saved = rotation_sets().get(plan.set_name)
+    return saved is None or json.dumps(saved, sort_keys=True) != json.dumps(_setup(plan), sort_keys=True)
+
+
+def rotation_status():
+    """What the engine last wrote about itself, or {} if it has never run."""
+    try:
+        st = json.loads(ROTATION_STATE.read_text())
+        return st if isinstance(st, dict) else {}
+    except (OSError, ValueError):
+        return {}
 
 
 # --------------------------------------------------------------------------- global rounded corners
@@ -1256,8 +1873,290 @@ def corners_file_text(on, px):
     if on:
         lines.append(f"hl.config({{ decoration = {{ rounding = {int(px)} }} }})")
     else:
-        lines.append("-- Global Rounded Corners is off: each theme's own rounding applies.")
-    return "\n".join(lines) + "\n"
+        lines.append("-- Rounded Corners is off: each theme's own rounding applies.")
+    return "\n".join(lines) + "\n" + TRANSPARENCY_LUA + QT_LUA
+
+
+# --------------------------------------------------------------------------- transparency
+#
+# Five steps (owner, 2026-10-02): off, Omarchy's own default, then three stronger ones; unfocused windows a
+# bit more see-through than the focused one. Only the windows Omarchy itself makes see-through (its
+# "default-opacity" tag); apps it keeps solid stay solid. Step 2 = exactly Omarchy's (and each theme's) own
+# values: OmaSkins sets nothing. Blur behind from step 3 up (owner, 2026-10-02), so text stays easy to read.
+# OmaSkins itself is left out of Hyprland's whole-window fade: it makes only its own background see-through
+# (same values), so theme and background previews, text and buttons stay solid.
+# The step lives in ~/.config/omaskins/transparency, which omaskins.lua reads when Hyprland loads; changing
+# it never makes Hyprland reload (in this VM a reload blanks the screen), OmaSkins fades it in live.
+TRANSPARENCY_FILE = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omaskins" / "transparency"
+OMARCHY_OPACITY = (0.985, 0.96)
+TRANSPARENCY_DEFAULT = 1
+# Steps 3-5 one notch stronger than first tried (owner, 2026-10-02: the blur made it less obvious).
+TRANSPARENCY_STEPS = ((1.0, 1.0, False), None, (0.85, 0.80, True), (0.80, 0.74, True), (0.75, 0.68, True))
+TRANSPARENCY_BLUR = "hl.config({ decoration = { blur = { enabled = true, size = 5, passes = 2 } } })"
+TRANSPARENCY_LUA = """
+-- OmaSkins makes only its own background see-through (its previews stay solid), so Hyprland leaves its
+-- windows out of the whole-window fade.
+o.window({ class = "^io.github.jesuslovesyou1013.omaskins$" }, { tag = "-default-opacity", opacity = "1 1" })
+
+-- Transparency (OmaSkins): the step chosen in OmaSkins, read from ~/.config/omaskins/transparency, so
+-- changing it never needs a Hyprland reload. No file: Omarchy's and the theme's own transparency.
+local omaskins_t = nil
+if type(io) == "table" and type(io.open) == "function" and type(os) == "table" and type(os.getenv) == "function" then
+  local dir = os.getenv("XDG_CONFIG_HOME") or ((os.getenv("HOME") or "") .. "/.config")
+  local ok, f = pcall(io.open, dir .. "/omaskins/transparency", "r")
+  if ok and f then
+    omaskins_t = f:read("*l")
+    f:close()
+  end
+end
+if type(omaskins_t) == "string" then
+  local a, b, blur = omaskins_t:match("^([%d.]+) ([%d.]+) (%a+)$")
+  if a then
+    -- Nautilus does its own (sidebar a little more solid, its icons solid): see NAUTILUS_CSS in OmaSkins.
+    o.window({ class = "^org.gnome.Nautilus$" }, { tag = "-default-opacity", opacity = "1 1" })
+    -- File dialogs too, while OmaSkins' dialog block is in GTK3's stylesheet (see DIALOG_CSS in OmaSkins).
+    local config_dir = os.getenv("XDG_CONFIG_HOME") or ((os.getenv("HOME") or "") .. "/.config")
+    local okd, fd = pcall(io.open, config_dir .. "/gtk-3.0/gtk.css", "r")
+    if okd and fd then
+      local css = fd:read("*a") or ""
+      fd:close()
+      if css:find("OmaSkins Manager: file dialog", 1, true) then
+        o.window({ class = "^xdg-desktop-portal-gtk$" }, { tag = "-default-opacity", opacity = "1 1" })
+      end
+    end
+    o.window({ tag = "default-opacity" }, { opacity = a .. " " .. b })
+    if blur == "blur" then
+      """ + TRANSPARENCY_BLUR + """
+    end
+  end
+end
+"""
+
+# Qt apps (OmaSkins' Qt style, see qtstyle.py): turned on for apps opened from now on, only while the built
+# style, OmaSkins itself (removing the plugin turns it off at the next login) and the "Qt apps" switch are
+# all there. Omarchy's own QT_QPA_PLATFORMTHEME=gtk3 stays; Qt6 apps ignore a Qt5 style. Windows the style
+# makes see-through do their own transparency: the engine tags them, and this keeps Hyprland's fade off.
+QT_LUA = """
+o.window({ tag = "omaskins-qt" }, { opacity = "1 1" })
+if type(io) == "table" and type(io.open) == "function" and type(os) == "table" and type(os.getenv) == "function" then
+  local home = os.getenv("HOME") or ""
+  local config = os.getenv("XDG_CONFIG_HOME") or (home .. "/.config")
+  local function exists(path)
+    local ok, f = pcall(io.open, path, "r")
+    if ok and f then
+      f:close()
+      return true
+    end
+    return false
+  end
+  local switched_off = false
+  local ok, f = pcall(io.open, config .. "/omaskins/qt-apps", "r")
+  if ok and f then
+    switched_off = (f:read("*l") or "") == "off"
+    f:close()
+  end
+  local plugins = home .. "/.local/share/omaskins/qt5"
+  if not switched_off and exists(plugins .. "/styles/libomaskins.so")
+      and exists(config .. "/omarchy/plugins/io.github.jesuslovesyou1013.omaskins/manifest.json") then
+    local path = os.getenv("QT_PLUGIN_PATH") or ""
+    if not path:find(plugins, 1, true) then   -- a reload must not add it twice
+      hl.env("QT_PLUGIN_PATH", path ~= "" and (plugins .. ":" .. path) or plugins)
+    end
+    hl.env("QT_STYLE_OVERRIDE", "OmaSkins")
+  elseif os.getenv("QT_STYLE_OVERRIDE") == "OmaSkins" then
+    hl.env("QT_STYLE_OVERRIDE", "")   -- switched off: Qt ignores an empty one (no unset in Hyprland)
+  end
+end
+"""
+
+
+GTK4_CSS = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "gtk-4.0" / "gtk.css"
+NAUTILUS_CSS_START = "/* >>> OmaSkins Manager: Nautilus transparency (set it in OmaSkins; at Omarchy's default this block goes) */"
+NAUTILUS_CSS_END = "/* <<< OmaSkins Manager */"
+NAUTILUS_SIDEBAR_MORE_SOLID = 0.10   # owner, 2026-10-02: the folders/bookmarks sidebar 10% less see-through
+
+
+def nautilus_css(step):
+    """Nautilus's own transparency (GTK reads ~/.config/gtk-4.0/gtk.css; Omarchy doesn't use that file):
+    only its backgrounds, the sidebar a bit more solid than the files; icons and text stay solid. Scoped to
+    Nautilus's window. Empty at the default step (then Hyprland fades it as Omarchy does)."""
+    if step == TRANSPARENCY_DEFAULT:
+        return ""
+    a, b, _ = transparency_values(step)
+    w = "window.nautilus-window"
+
+    def greys(mode):
+        # The same greys as the file dialogs (owner, 2026-10-02: the dialog's grey, and both alike).
+        view, sidebar = DIALOG_GREYS[mode]
+        return [
+            # The see-through background is the whole window's: when Nautilus is narrow it folds the sidebar
+            # away and its panes stop painting (owner, 2026-10-02: a narrow Nautilus went fully clear).
+            f"{w}, {w}.background {{ background-color: alpha({view}, {a:g}); }}",
+            f"{w}:backdrop, {w}.background:backdrop {{ background-color: alpha({view}, {b:g}); }}",
+            f"{w} .sidebar-pane {{ background-color: alpha({sidebar}, {_sidebar_layer(a):g}); }}",
+            f"{w}:backdrop .sidebar-pane {{ background-color: alpha({sidebar}, {_sidebar_layer(b):g}); }}"]
+    return "\n".join([
+        NAUTILUS_CSS_START,
+        f"{w} .content-pane, {w} .content-pane .view, {w} .nautilus-grid-view, {w} .nautilus-list-view,",
+        f"{w} .content-pane scrolledwindow, {w} .content-pane toolbarview, {w} .sidebar-pane toolbarview,",
+        f"{w} placessidebar, {w} .navigation-sidebar,",
+        f"{w} headerbar, {w} .top-bar {{ background-color: transparent; box-shadow: none; }}",
+        # Light or dark follows Omarchy's setting live (GTK 4.16+), so a theme switch needs no restart.
+        *greys("light"),
+        "@media (prefers-color-scheme: dark) {",
+        *("  " + line for line in greys("dark")),
+        "}",
+        NAUTILUS_CSS_END]) + "\n"
+
+
+def _sidebar_layer(base):
+    """The sidebar's own layer on top of the window's, so the two together are 10 points more solid."""
+    target = min(1.0, base + NAUTILUS_SIDEBAR_MORE_SOLID)
+    return round((target - base) / (1 - base), 3) if base < 1 else 0
+
+
+def _write_css_block(path, start_mark, end_mark, block):
+    """Put one OmaSkins block in a GTK stylesheet (replacing its last one), leaving anything else in the file
+    alone; an empty block removes it (and the file too, if nothing else was ever in it). True if changed."""
+    try:
+        text = path.read_text()
+    except OSError:
+        text = ""
+    start, end = text.find(start_mark), text.find(end_mark)
+    if start >= 0 and end > start:
+        before, after = text[:start].rstrip("\n"), text[end + len(end_mark):].lstrip("\n")
+        rest = (before + "\n\n" + after) if before and after else (before + "\n" if before else after)
+    else:
+        rest = text
+    new = (rest.rstrip("\n") + "\n\n" + block) if rest.strip() and block else (block or rest)
+    if new == text:
+        return False
+    if new.strip():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(".gtk.css.omaskins-tmp")
+        tmp.write_text(new)
+        tmp.replace(path)
+    else:
+        path.unlink(missing_ok=True)
+    return True
+
+
+def write_nautilus_css(step):
+    """OmaSkins' Nautilus block in ~/.config/gtk-4.0/gtk.css; gone at the default step. True if changed."""
+    return _write_css_block(GTK4_CSS, NAUTILUS_CSS_START, NAUTILUS_CSS_END, nautilus_css(step))
+
+
+# --------------------------------------------------------------------------- file dialogs
+#
+# Open/Save dialogs come from Omarchy's dialog service (xdg-desktop-portal-gtk), which draws them with GTK3.
+# Owner, 2026-10-02: they should look like Nautilus (its stock grey, its background-only transparency at the
+# slider's level). GTK3 reads ~/.config/gtk-3.0/gtk.css only when the service starts, so after a change
+# OmaSkins restarts the service while no dialog is open (nothing on screen); the next dialog has the new look.
+# Dark themes need GTK3's dark theme (Omarchy asks for "Adwaita-dark", from gnome-themes-extra): without it
+# the dialog text is dark, so no block is written then. GTK3 can't tell a file dialog's window from another
+# dialog's, so the block covers GTK3 dialogs (in practice the service's: pickers, "open with", permissions).
+GTK3_CSS = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "gtk-3.0" / "gtk.css"
+DIALOG_CSS_START = "/* >>> OmaSkins Manager: file dialog transparency, like Nautilus (set it in OmaSkins) */"
+DIALOG_CSS_END = "/* <<< OmaSkins Manager */"
+DIALOG_CLASS = "xdg-desktop-portal-gtk"
+# libadwaita's own greys (Nautilus): its view (the window's see-through background) and sidebar.
+DIALOG_GREYS = {"dark": ("#1d1d20", "#2e2e32"), "light": ("#ffffff", "#ebebed")}
+GTK3_DARK_THEME = [Path(d) / "Adwaita-dark/gtk-3.0/gtk.css" for d in
+                   (HOME / ".local/share/themes", HOME / ".themes", "/usr/share/themes")]
+
+
+def theme_mode():
+    """"dark" or "light" for the current theme, by Omarchy's own resolver (colors.toml's mode, the legacy
+    light.mode marker, or the background's brightness); dark if it can't tell."""
+    colors = STATE_DIR / "theme" / "colors.toml"
+    try:
+        out = subprocess.run(["omarchy-theme-color", "--file", str(colors), "mode"], capture_output=True,
+                             text=True, timeout=5, env=child_env()).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        out = ""
+    return "light" if out == "light" else "dark"
+
+
+def gtk3_dark_available():
+    return any(p.exists() for p in GTK3_DARK_THEME)
+
+
+def dialog_css(step, mode):
+    """GTK3 dialogs like Nautilus: its grey, the background see-through at the step, the sidebar 10 points
+    more solid, files and text solid. Empty at the default step, and for dark themes without GTK3's dark theme."""
+    if step == TRANSPARENCY_DEFAULT or (mode == "dark" and not gtk3_dark_available()):
+        return ""
+    a, b, _ = transparency_values(step)
+    view, sidebar = DIALOG_GREYS[mode]
+    extra = _sidebar_layer
+    d = "dialog"
+    fc = "dialog filechooser"
+    return "\n".join([
+        DIALOG_CSS_START,
+        # The window and its title bar (GTK3 doesn't paint the window's background behind the title bar).
+        f"{d}.background, {d}.background.csd, {d} headerbar.titlebar, {d} .titlebar headerbar "
+        f"{{ background-color: alpha({view}, {a:g}); background-image: none; box-shadow: none; }}",
+        f"{d}.background:backdrop, {d}.background.csd:backdrop, {d}:backdrop headerbar.titlebar, "
+        f"{d}:backdrop .titlebar headerbar {{ background-color: alpha({view}, {b:g}); }}",
+        f"{fc}, {fc} box, {fc} stack, {fc} paned, {fc} scrolledwindow, {fc} viewport, {fc} treeview.view, {fc} .view,",
+        f"{fc} treeview.view header button, {fc} placessidebar list, {fc} actionbar, {fc} revealer, {fc} searchbar,",
+        f"{d} .dialog-action-area {{ background-color: transparent; background-image: none; box-shadow: none; }}",
+        f"{fc} placessidebar {{ background-color: alpha({sidebar}, {extra(a):g}); }}",
+        f"{d}:backdrop {fc} placessidebar {{ background-color: alpha({sidebar}, {extra(b):g}); }}",
+        DIALOG_CSS_END]) + "\n"
+
+
+def write_dialog_css(step, mode=None):
+    """OmaSkins' file dialog block in ~/.config/gtk-3.0/gtk.css. True if changed."""
+    return _write_css_block(GTK3_CSS, DIALOG_CSS_START, DIALOG_CSS_END, dialog_css(step, mode or theme_mode()))
+
+
+def transparency_values(step):
+    """(focused, unfocused, blur) for a step; Omarchy's own for the default step."""
+    v = TRANSPARENCY_STEPS[step]
+    return v if v else (*OMARCHY_OPACITY, False)
+
+
+def transparency_line(step):
+    a, b, blur = transparency_values(step)
+    return f"{a:g} {b:g} {'blur' if blur else 'noblur'}"
+
+
+def transparency_step():
+    """The step in use (0-4): the default when OmaSkins sets nothing."""
+    try:
+        line = TRANSPARENCY_FILE.read_text().strip()
+    except OSError:
+        return TRANSPARENCY_DEFAULT
+    for i in range(len(TRANSPARENCY_STEPS)):
+        if i != TRANSPARENCY_DEFAULT and transparency_line(i) == line:
+            return i
+    return TRANSPARENCY_DEFAULT
+
+
+def save_transparency(step):
+    if step == TRANSPARENCY_DEFAULT:
+        TRANSPARENCY_FILE.unlink(missing_ok=True)
+        return
+    TRANSPARENCY_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = TRANSPARENCY_FILE.with_name(".transparency.tmp")
+    tmp.write_text(transparency_line(step) + "\n")
+    tmp.replace(TRANSPARENCY_FILE)
+
+
+def transparency_action(step):
+    """No password, no reload: fades every see-through window to the new step over 1.5 s."""
+    step = max(0, min(len(TRANSPARENCY_STEPS) - 1, int(step)))
+    return Action("Transparency", f"fade windows to step {step + 1} of 5; save {TRANSPARENCY_FILE}",
+                  steps=(("apply_transparency", step),))
+
+
+def qt_apps_action(on):
+    """No password. On: the engine builds OmaSkins' Qt style within a few seconds (once per Qt5 update), then
+    omaskins.lua turns it on for Qt apps opened from then on. Off: style and palette removed at once."""
+    return Action("Qt apps", "theme Qt apps opened from now on" if on else
+                  "stop theming Qt apps opened from now on; remove OmaSkins' Qt style",
+                  steps=(("qt_apps", bool(on)),))
 
 
 def corners_action(on, px):
