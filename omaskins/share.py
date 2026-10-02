@@ -186,21 +186,32 @@ APP_DESKTOP = data.HOME / ".local/share/applications/io.github.jesuslovesyou1013
 MIMEAPPS = Path(os.environ.get("XDG_CONFIG_HOME") or data.HOME / ".config") / "mimeapps.list"
 
 
-def _desktop_entry():
-    """Hidden (NoDisplay: no second OmaSkins in the app launcher); only says OmaSkins opens its setups."""
-    launcher = Path(__file__).resolve().parent.parent / "omaskins-manager"
+def _desktop_entry(launcher=None):
+    """OmaSkins in the app launcher (Super + Space) and the app opened for its setups."""
+    launcher = launcher or Path(__file__).resolve().parent.parent / "omaskins-manager"
     return ("[Desktop Entry]\n"
             "Type=Application\n"
-            "Name=OmaSkins Manager\n"
-            "Comment=Import an OmaSkins setup\n"
+            "Name=OmaSkins\n"
+            "GenericName=Themes, backgrounds and fonts\n"
+            "Comment=Themes, backgrounds, fonts, rotation and transparency for Omarchy\n"
             f'Exec="{launcher}" %f\n'
             "Icon=preferences-desktop-theme\n"
             f"MimeType={MIME_TYPE};\n"
-            "NoDisplay=true\n"
+            "Categories=Settings;DesktopSettings;\n"
+            "Keywords=theme;background;wallpaper;font;rotation;transparency;omarchy;\n"
             "Terminal=false\n")
 
 
-def register_file_type():
+def _entry_target():
+    """The launcher the existing entry opens, if that file still exists."""
+    try:
+        m = re.search(r'^Exec="([^"]+)"', APP_DESKTOP.read_text(), re.M)
+    except OSError:
+        return None
+    return Path(m.group(1)) if m and Path(m.group(1)).exists() else None
+
+
+def register_file_type(launcher=None):
     """Tell the desktop that *.omaskins is an OmaSkins setup, opened by OmaSkins. Yours only
     (~/.local/share, ~/.config/mimeapps.list), no password, and nothing but that one file type:
     - its type (MIME_PACKAGE): without it a file manager looks inside, sees a zip, and unpacks it next
@@ -212,7 +223,11 @@ def register_file_type():
             _write_new(MIME_PACKAGE, MIME_XML.encode())
             subprocess.run(["update-mime-database", str(MIME_PACKAGE.parent.parent)], capture_output=True,
                            timeout=60, env=data.child_env())
-        entry = _desktop_entry()
+        # The installed plugin (the engine passes its own launcher) always points it at itself; a copy run
+        # from elsewhere (a developer's) only fills in an entry that's missing or points nowhere.
+        if launcher is None and _entry_target():
+            launcher = _entry_target()
+        entry = _desktop_entry(launcher)
         if not (APP_DESKTOP.exists() and APP_DESKTOP.read_text() == entry):
             _write_new(APP_DESKTOP, entry.encode())
         import gi

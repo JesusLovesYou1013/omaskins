@@ -540,14 +540,18 @@ def mix_it_up(desktop, plan, st, theme, current, themes, others, rng, now):
 
 
 def plugin_enabled(plugin_id):
-    """Omarchy lists enabled plugins in shell.json (re-read only when it changes). Unreadable =
-    assume yes (never stop on a glitch)."""
+    """Omarchy's own rule (PluginRegistry.isEnabled): a third-party plugin is on while its id is anywhere
+    in shell.json, in plugins[] or, as OmaSkins' palette icon is, in the bar's layout (re-read only when it
+    changes). Unreadable = assume yes (never stop on a glitch)."""
     try:
         mtime = SHELL_JSON.stat().st_mtime_ns
         if _ENABLED.get("key") != (plugin_id, mtime):
-            plugins = json.loads(SHELL_JSON.read_text()).get("plugins", [])
+            config = json.loads(SHELL_JSON.read_text())
+            entries = list(config.get("plugins", []))
+            for section in ((config.get("bar") or {}).get("layout") or {}).values():
+                entries += section if isinstance(section, list) else []
             _ENABLED.update(key=(plugin_id, mtime),
-                            on=any(isinstance(p, dict) and p.get("id") == plugin_id for p in plugins))
+                            on=any(isinstance(e, dict) and e.get("id") == plugin_id for e in entries))
     except (OSError, ValueError, AttributeError):
         return True
     return _ENABLED["on"]
@@ -705,12 +709,16 @@ def run(plugin_id=None):
                 log("omaskins.lua brought up to date")
         except Exception as e:
             log("omaskins.lua update failed:", repr(e))
-    # Double-clicking an exported .omaskins file opens OmaSkins, from the moment it's installed.
+    # OmaSkins in the app launcher, in Style › OmaSkins, and double-clicking an exported .omaskins file
+    # opens it, from the moment it's installed (Service.qml takes them away when the plugin goes off).
+    launcher = Path(__file__).resolve().parent.parent / "omaskins-manager"
     try:
-        from . import share
-        share.register_file_type()
+        from . import menu, share
+        share.register_file_type(launcher)
+        if menu.add_row(launcher):
+            log("added Style › OmaSkins to Omarchy's menu")
     except Exception as e:
-        log("file type registration failed:", repr(e))
+        log("launcher and menu registration failed:", repr(e))
     qt = QtApps()
     dialogs = DialogLook()
     try:

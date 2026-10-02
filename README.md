@@ -15,7 +15,20 @@ All of these ship with a stock Omarchy install. Installing needs no password.
 
     omarchy plugin add https://github.com/JesusLovesYou1013/omaskins.git --enable
 
-Or **Setup › Plugins › Add Plugin** with that URL. Enabling puts OmaSkins' palette icon in the bar.
+Or **Setup › Plugins › Add Plugin** with that URL, then enable it (Omarchy adds plugins switched off).
+
+## Opening OmaSkins
+
+Once it's on, any of these:
+
+- **Style › OmaSkins** in Omarchy's menu (the last row of Style: rows a plugin adds always come after
+  Omarchy's own);
+- the app launcher (**Super + Space**, type "OmaSkins");
+- the palette icon in the bar › **Open OmaSkins**;
+- double-click an exported `.omaskins` file.
+
+Turning OmaSkins off or removing it takes the menu row, the launcher entry and the file type away
+again.
 
 ## The palette icon
 

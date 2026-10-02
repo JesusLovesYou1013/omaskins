@@ -9,6 +9,7 @@ suite refuses to start if any of them still points at the real home.
 
 import itertools
 import json
+import re
 import os
 import shutil
 import subprocess
@@ -2049,7 +2050,8 @@ class ShareImport(unittest.TestCase):
         self.assertIn('<glob pattern="*.omaskins"', self.share.MIME_PACKAGE.read_text())
         self.assertTrue(str(self.share.MIME_PACKAGE).startswith(str(HOME)), "yours only, never system-wide")
         entry = self.share.APP_DESKTOP.read_text()
-        self.assertIn("MimeType=application/x-omaskins-setup;\nNoDisplay=true", entry, "hidden, that type only")
+        self.assertIn("MimeType=application/x-omaskins-setup;\n", entry, "that type only")
+        self.assertNotIn("NoDisplay", entry, "OmaSkins shows in the app launcher (owner, 2026-10-02)")
         self.assertIn("application/x-omaskins-setup=io.github.jesuslovesyou1013.omaskins.desktop",
                       self.share.MIMEAPPS.read_text())
         self.share.MIMEAPPS.write_text("[Default Applications]\napplication/x-omaskins-setup=other.desktop\n")
@@ -2558,6 +2560,54 @@ class NautilusTransparency(unittest.TestCase):
                                  "window = 'address:0xnew' }))"])
 
 
+class PluginEnabled(unittest.TestCase):
+    """The engine runs while Omarchy has OmaSkins on: listed as a plugin, or as its icon in the bar."""
+
+    def check(self, config):
+        from omaskins import rotation
+        rotation._ENABLED.clear()
+        rotation.SHELL_JSON = SANDBOX / "shell.json"
+        rotation.SHELL_JSON.write_text(json.dumps(config))
+        return rotation.plugin_enabled("io.github.jesuslovesyou1013.omaskins")
+
+    def test_as_its_bar_icon(self):
+        me = {"id": "io.github.jesuslovesyou1013.omaskins"}
+        self.assertTrue(self.check({"bar": {"layout": {"right": [{"id": "omarchy.clock"}, me]}}, "plugins": []}),
+                        "installed with omarchy plugin add: the icon in the bar is what keeps it on")
+        self.assertTrue(self.check({"plugins": [me]}))
+        self.assertFalse(self.check({"bar": {"layout": {"right": [{"id": "omarchy.clock"}]}}, "plugins": []}),
+                         "icon removed from the bar: off")
+
+
+class MenuRow(unittest.TestCase):
+    """Style › OmaSkins in Omarchy's menu, beside whatever else the extension file holds."""
+
+    def setUp(self):
+        from omaskins import menu
+        self.m = menu
+        self.assertTrue(str(menu.MENU_FILE).startswith(str(SANDBOX)), "never the real menu file")
+        menu.MENU_FILE.unlink(missing_ok=True)
+
+    def test_added_once_and_removed_cleanly(self):
+        theirs = '{\n  // a comment\n  "setup.plugin.browse": {"label":"Browse Plugins","action":"x"}\n}\n'
+        write(self.m.MENU_FILE, theirs)
+        self.assertTrue(self.m.add_row("/plug/omaskins-manager"))
+        self.assertFalse(self.m.add_row("/plug/omaskins-manager"), "once")
+        text = self.m.MENU_FILE.read_text()
+        self.assertIn('"style.omaskins"', text)
+        stripped = re.sub(r"^\s*//[^\n]*(\n|$)", "", text, flags=re.M)
+        stripped = re.sub(r",(\s*[}\]])", r"\1", stripped)   # Omarchy's own JSONC reader
+        rows = json.loads(stripped)
+        self.assertEqual(list(rows), ["style.omaskins", "setup.plugin.browse"])
+        self.assertEqual(rows["style.omaskins"]["action"], "uwsm-app -- /plug/omaskins-manager")
+        self.assertTrue(self.m.remove_row())
+        self.assertEqual(self.m.MENU_FILE.read_text(), theirs, "exactly as it was")
+
+    def test_no_file_yet(self):
+        self.assertTrue(self.m.add_row("/plug/omaskins-manager"))
+        self.assertIn('"style.omaskins"', self.m.MENU_FILE.read_text())
+
+
 class SkipAhead(unittest.TestCase):
     """The bar's palette menu: next theme or background now, the rotation's way, without pausing it."""
 
@@ -2854,8 +2904,9 @@ class QtStyle(unittest.TestCase):
                        "hl = { env = function(k, v) print('env', k, v) end }\n" + data.QT_LUA)
 
         def run_lua(**env):
+            clean = {k: v for k, v in os.environ.items() if k not in ("QT_STYLE_OVERRIDE", "QT_PLUGIN_PATH")}
             return subprocess.run(["lua", str(lua)], capture_output=True, text=True,
-                                  env=dict(os.environ, HOME=str(HOME), XDG_CONFIG_HOME=str(HOME / ".config"),
+                                  env=dict(clean, HOME=str(HOME), XDG_CONFIG_HOME=str(HOME / ".config"),
                                            **env)).stdout.rstrip("\n").split("\n")
         plugins = str(HOME / ".local/share/omaskins/qt5")
         self.assertEqual(run_lua(), ["rule\tomaskins-qt\t1 1"], "not built: nothing set")

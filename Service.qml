@@ -8,6 +8,8 @@ import Quickshell.Io
 // shell exits, and a crashed engine is restarted after a pause. The engine also stops by
 // itself once the plugin is disabled (it checks shell.json). -B: Python writes no
 // __pycache__ here, since any file change in a plugin folder makes the shell reload it.
+// While on, the engine also puts OmaSkins in the app launcher and in Omarchy's menu (Style ›
+// OmaSkins); turning the plugin off takes them away again (removeCommand below).
 Item {
   id: root
 
@@ -31,5 +33,23 @@ Item {
     onTriggered: engine.running = true
   }
 
-  Component.onDestruction: engine.running = false
+  // Turned off or removed: OmaSkins leaves Omarchy's menu (Style › OmaSkins), the app launcher and the
+  // .omaskins file type. Inline, not in a script, because `omarchy plugin remove` deletes this folder
+  // right after disabling it (CtrlZ Guard's way). The service is also destroyed on a normal shell exit or
+  // reload; while the id is still in shell.json (as a plugin or its bar icon) this does nothing.
+  readonly property string removeCommand:
+    "sleep 1; c=\"${XDG_CONFIG_HOME:-$HOME/.config}\"; d=\"${XDG_DATA_HOME:-$HOME/.local/share}\"; " +
+    "grep -qF '\"" + pluginId + "\"' \"$c/omarchy/shell.json\" 2>/dev/null && exit 0; " +
+    "f=\"$c/omarchy/extensions/omarchy-menu.jsonc\"; " +
+    "[ -f \"$f\" ] && sed -i --follow-symlinks '/^  \\/\\/ >>> OmaSkins/,/^  \\/\\/ <<< OmaSkins/d' \"$f\"; " +
+    "rm -f \"$d/applications/" + pluginId + ".desktop\" \"$d/mime/packages/" + pluginId + ".xml\"; " +
+    "update-mime-database \"$d/mime\" >/dev/null 2>&1; " +
+    "m=\"$c/mimeapps.list\"; " +
+    "[ -f \"$m\" ] && sed -i --follow-symlinks '/^application\\/x-omaskins-setup=" +
+    pluginId.replace(/\./g, "\\.") + "\\.desktop;\\?$/d' \"$m\"; true"
+
+  Component.onDestruction: {
+    engine.running = false
+    Quickshell.execDetached(["bash", "-c", root.removeCommand])
+  }
 }
