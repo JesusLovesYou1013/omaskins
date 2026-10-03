@@ -725,6 +725,15 @@ def run(plugin_id=None):
             log("added Style › OmaSkins to Omarchy's menu")
     except Exception as e:
         log("launcher and menu registration failed:", repr(e))
+    # Font previews downloaded before they were slimmed: once, in the background (a few ms each).
+    def slim_previews():
+        try:
+            n = data.slim_preview_fonts()
+            if n:
+                log("font previews slimmed:", n)
+        except Exception as e:
+            log("font preview slimming failed:", repr(e))
+    threading.Thread(target=slim_previews, daemon=True).start()
     qt = QtApps()
     dialogs = DialogLook()
     try:

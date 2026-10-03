@@ -733,6 +733,109 @@ def _preview_file_in(names):
     return fonts[0] if fonts else None
 
 
+# A Browse preview only draws the font's own name (and OmaSkins measures its "x"), but the regular face of a
+# Nerd Font is 2-14 MB, mostly icons and other scripts. So each one is slimmed to basic Latin (A-Z, a-z, 0-9,
+# punctuation, "…") with HarfBuzz's subsetter (part of GTK/Pango, on every Omarchy install; no package, no
+# password). Every table is kept and nothing else changes, so it draws exactly as before: checked
+# pixel-for-pixel on 66 fonts, 5 sizes, 3 texts (2026-10-02; 221 MB -> 11 MB). The whole basic Latin set,
+# not just the name's letters: FreeType's auto-hinter places lowercase/capital heights from reference
+# letters ("o", "x", "H"...), and without them some fonts drew 1-2 px taller. A font HarfBuzz can't slim
+# stays as it is.
+PREVIEW_KEEP = "".join(chr(c) for c in range(0x20, 0x7f)) + "\u2026"
+_HB = {}
+
+
+def _harfbuzz():
+    if "lib" not in _HB:
+        import ctypes
+        from ctypes import POINTER, c_char_p, c_int, c_uint, c_void_p
+        try:
+            hb = ctypes.CDLL("libharfbuzz-subset.so.0")
+            for name, res, args in [
+                    ("hb_blob_create_from_file_or_fail", c_void_p, [c_char_p]),
+                    ("hb_face_create", c_void_p, [c_void_p, c_uint]),
+                    ("hb_subset_input_create_or_fail", c_void_p, []),
+                    ("hb_subset_input_unicode_set", c_void_p, [c_void_p]),
+                    ("hb_subset_input_set", c_void_p, [c_void_p, c_int]),
+                    ("hb_subset_input_set_flags", None, [c_void_p, c_uint]),
+                    ("hb_set_add", None, [c_void_p, c_uint]),
+                    ("hb_set_clear", None, [c_void_p]),
+                    ("hb_set_invert", None, [c_void_p]),
+                    ("hb_subset_or_fail", c_void_p, [c_void_p, c_void_p]),
+                    ("hb_face_reference_blob", c_void_p, [c_void_p]),
+                    ("hb_blob_get_data", POINTER(ctypes.c_char), [c_void_p, POINTER(c_uint)]),
+                    ("hb_blob_destroy", None, [c_void_p]),
+                    ("hb_face_destroy", None, [c_void_p]),
+                    ("hb_subset_input_destroy", None, [c_void_p])]:
+                f = getattr(hb, name)
+                f.restype, f.argtypes = res, args
+        except (OSError, AttributeError):
+            hb = None
+        _HB["lib"] = hb
+    return _HB["lib"]
+
+
+def slim_font(path, text):
+    """`path` rewritten with only the characters in `text` (every table kept, glyph ids kept, unknown tables
+    passed through). False (file untouched) if HarfBuzz isn't there or can't subset this font."""
+    import ctypes
+    hb = _harfbuzz()
+    if not hb:
+        return False
+    blob = hb.hb_blob_create_from_file_or_fail(str(path).encode())
+    if not blob:
+        return False
+    face = hb.hb_face_create(blob, 0)
+    inp = hb.hb_subset_input_create_or_fail()
+    try:
+        if not inp:
+            return False
+        unicodes = hb.hb_subset_input_unicode_set(inp)
+        for ch in set(text):
+            hb.hb_set_add(unicodes, ord(ch))
+        for which in (4, 5, 6, 7):   # every name id, name language, layout feature and script
+            keep = hb.hb_subset_input_set(inp, which)
+            hb.hb_set_clear(keep)
+            hb.hb_set_invert(keep)
+        hb.hb_set_clear(hb.hb_subset_input_set(inp, 3))   # drop no tables
+        hb.hb_subset_input_set_flags(inp, 0x2 | 0x8 | 0x20 | 0x100)   # glyph ids, legacy names, unknown tables, ranges
+        out = hb.hb_subset_or_fail(face, inp)
+        if not out:
+            return False
+        out_blob = hb.hb_face_reference_blob(out)
+        size = ctypes.c_uint()
+        payload = ctypes.string_at(hb.hb_blob_get_data(out_blob, ctypes.byref(size)), size.value)
+        hb.hb_blob_destroy(out_blob)
+        hb.hb_face_destroy(out)
+        if not payload:
+            return False
+        tmp = Path(path).with_name("." + Path(path).name + ".slim")
+        tmp.write_bytes(payload)
+        tmp.replace(path)
+        return True
+    finally:
+        if inp:
+            hb.hb_subset_input_destroy(inp)
+        hb.hb_face_destroy(face)
+        hb.hb_blob_destroy(blob)
+
+
+def slim_preview_fonts():
+    """Slim the previews downloaded before slimming existed (once each). Returns how many."""
+    done = 0
+    for meta_file in PREVIEW_FONTS.glob("*.json"):
+        try:
+            meta = json.loads(meta_file.read_text())
+        except (OSError, ValueError):
+            continue
+        if meta.get("slim") or not Path(meta.get("file", "")).is_file():
+            continue
+        meta["slim"] = bool(slim_font(meta["file"], meta.get("family", "") + PREVIEW_KEEP))
+        meta_file.write_text(json.dumps(meta))
+        done += meta["slim"]
+    return done
+
+
 def fetch_preview_font(package):
     """Download the package, keep its regular font file, delete the package. Returns preview_font()."""
     urls = [u for u in _run(["pacman", "-Sp", package], 30).splitlines() if "://" in u]
@@ -760,7 +863,8 @@ def fetch_preview_font(package):
         family = _run(["fc-scan", "--format", "%{family[0]}", str(dest)], 10).strip()
         if not family:
             raise ValueError(f"unreadable font in {package}")
-        (PREVIEW_FONTS / f"{package}.json").write_text(json.dumps({"family": family, "file": str(dest)}))
+        slim = slim_font(dest, family + PREVIEW_KEEP)
+        (PREVIEW_FONTS / f"{package}.json").write_text(json.dumps({"family": family, "file": str(dest), "slim": slim}))
     finally:
         tmp.unlink(missing_ok=True)
     return preview_font(package)

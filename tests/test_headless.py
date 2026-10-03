@@ -2581,6 +2581,62 @@ class PluginEnabled(unittest.TestCase):
                          "icon removed from the bar: off")
 
 
+class SlimPreviews(unittest.TestCase):
+    """Browse's font previews slimmed to basic Latin, drawing exactly as the full font did."""
+    SOURCE = Path("/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf")
+
+    def setUp(self):
+        if not self.SOURCE.exists() or not data._harfbuzz():
+            self.skipTest("no sample font or HarfBuzz here")
+        self.dir = SANDBOX / "slim"
+        shutil.rmtree(self.dir, ignore_errors=True)
+        self.dir.mkdir()
+
+    def render(self, path):
+        code = ("import sys, gi, hashlib\n"
+                "gi.require_version('Pango','1.0'); gi.require_version('PangoCairo','1.0')\n"
+                "from gi.repository import Pango, PangoCairo\nimport cairo\n"
+                "fm = PangoCairo.FontMap.new(); fm.add_font_file(sys.argv[1]); ctx = fm.create_context(); out = []\n"
+                "for text in ('JetBrainsMono Nerd Font', 'x', 'JetBra…'):\n"
+                "  for px in (19.2, 24.0, 28.8):\n"
+                "    lay = Pango.Layout.new(ctx); lay.set_text(text, -1); d = Pango.FontDescription()\n"
+                "    d.set_family('JetBrainsMono Nerd Font'); d.set_absolute_size(px * Pango.SCALE); lay.set_font_description(d)\n"
+                "    ink, log = lay.get_pixel_extents()\n"
+                "    surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, log.width + 4, log.height + 4); cr = cairo.Context(surf)\n"
+                "    PangoCairo.update_context(cr, ctx); cr.move_to(2, 2); PangoCairo.show_layout(cr, lay); surf.flush()\n"
+                "    out.append(fm.load_font(ctx, d).describe().get_family() + str(ink.height) + hashlib.sha1(bytes(surf.get_data())).hexdigest())\n"
+                "print(out)\n")
+        env = {k: v for k, v in os.environ.items() if k != "FONTCONFIG_FILE"}
+        return subprocess.run([sys.executable, "-c", code, str(path)], capture_output=True, text=True, env=env).stdout
+
+    def test_much_smaller_and_draws_the_same(self):
+        font = self.dir / "Preview-Regular.ttf"
+        shutil.copy(self.SOURCE, font)
+        before = self.render(font)
+        self.assertTrue(data.slim_font(font, "JetBrainsMono Nerd Font" + data.PREVIEW_KEEP))
+        self.assertLess(font.stat().st_size, self.SOURCE.stat().st_size / 10, "a small fraction of the size")
+        self.assertEqual(self.render(font), before, "pixel for pixel, same heights, same font")
+
+    def test_existing_previews_slimmed_once(self):
+        old = data.PREVIEW_FONTS
+        data.PREVIEW_FONTS = self.dir
+        try:
+            font = self.dir / "Preview-Regular.ttf"
+            shutil.copy(self.SOURCE, font)
+            (self.dir / "ttf-x.json").write_text(json.dumps({"family": "JetBrainsMono Nerd Font", "file": str(font)}))
+            self.assertEqual(data.slim_preview_fonts(), 1)
+            self.assertTrue(json.loads((self.dir / "ttf-x.json").read_text())["slim"])
+            self.assertEqual(data.slim_preview_fonts(), 0, "once")
+        finally:
+            data.PREVIEW_FONTS = old
+
+    def test_unreadable_font_left_alone(self):
+        bad = self.dir / "Broken.ttf"
+        bad.write_bytes(b"not a font")
+        self.assertFalse(data.slim_font(bad, "abc"))
+        self.assertEqual(bad.read_bytes(), b"not a font")
+
+
 class ShellSurfaces(unittest.TestCase):
     """Omarchy's menus, panels and notifications at the step, through the shell's own live setting."""
 
