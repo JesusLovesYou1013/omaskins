@@ -304,12 +304,36 @@ def x_height_ratio(widget, family):
     return _XRATIO[family]
 
 
+def _load_matched():
+    try:
+        saved = json.loads(data.FONT_SIZES_CACHE.read_text())
+        if saved.get("fonts") == data.font_signature():
+            for k, v in saved.get("sizes", {}).items():
+                family, base = k.rsplit("@", 1)
+                _MATCHED[(family, float(base))] = v
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _save_matched():
+    try:
+        data.FONT_SIZES_CACHE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = data.FONT_SIZES_CACHE.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"fonts": data.font_signature(),
+                                   "sizes": {f"{f}@{b}": v for (f, b), v in _MATCHED.items()}}))
+        tmp.replace(data.FONT_SIZES_CACHE)
+    except OSError:
+        pass
+
+
 def matched_size(widget, family, base_px):
     """The size at which `family`'s lowercase is as tall as Omarchy's default font (JetBrainsMono
     Nerd Font) at `base_px`: first by the measured ratio, then fine-tuned in 0.1 px steps on what is
     actually drawn (hinting snaps letters to whole pixels), so switching fonts changes the style,
     not the size."""
     key = (family, round(base_px, 2))
+    if not _MATCHED:
+        _load_matched()
     if key not in _MATCHED:
         ref = data.REFERENCE_FAMILY
         ratio = x_height_ratio(widget, family)
@@ -319,9 +343,50 @@ def matched_size(widget, family, base_px):
         else:
             first = data.normalized_size(base_px, ratio, ref_ratio)
             target = _x_ink(widget, ref, base_px) or base_px * ref_ratio
-            steps = [round(first + d / 10, 1) for d in range(-10, 11)]
-            _MATCHED[key] = min(steps, key=lambda s: (abs(_x_ink(widget, family, s) - target), abs(s - first)))
+            _MATCHED[key] = _closest_size(lambda s: _x_ink(widget, family, s), target, first)
+        GLib.idle_add(lambda: (_save_matched(), False)[1]) if len(_MATCHED) % 8 == 0 else None
     return _MATCHED[key]
+
+
+def _closest_size(ink, target, first):
+    """The size within ±1 px of `first` (0.1 px steps) whose drawn 'x' is closest to `target`, nearest to
+    `first` on a tie: exactly what trying all 21 gives, in far fewer measurements. A letter's drawn height
+    only grows with the size (hinting makes runs of sizes draw the same height), so halving searches find
+    where it crosses `target` and where each run of equal heights starts and ends."""
+    steps = [round(first + d / 10, 1) for d in range(-10, 11)]
+    mid_i = 10   # `first`
+    measured = {}
+
+    def at(i):
+        if i not in measured:
+            measured[i] = ink(steps[i])
+        return measured[i]
+
+    def search(lo, hi, pred):
+        """First index in [lo, hi] where pred holds (pred is False...False True...True); hi + 1 if none."""
+        while lo <= hi:
+            m = (lo + hi) // 2
+            if pred(m):
+                hi = m - 1
+            else:
+                lo = m + 1
+        return lo
+
+    n = len(steps)
+    up = search(0, n - 1, lambda i: at(i) >= target)        # first step at least as tall as the target
+    best = None
+    for c in (up - 1, up):
+        if not 0 <= c < n:
+            continue
+        v = at(c)
+        # the run of steps drawing exactly v, and its step nearest `first`
+        start = search(0, c, lambda i: at(i) >= v)
+        end = search(c, n - 1, lambda i: at(i) > v) - 1
+        pick = min(max(mid_i, start), end)
+        key = (abs(v - target), abs(steps[pick] - first))
+        if best is None or key < best[0]:
+            best = (key, pick)
+    return steps[best[1]]
 
 
 FONT_SLOT = 1.75  # font previews sit in a box this many times the base size tall (tallest line: 1.58)
@@ -2050,7 +2115,7 @@ class Window(Adw.ApplicationWindow):
         self._running = set()
         self.preview_rows, self._preview_queue, self._preview_busy = {}, [], False
         self._asked_aether = False
-        self._load_cached_previews()
+        self._previews_loaded = False   # Browse's downloaded preview fonts: loaded with the Fonts tab
         self._quiet_until, self._pending = 0, set()
         self.current_font = ""
         self.font_base = 12
@@ -2575,15 +2640,25 @@ class Window(Adw.ApplicationWindow):
         installed = [ThemeEntry(by_local.get(t.name), t) for t in self.local]
         installed.sort(key=self._theme_order)
         for name, entries in (("Browse", browse), ("Installed", installed)):
-            fb = self.theme_flows[name]
-            fb.remove_all()
-            for e in entries:
-                fb.append(ThemeCard(self, e, self.current_theme))
             self.theme_counts[name].set_text(str(len(entries)))
+        # Browse (~180 cards) is built when it's first shown; OmaSkins opens on Installed.
+        self._theme_entries = {"Browse": browse, "Installed": installed}
+        self._themes_dirty = {"Browse", "Installed"}
+        self._build_theme_grid(self.theme_stack.get_visible_child_name() or "Installed")
         self._rebuild_bg_sidebar()
         self._rebuild_fonts()
         self.rotation.refresh()
         self._refresh_page()
+
+    def _build_theme_grid(self, name):
+        if name not in getattr(self, "_themes_dirty", ()):
+            return
+        self._themes_dirty.discard(name)
+        dlog("build theme grid", name)
+        fb = self.theme_flows[name]
+        fb.remove_all()
+        for e in self._theme_entries[name]:
+            fb.append(ThemeCard(self, e, self.current_theme))
 
     def _rebuild_bg_sidebar(self):
         keep = self.bg_theme.name if self.bg_theme else self.current_theme
@@ -2622,6 +2697,16 @@ class Window(Adw.ApplicationWindow):
             self.bg_flow.append(Gtk.FlowBoxChild(child=label("No backgrounds for this theme yet.", "empty")))
 
     def _rebuild_fonts(self):
+        """Built when the Fonts tab is (or gets) shown: matching every font's size costs real time, and most
+        launches never open Fonts (2026-10-02: it froze the window for ~3 s at every launch)."""
+        if self.main_stack.get_visible_child_name() != "Fonts":
+            self._fonts_dirty = True
+            return
+        self._fonts_dirty = False
+        if not self._previews_loaded:
+            self._previews_loaded = True
+            self._load_cached_previews()
+        dlog("build fonts tab")
         cur_pkg = next((f.package for f in self.fonts if f.current), "")
         fonts = data.without_icon_twins(self.fonts)
         # Installed fonts grouped by the package that brought them (owner: removing one removes the
@@ -2697,6 +2782,8 @@ class Window(Adw.ApplicationWindow):
             self._select_bg_theme(self.current_theme)
         self.main_stack.set_visible_child_name(name)
         self.tab_rows.set_visible_child_name(name)
+        if name == "Fonts" and getattr(self, "_fonts_dirty", False):
+            self._rebuild_fonts()
         self.search.set_sensitive(name != "Rotation")
         self.sort_box.set_sensitive(name in ("Themes", "Fonts"))  # greyed elsewhere, never moved
         self.search.set_placeholder_text({"Themes": "Search themes…", "Backgrounds": "Search backgrounds…",
@@ -2713,6 +2800,7 @@ class Window(Adw.ApplicationWindow):
         self.bg_tab_wrap.set_tooltip_text(BGS_BLOCKED if on else None)
 
     def _on_theme_sub(self, name):
+        self._build_theme_grid(name)
         self.theme_stack.set_visible_child_name(name)
 
     def _on_font_sub(self, name):

@@ -698,6 +698,21 @@ PREVIEW_FONTS = CACHE_DIR / "font-previews"
 MAX_FONT_PACKAGE = 200 * 1024 * 1024
 
 
+FONT_SIZES_CACHE = CACHE_DIR / "font-sizes.json"   # matched preview sizes (app.matched_size), per font set
+
+
+def font_signature():
+    """Changes when fonts are installed or removed (fontconfig's own cache folders), so remembered sizes
+    are measured again then."""
+    stamps = []
+    for d in (Path("/var/cache/fontconfig"), HOME / ".cache/fontconfig", HOME / ".local/share/fonts"):
+        try:
+            stamps.append(d.stat().st_mtime_ns)
+        except OSError:
+            stamps.append(0)
+    return stamps
+
+
 def preview_font(package):
     """{"family", "file"} for a downloaded preview, or None."""
     try:
@@ -842,11 +857,41 @@ def omarchy_font_picks():
     return picks
 
 
+REPO_FONTS_CACHE = CACHE_DIR / "repo-fonts.json"
+
+
+def _repo_font_search():
+    """`pacman -Ss` for Nerd Font packages (~0.4 s), remembered until pacman's package lists change (a sync,
+    an install or a removal), so a launch doesn't wait for it."""
+    def stamp(d):
+        try:
+            return Path(d).stat().st_mtime_ns
+        except OSError:
+            return 0
+    key = [stamp("/var/lib/pacman/sync"), stamp("/var/lib/pacman/local")]
+    try:
+        saved = json.loads(REPO_FONTS_CACHE.read_text())
+        if saved.get("key") == key:
+            return saved["out"]
+    except (OSError, ValueError, KeyError, AttributeError):
+        pass
+    out = _run(["pacman", "-Ss", r"^(ttf|otf)-.*nerd"], 30)
+    if out:
+        try:
+            REPO_FONTS_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = REPO_FONTS_CACHE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"key": key, "out": out}))
+            tmp.replace(REPO_FONTS_CACHE)
+        except OSError:
+            pass
+    return out
+
+
 def repo_fonts():
     """Nerd Font packages in the Arch repos: the same source Omarchy installs fonts from."""
     picks = omarchy_font_picks()
     out, pkg = [], None
-    for line in _run(["pacman", "-Ss", r"^(ttf|otf)-.*nerd"], 30).splitlines():
+    for line in _repo_font_search().splitlines():
         if not line.startswith(" "):
             m = re.match(r"\S+/(\S+) (\S+)(.*)", line)
             pkg = FontPackage(m.group(1), m.group(2), "", "[installed" in m.group(3),
