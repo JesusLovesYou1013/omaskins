@@ -5,7 +5,7 @@
   "version": "1.0.0",
   "author": "JesusLovesYou1013",
   "license": "GPL-3.0",
-  "description": "Manage Omarchy's look in one place: browse, add and switch themes, backgrounds and fonts, and rotate themes and backgrounds on a schedule that keeps running with the app closed. Rounded corners and five steps of window transparency for every theme, with menus, file dialogs and Qt apps following along. Next and Pause in the bar. Removing it puts everything back to Omarchy's own.",
+  "description": "Manage Omarchy's look in one place: browse, add and switch themes, backgrounds and fonts, and rotate themes and backgrounds on a schedule that keeps running with the app closed. Rounded corners and five steps of window transparency, with menus, file dialogs and Qt apps following along. Next and Pause in the bar. Removing it puts everything back to Omarchy's own.",
   "kinds": [
     "service",
     "bar-widget"
