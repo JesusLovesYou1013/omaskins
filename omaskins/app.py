@@ -1146,7 +1146,10 @@ class ImportDialog(Adw.Dialog):
     """What's in a shared zip, as tick boxes (all ticked: Everything). Something another item needs sits
     underneath it, ticked and locked while that item is ticked, so it can't be left behind."""
 
-    GROUPS = ("Themes", "Built-in themes", "Your backgrounds", "Fonts", "Rotation sets", "Settings")
+    # Changes to built-in themes come first (owner, 2026-10-08): under the 29 theme rows nobody scrolled
+    # down to them, so "Remove entirely" went unseen and the default, hiding, was applied.
+    GROUPS = ("Built-in themes", "Themes", "Your backgrounds", "Fonts", "Rotation sets", "Settings")
+    GROUP_TITLES = {"Built-in themes": "Changes to built-in themes"}
     BADGES = {"merge": ("Merge", "verified"), "password": ("Password", "warn"), "have": ("Already here", "builtin")}
 
     def __init__(self, win, path, manifest):
@@ -1179,7 +1182,8 @@ class ImportDialog(Adw.Dialog):
             rows = [r for r in self.rows if r["group"] == group]
             if not rows:
                 continue
-            g = Gtk.CheckButton(label=f"{group} ({len(rows)})", margin_start=22, margin_top=6)
+            g = Gtk.CheckButton(label=f"{self.GROUP_TITLES.get(group, group)} ({len(rows)})", margin_start=22,
+                                margin_top=6)
             g.add_css_class("card-name")
             g.connect("toggled", lambda b, rows=rows: self._set_all(b.get_active(), rows))
             self.group_checks[group] = (g, rows)

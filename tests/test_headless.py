@@ -1497,6 +1497,13 @@ class ReadingChangesNothing(unittest.TestCase):
         data.export_plan(local[0], community, None, None)
         self.assertEqual(snapshot(HOME), before)
 
+    def test_import_lists_builtin_theme_changes_first(self):
+        # Read from the source: importing app.py needs a display.
+        src = (ROOT / "omaskins/app.py").read_text()
+        groups = re.search(r'GROUPS = \(([^)]*)\)', src).group(1)
+        self.assertTrue(groups.startswith('"Built-in themes", "Themes"'), groups)
+        self.assertIn('"Built-in themes": "Changes to built-in themes"', src)
+
     def test_app_never_runs_commands_itself(self):
         # Real actions may only go through omaskins/run.py and its allow-list.
         src = (ROOT / "omaskins/app.py").read_text()
