@@ -50,6 +50,9 @@ Item {
     "[ -f \"$f\" ] && sed -i --follow-symlinks '/^  \\/\\/ >>> OmaSkins/,/^  \\/\\/ <<< OmaSkins/d' \"$f\"; " +
     "rm -f \"$d/applications/" + pluginId + ".desktop\" \"$d/mime/packages/" + pluginId + ".xml\"; " +
     "update-mime-database \"$d/mime\" >/dev/null 2>&1; " +
+    // The desktop's own list of which app opens which file type, if one was ever built here: rebuilt
+    // without OmaSkins (2026-10-08: a mimeinfo.cache still named it after a removal).
+    "[ -f \"$d/applications/mimeinfo.cache\" ] && update-desktop-database \"$d/applications\" >/dev/null 2>&1; " +
     "t=\"$d/themes/Adwaita-dark/gtk-3.0/gtk.css\"; " +
     "grep -qF 'Written by OmaSkins' \"$t\" 2>/dev/null && rm -f \"$t\" && " +
     "rmdir \"$d/themes/Adwaita-dark/gtk-3.0\" \"$d/themes/Adwaita-dark\" 2>/dev/null; " +
