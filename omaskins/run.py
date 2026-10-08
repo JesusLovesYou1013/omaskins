@@ -716,6 +716,14 @@ def _set_terminal_size(pt):
     _sub_in(_cfg("foot/foot.ini"), r"(:size=)[0-9.]+", rf"\g<1>{pt}")
 
 
+def set_plain_text_size(px):
+    """The shell's base-size and the terminals' point size exactly as `omarchy display text size <px>`
+    sets them (no scaling for the font): an import of a text size that was set with Omarchy's control."""
+    px, pt = data.sizes_for(int(px), 1.0)
+    _set_shell_base_size(px)
+    _set_terminal_size(pt)
+
+
 def _text_size_state():
     try:
         return json.loads(data.TEXT_SIZE_STATE.read_text())

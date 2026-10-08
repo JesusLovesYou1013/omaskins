@@ -351,9 +351,16 @@ def collect(community):
 
     on, px = data.corners_setting()
     builtin_state = data._builtin_state()
-    text_size = None
+    text_size = text_size_set = None
     try:
-        text_size = json.loads(data.TEXT_SIZE_STATE.read_text()).get("base")
+        st = json.loads(data.TEXT_SIZE_STATE.read_text())
+        text_size = st.get("base")
+        # Changed with Omarchy's own text-size control since OmaSkins last sized a font: that plain value
+        # is the text size now (run.remember_text_size's rule), not the older one OmaSkins scaled from.
+        # 2026-10-08: an import put 17 px back where the owner had since set 16.
+        from . import run
+        if isinstance(st.get("wrote"), int) and st["wrote"] != run.shell_base_size():
+            text_size_set = run.shell_base_size()
     except (OSError, ValueError, AttributeError):
         pass
 
@@ -375,6 +382,7 @@ def collect(community):
         "transparency_values": data.transparency_line(data.transparency_step()),
         "qt_apps": qtstyle.enabled(),
         "text_size": text_size,
+        "text_size_set": text_size_set,
         "rotation": rotation,
         "rotation_paused": sorted(data.rotation_paused()),
         "rotation_sets": sets,
@@ -571,7 +579,8 @@ def items(manifest):
         ("transparency", "Transparency", transparency_step_of(manifest) is not None,
          f"step {(transparency_step_of(manifest) or 0) + 1} of {len(data.TRANSPARENCY_STEPS)}"),
         ("qt_apps", "Qt apps", isinstance(manifest.get("qt_apps"), bool), "on" if manifest.get("qt_apps") else "off"),
-        ("text_size", "Text size", bool(manifest.get("text_size")), str(manifest.get("text_size") or "")),
+        ("text_size", "Text size", bool(manifest.get("text_size") or manifest.get("text_size_set")),
+         f"{manifest['text_size_set']} px" if manifest.get("text_size_set") else str(manifest.get("text_size") or "")),
         ("blueprints", "Aether blueprints", bool(manifest.get("aether_blueprints")),
          f"{len(manifest.get('aether_blueprints', []))}"),
     ]
@@ -1097,11 +1106,20 @@ def apply_look(manifest, chosen, as_here, pics, in_use, note, exact=None):
         done.append(f"Qt apps: {'on' if manifest['qt_apps'] else 'off'}")
     font = current.get("font")
     if font and font in {f.family for f in data.installed_fonts()}:
-        if "text_size" in chosen and manifest.get("text_size"):
+        own = manifest.get("text_size_set")
+        if "text_size" in chosen and isinstance(own, int) and 9 <= own <= 20:
+            # Set there with Omarchy's own control: the same plain sizes here, not scaled for the font.
+            run.perform((("run", ["omarchy-font-set", font]),))
             data.TEXT_SIZE_STATE.parent.mkdir(parents=True, exist_ok=True)
-            data.TEXT_SIZE_STATE.write_text(json.dumps({"base": int(manifest["text_size"]), "wrote": None}))
-        run.perform((("run", ["omarchy-font-set", font]), ("font_size", font)))
-        done.append(f"Font: {font}")
+            data.TEXT_SIZE_STATE.write_text(json.dumps({"base": own, "wrote": own}))
+            run.set_plain_text_size(own)
+            done.append(f"Font: {font}, text size {own} px as set there")
+        else:
+            if "text_size" in chosen and manifest.get("text_size"):
+                data.TEXT_SIZE_STATE.parent.mkdir(parents=True, exist_ok=True)
+                data.TEXT_SIZE_STATE.write_text(json.dumps({"base": int(manifest["text_size"]), "wrote": None}))
+            run.perform((("run", ["omarchy-font-set", font]), ("font_size", font)))
+            done.append(f"Font: {font}")
     theme = match(as_here.get(current.get("theme", ""), current.get("theme", ""))) if current.get("theme") else None
     if theme:
         bg = current.get("background") or {}

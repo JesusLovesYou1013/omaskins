@@ -2121,6 +2121,40 @@ class ShareImport(unittest.TestCase):
         finally:
             data.current_font, run.perform, data.builtin_package = saved_font, saved_perform, saved_pkg
 
+    def test_a_text_size_set_with_omarchys_control_comes_back_as_set(self):
+        """OmaSkins sized a font (wrote 17), then you set 16 with Omarchy's own control: the export carries
+        16, and "Also apply" puts 16 back, not the 17 it would scale to (the owner's machine, 2026-10-08)."""
+        from omaskins import run
+        saved = (data.current_font, run.perform, data.builtin_package, run._set_terminal_size)
+        data.current_font = lambda: "JetBrainsMono Nerd Font"
+        data.builtin_package = lambda: ""
+        performed, terminals = [], []
+        run.perform = lambda steps, *a, **k: performed.extend(steps)
+        run._set_terminal_size = terminals.append
+        try:
+            write(data.TEXT_SIZE_STATE, json.dumps({"base": 14, "wrote": 17}))
+            write(HOME / ".config/omarchy/shell.toml", "[font]\nbase-size = 16\n")
+            manifest, _ = self.share.write_zip(self.zip, [])
+            self.assertEqual((manifest["text_size"], manifest["text_size_set"]), (14, 16))
+            data.TEXT_SIZE_STATE.unlink()
+            write(HOME / ".config/omarchy/shell.toml", "[font]\nbase-size = 12\n")
+            manifest = self.share.read_zip(self.zip)
+            rows = {r["id"]: r for r in self.share.items(manifest)}
+            self.assertEqual(rows["text_size"]["detail"], "16 px")
+            done, note, failed = self.share.run_import(self.zip, manifest, set(rows), apply=True)
+            self.assertEqual(failed, [], (done, note))
+            self.assertEqual(run.shell_base_size(), 16)
+            self.assertEqual(terminals, [12], "16 px is 12 pt, as Omarchy's own control sets it")
+            self.assertEqual(json.loads(data.TEXT_SIZE_STATE.read_text()), {"base": 16, "wrote": 16})
+            self.assertNotIn("font_size", [st[0] for st in performed], "not scaled for the font again")
+
+            # Not changed since OmaSkins sized it: nothing extra travels, and the old way applies.
+            write(data.TEXT_SIZE_STATE, json.dumps({"base": 14, "wrote": 16}))
+            manifest, _ = self.share.write_zip(self.zip, [])
+            self.assertIsNone(manifest["text_size_set"])
+        finally:
+            data.current_font, run.perform, data.builtin_package, run._set_terminal_size = saved
+
     def test_transparency_lands_on_the_same_levels_after_a_respacing(self):
         """An export records the levels; an import finds the step with those levels here."""
         for line, step in (("0.75 0.68 blur", 3), ("0.65 0.56 blur", 4), ("0.85 0.8 blur", 2), ("1 1 noblur", 0)):
