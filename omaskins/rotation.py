@@ -626,6 +626,7 @@ class QtApps:
         self.builder = None
         self.failed = None   # (stamp, why) of the last failed build: not retried until something changes
         self.rule_set = False
+        self.retry_until = 0.0
 
     def glance(self):
         try:
@@ -638,6 +639,9 @@ class QtApps:
         try:
             if qtstyle.marks_stamp() != self.marks:
                 self.marks = qtstyle.marks_stamp()
+                # An app leaves its marker before its window exists: keep looking for a few seconds.
+                self.retry_until = time.monotonic() + 8
+            if time.monotonic() < self.retry_until:
                 self.unfade()
         except Exception as e:
             log("Qt windows failed:", repr(e))

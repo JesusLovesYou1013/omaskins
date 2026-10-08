@@ -889,6 +889,11 @@ local function default_rule(a, b)
   end
   if key and not F.default[key] then
     F.default[key] = hl.window_rule({ match = { tag = "default-opacity" }, opacity = key })
+    -- Apps that draw their own transparency (tag "omaskins-qt": OmaSkins' Qt style, OmaShow...) keep
+    -- Hyprland's fade off: their rule has to stay newer than every default-opacity rule, so one more
+    -- is made with each new level (at most one per level, like the level rules).
+    F.own = F.own or {}
+    F.own[#F.own + 1] = hl.window_rule({ match = { tag = "omaskins-qt" }, opacity = "1 1" })
   end
 end
 local function nautilus(own, a, b)
@@ -949,9 +954,13 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
     before, after = data.transparency_values(data.transparency_step()), data.transparency_values(step)
     open_windows = clients()
     windows = [c["address"] for c in open_windows if "default-opacity" in _tags(c)   # Nautilus and file
-               and c.get("class") not in ("org.gnome.Nautilus", data.DIALOG_CLASS)]  # dialogs do their own
+               and c.get("class") not in ("org.gnome.Nautilus", data.DIALOG_CLASS)   # dialogs do their own,
+               and "omaskins-qt" not in _tags(c)]                                    # and so do marked apps
     # Tags left by the fade OmaSkins used before 2026-10-02 (a new set every move): cleared once.
     stale = {c["address"]: [t for t in _tags(c) if t.startswith("omaskins-t")] for c in open_windows}
+    # The step is published as the fade starts: apps that draw their own transparency from it (OmaShow)
+    # fade over the same 1.5 s, together with the windows, instead of jumping when it ends.
+    data.save_transparency(step)
     if after[2] and not before[2]:
         evaluate(data.TRANSPARENCY_BLUR)          # blur first, so it's there as the windows fade
     wl = _lua_list(windows)
@@ -983,7 +992,6 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
         open_windows = nautilus_windows()
         if open_windows:
             nautilus_restart(open_windows, evaluate, clients, sleep)
-    data.save_transparency(step)
     update_hypr_file()
 
 

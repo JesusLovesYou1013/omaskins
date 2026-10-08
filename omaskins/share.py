@@ -368,6 +368,9 @@ def collect(community):
         "current": current,
         "corners": {"on": on, "px": px},
         "transparency": data.transparency_step(),
+        # The levels themselves too: the steps can be re-spaced between versions (2026-10-02), and an import
+        # should land on the same look, not the same step number.
+        "transparency_values": data.transparency_line(data.transparency_step()),
         "qt_apps": qtstyle.enabled(),
         "text_size": text_size,
         "rotation": rotation,
@@ -556,8 +559,8 @@ def items(manifest):
     corners = manifest.get("corners") or {}
     settings = [
         ("corners", "Rounded Corners", bool(corners), f"{corners.get('px')} px" if corners.get("on") else "off"),
-        ("transparency", "Transparency", isinstance(manifest.get("transparency"), int),
-         f"step {int(manifest.get('transparency') or 0) + 1} of {len(data.TRANSPARENCY_STEPS)}"),
+        ("transparency", "Transparency", transparency_step_of(manifest) is not None,
+         f"step {(transparency_step_of(manifest) or 0) + 1} of {len(data.TRANSPARENCY_STEPS)}"),
         ("qt_apps", "Qt apps", isinstance(manifest.get("qt_apps"), bool), "on" if manifest.get("qt_apps") else "off"),
         ("text_size", "Text size", bool(manifest.get("text_size")), str(manifest.get("text_size") or "")),
         ("blueprints", "Aether blueprints", bool(manifest.get("aether_blueprints")),
@@ -1028,6 +1031,24 @@ def _password_work(add_pkgs, drop_pkgs, remove_themes, restore_themes, done, not
                         "cancelled password, or a download that failed)")
 
 
+def transparency_step_of(manifest):
+    """The step here with the levels the file was exported with (nearest one), else its step number."""
+    line = manifest.get("transparency_values")
+    if isinstance(line, str):
+        try:
+            a, b, blur = line.split()
+            a, b = float(a), float(b)
+        except ValueError:
+            pass
+        else:
+            def distance(i):
+                fa, fb, fblur = data.transparency_values(i)
+                return (abs(fa - a) + abs(fb - b), fblur != (blur == "blur"))
+            return min(range(len(data.TRANSPARENCY_STEPS)), key=distance)
+    step = manifest.get("transparency")
+    return step if isinstance(step, int) and 0 <= step < len(data.TRANSPARENCY_STEPS) else None
+
+
 def apply_look(manifest, chosen, as_here, pics, in_use, note):
     """"Also apply": the rotation that was in use, corners, text size and font, then the theme and the
     very background it had."""
@@ -1041,8 +1062,8 @@ def apply_look(manifest, chosen, as_here, pics, in_use, note):
         c = manifest["corners"]
         run.perform(data.corners_action(bool(c.get("on")), int(c.get("px") or data.CORNERS_DEFAULT)).steps)
         done.append("Corners as they were there")
-    step = manifest.get("transparency")
-    if "transparency" in chosen and isinstance(step, int) and 0 <= step < len(data.TRANSPARENCY_STEPS):
+    step = transparency_step_of(manifest)
+    if "transparency" in chosen and step is not None:
         run.perform(data.transparency_action(step).steps)
         done.append(f"Transparency: step {step + 1} of {len(data.TRANSPARENCY_STEPS)}")
     if "qt_apps" in chosen and isinstance(manifest.get("qt_apps"), bool):

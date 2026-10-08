@@ -1945,6 +1945,83 @@ class ShareImport(unittest.TestCase):
         self.assertFalse((mine / "hyprland.lua").exists(), "code-running files stay out")
         self.assertTrue(any("hyprland.lua" in n for n in note))
 
+    def test_every_setting_survives_export_reset_import(self):
+        """Every OmaSkins setting, set away from its default, exported, wiped and imported with everything
+        ticked and "Also apply": each one comes back (owner, 2026-10-03: double and triple check)."""
+        from omaskins import qtstyle, run
+        saved_font, saved_perform = data.current_font, run.perform
+        data.current_font = lambda: "JetBrainsMono Nerd Font"
+        data.shipped_builtins = lambda pkg: ["nord", "tokyo-night"]   # what Omarchy ships, in the sandbox
+        saved_pkg = data.builtin_package
+        data.builtin_package = lambda: "omarchy"
+        performed = []
+        run.perform = lambda steps, *a, **k: performed.extend(steps)
+        try:
+            # --- set every setting away from its default
+            write(data.CORNERS_FILE, data.corners_file_text(True, 20))
+            data.save_transparency(4)                       # step 5
+            qtstyle.save_enabled(False)                     # Qt apps off (on is the default)
+            write(data.TEXT_SIZE_STATE, json.dumps({"base": 15, "wrote": None}))
+            data.save_sort_mode("az")
+            data.set_hidden_in_omaskins("nord", True)   # not the theme in use (that one is never hidden)
+            write(data.AETHER_BLUEPRINTS / "sunset.json", '{"name": "sunset"}')
+            write(data.USER_BACKGROUNDS / "nord/mine.png", "my picture")
+            plan = data.RotationPlan("nord")
+            plan.themes, plan.backgrounds, plan.minutes, plan.mix, plan.dawn_dusk = True, True, 20, True, True
+            plan.checked["Dawn"], plan.checked["Dusk"] = ["nord"], ["aura"]
+            data.save_rotation_set("Evenings", plan)
+            data.save_rotation(plan)
+            before = {
+                "corners": data.corners_setting(), "step": data.transparency_step(),
+                "qt": qtstyle.enabled(), "text": json.loads(data.TEXT_SIZE_STATE.read_text())["base"],
+                "sort": data.sort_mode(), "hidden": data.hidden_in_omaskins(),
+                "sets": data.rotation_sets(), "rotation": data.load_rotation("nord").to_dict(),
+            }
+            manifest, _ = self.share.write_zip(self.zip, [])
+            self.assertEqual(manifest["transparency_values"], "0.65 0.56 blur", "the levels travel, not just a number")
+
+            # --- wipe all of it (a fresh machine as far as OmaSkins is concerned)
+            for f in (data.CORNERS_FILE, data.TRANSPARENCY_FILE, qtstyle.SETTING, data.TEXT_SIZE_STATE,
+                      data.UI_STATE, data.BUILTIN_STATE, data.ROTATION_FILE):
+                f.unlink(missing_ok=True)
+            data.ROTATION_SETS.unlink(missing_ok=True)
+            shutil.rmtree(data.AETHER_BLUEPRINTS, ignore_errors=True)
+            shutil.rmtree(data.USER_BACKGROUNDS / "nord", ignore_errors=True)
+            self.assertEqual((data.corners_setting(), data.transparency_step(), qtstyle.enabled()),
+                             ((False, None), data.TRANSPARENCY_DEFAULT, True), "really back to defaults")
+
+            # --- import everything, "Also apply"
+            manifest = self.share.read_zip(self.zip)
+            rows = {r["id"] for r in self.share.items(manifest)}
+            for wanted in ("corners", "transparency", "qt_apps", "text_size", "blueprints", "set:Evenings", "rotation",
+                           "hide:nord"):
+                self.assertIn(wanted, rows, f"an import row for {wanted}")
+            done, note, failed = self.share.run_import(self.zip, manifest, rows, apply=True)
+            self.assertEqual(failed, [], (done, note))
+
+            # --- each one is back (settings applied through their actions are checked as those actions)
+            self.assertIn(("apply_corners", True, 20), performed, "corners")
+            self.assertIn(("apply_transparency", 4), performed, "transparency: step 5")
+            self.assertIn(("qt_apps", False), performed, "Qt apps off")
+            self.assertEqual(json.loads(data.TEXT_SIZE_STATE.read_text())["base"], before["text"], "text size")
+            self.assertEqual(data.sort_mode(), before["sort"], "sort order")
+            self.assertIn("nord", data.hidden_in_omaskins(), "hidden built-in theme")
+            self.assertTrue((data.AETHER_BLUEPRINTS / "sunset.json").exists(), "Aether blueprint")
+            self.assertEqual((data.USER_BACKGROUNDS / "nord/mine.png").read_text(), "my picture", "own background")
+            self.assertEqual(data.rotation_sets()["Evenings"], before["sets"]["Evenings"], "saved rotation set")
+            back = data.load_rotation("nord").to_dict()
+            for key in ("themes", "backgrounds", "minutes", "mix", "dawn_dusk"):
+                self.assertEqual(back[key], before["rotation"][key], f"rotation: {key}")
+        finally:
+            data.current_font, run.perform, data.builtin_package = saved_font, saved_perform, saved_pkg
+
+    def test_transparency_lands_on_the_same_levels_after_a_respacing(self):
+        """An export records the levels; an import finds the step with those levels here."""
+        for line, step in (("0.75 0.68 blur", 3), ("0.65 0.56 blur", 4), ("0.85 0.8 blur", 2), ("1 1 noblur", 0)):
+            self.assertEqual(self.share.transparency_step_of({"transparency": 4, "transparency_values": line}), step, line)
+        self.assertEqual(self.share.transparency_step_of({"transparency": 2}), 2, "older files: the step number")
+        self.assertIsNone(self.share.transparency_step_of({}))
+
     def test_a_matching_name_merges_pictures_into_yours(self):
         mine = HOME / ".config/omarchy/themes/oil-paintings"
         write(mine / "colors.toml", 'accent = "#mine"\n')
@@ -2350,12 +2427,19 @@ for _, r in ipairs(rules) do
   local m = r.match and r.match.tag
   if r.on and r.opacity and (m == "default-opacity" or (m and tags["0xa"][m])) then seen = r.opacity end
 end
-print(#rules, on, table.concat(names, " "), seen)
+-- an app that draws its own transparency (tags: Omarchy's default-opacity + ours)
+local own = "none"
+for _, r in ipairs(rules) do
+  local m = r.match and r.match.tag
+  if r.on and r.opacity and (m == "default-opacity" or m == "omaskins-qt") then own = r.opacity end
+end
+print(#rules, on, table.concat(names, " "), seen, own)
 """
         lua.write_text(stand_in + body + report)
         out = subprocess.run(["lua", str(lua)], capture_output=True, text=True)
         self.assertEqual(out.stderr, "")
-        n, on, names, seen = out.stdout.rstrip("\n").split("\t")
+        n, on, names, seen, own = out.stdout.rstrip("\n").split("\t")
+        self.own_app = own   # what a window tagged "omaskins-qt" ends up with
         return int(n), int(on), names, seen
 
     def test_fade_to_step_3(self):
@@ -2381,6 +2465,16 @@ print(#rules, on, table.concat(names, " "), seen)
         self.assertEqual(seen, "0.8500 0.8000")
         self.assertEqual(names, "")
         self.assertEqual(rules - on, 1, "of our two default-opacity rules (step 3 and 5) only one is switched on")
+
+    def test_apps_doing_their_own_transparency_stay_out_of_the_fade(self):
+        """Owner, 2026-10-03: moving the slider faded OmaShow's whole window again (slides included)."""
+        write(HOME / ".config/hypr/looknfeel.lua", "-- looknfeel\n")
+        self.windows.append({"address": "0xq", "tags": ["default-opacity*", "omaskins-qt"]})
+        for step in (3, 4, 2, 4, 3):
+            self.fade(step)
+            self.assertFalse(any("0xq" in c for c in self.calls), "never given a fade level")
+            self.hyprland()
+            self.assertEqual(self.own_app, "1 1", f"after moving to step {step + 1}: its own rule is still the newest")
 
     def test_blur_on_the_strong_steps_and_back_to_omarchys_own(self):
         write(HOME / ".config/hypr/looknfeel.lua", "-- looknfeel\n")
@@ -2999,7 +3093,8 @@ class QtStyle(unittest.TestCase):
         (self.q.MARKS / "100").touch()
         (self.q.MARKS / "200").touch()   # closed since
         windows = [{"address": "0xa", "pid": 100, "tags": ["default-opacity*"]},
-                   {"address": "0xb", "pid": 100, "tags": ["omaskins-qt"]},        # done already
+                   {"address": "0xb", "pid": 100, "tags": ["default-opacity*", "omaskins-qt"]},   # done already (Omarchy's
+                   # own tag comes back from its rule: that must not make it "to do" again every few seconds)
                    {"address": "0xc", "pid": 300, "tags": ["default-opacity*"]}]   # another app: left alone
         calls = []
         changed = self.q.unfade_windows(lambda: windows, calls.append, alive=lambda pid: pid == 100)

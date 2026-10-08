@@ -238,8 +238,8 @@ def unfade_windows(clients, evaluate, alive=_alive):
         if c.get("pid") not in pids:
             continue
         tags = [t.rstrip("*") for t in c.get("tags", [])]
-        if WINDOW_TAG in tags and "default-opacity" not in tags:
-            continue
+        if WINDOW_TAG in tags:
+            continue   # done (Omarchy's own "default-opacity" tag comes back from its rule; ours overrides it)
         address = c["address"]
         evaluate(f"hl.dispatch(hl.dsp.window.tag({{ window = 'address:{address}', tag = '-default-opacity' }}))")
         if WINDOW_TAG not in tags:
