@@ -1497,6 +1497,28 @@ class ReadingChangesNothing(unittest.TestCase):
         data.export_plan(local[0], community, None, None)
         self.assertEqual(snapshot(HOME), before)
 
+    def test_the_window_floats_for_everyone_not_just_where_it_was_built(self):
+        """The plugin sets its own window rules (owner, 2026-10-08): they used to live only in the owner's
+        hand-edited hyprland.lua."""
+        from omaskins import run
+        sent = []
+        self.assertTrue(run.ensure_window_rules(sent.append))
+        code, = sent
+        for part in ('class = "^io.github.jesuslovesyou1013.omaskins$"', 'title = "^OmaSkins Manager$"',
+                     "float = true", "center = true", '"(monitor_w*0.7)", "(monitor_h*0.75)"',
+                     'title = "^OmaSkins preview$"', "border_size = 0", "if not omaskins_window_rules then"):
+            self.assertIn(part, code)
+        if shutil.which("lua"):
+            lua = SANDBOX / "rules.lua"
+            lua.write_text("rules = {}\nhl = { window_rule = function(r) rules[#rules + 1] = r end }\n"
+                           + code + code + "print(#rules, rules[1].float, rules[1].match.title)\n")
+            out = subprocess.run(["lua", str(lua)], capture_output=True, text=True).stdout.split()
+            self.assertEqual(out, ["2", "true", "^OmaSkins"] + ["Manager$"], "made once, however often it opens")
+        self.assertFalse(run.ensure_window_rules(lambda code: 1 / 0), "a desktop that won't answer never stops it")
+        launcher = (ROOT / "omaskins-manager").read_text()
+        self.assertLess(launcher.index("run.ensure_window_rules()"), launcher.index("from omaskins.app import main"),
+                        "set before the window exists")
+
     def test_import_lists_builtin_theme_changes_first(self):
         # Read from the source: importing app.py needs a display.
         src = (ROOT / "omaskins/app.py").read_text()

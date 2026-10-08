@@ -36,6 +36,11 @@ if "FONTCONFIG_FILE" not in os.environ:
         os.environ["FONTCONFIG_FILE"] = str(_conf)
         os.environ["OMASKINS_FONTCONFIG"] = "1"
 
+# OmaSkins' window floats, centred and sized: the rules are set before the window exists (run.py).
+from omaskins import run  # noqa: E402
+
+run.ensure_window_rules()
+
 from omaskins.app import main  # noqa: E402
 
 sys.exit(main())

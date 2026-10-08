@@ -801,6 +801,34 @@ def hypr_eval(code):
                           env=data.child_env()).stdout
 
 
+# OmaSkins' own window: floating, centred, 70% x 75% of the screen (Super+T still tiles it), and its big
+# picture view just the picture. Until 2026-10-08 this only worked on the owner's machine, from two rules
+# added by hand to their hyprland.lua; everyone else got a tiled window. Now the launcher sets the rules
+# live each time OmaSkins opens: no file is written, and they go when Hyprland next loads its config (its
+# Lua state, with this flag, is cleared then too, so the next launch sets them again).
+# render_unfocused: it may redraw on a hidden workspace, so a theme change never shows old colours when
+# you switch back (it only redraws when something changes: one redraw per theme change).
+WINDOW_RULES_LUA = """
+if not omaskins_window_rules then
+  omaskins_window_rules = true
+  hl.window_rule({ match = { class = "^io.github.jesuslovesyou1013.omaskins$", title = "^OmaSkins Manager$" },
+                   float = true, center = true, size = { "(monitor_w*0.7)", "(monitor_h*0.75)" },
+                   render_unfocused = true })
+  hl.window_rule({ match = { class = "^io.github.jesuslovesyou1013.omaskins$", title = "^OmaSkins preview$" },
+                   float = true, center = true, border_size = 0, no_shadow = true })
+end
+"""
+
+
+def ensure_window_rules(evaluate=None):
+    """Called by the launcher before the window exists. Never stops OmaSkins from opening."""
+    try:
+        (evaluate or hypr_eval)(WINDOW_RULES_LUA)
+        return True
+    except Exception:
+        return False
+
+
 def hypr_clients():
     try:
         return json.loads(subprocess.run(["hyprctl", "clients", "-j"], capture_output=True, text=True,
