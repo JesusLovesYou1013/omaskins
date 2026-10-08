@@ -3377,6 +3377,31 @@ class Uninstall(unittest.TestCase):
             self.assertEqual(looknfeel.read_text().rstrip("\n"), before.rstrip("\n"))
             self.assertFalse(self.u.strip_require(), "nothing left to take out")
 
+    def test_comments_older_versions_left_go_too(self):
+        looknfeel = HOME / ".config/hypr/looknfeel.lua"
+        old = "-- Added by OmaSkins Manager: Global Rounded Corners (switch it off in OmaSkins)."
+        looknfeel.write_text("-- yours\n-- })\n" + f"\n{old}\n" * 4 + f"\n{old}\n" + data.CORNERS_REQUIRE + "\n")
+        self.assertTrue(self.u.strip_require())
+        self.assertEqual(looknfeel.read_text(), "-- yours\n-- })\n", "as the real file was, 2026-10-08")
+
+    def test_an_open_window_is_closed_first(self):
+        killed = []
+        self.run.windows = [{"class": self.u.APP_CLASS, "pid": 4242, "address": "0x1", "tags": []},
+                            {"class": "org.gnome.Nautilus", "pid": 7, "address": "0x2", "tags": []}]
+        self.assertEqual(self.u.close_windows(self.run, kill=lambda pid, sig: killed.append(pid), wait=0), 1)
+        self.assertEqual(killed, [4242], "only OmaSkins' own window")
+
+    def test_the_question_is_wide_enough_to_read(self):
+        asked = []
+        keep, subprocess.run = subprocess.run, lambda argv, **k: asked.append(argv) or subprocess.CompletedProcess(argv, 0, "Keep this background\tx\n", "")
+        try:
+            self.assertEqual(self.u.ask("matte-black", "retro-82"), self.u.KEEP_BACKGROUND)
+        finally:
+            subprocess.run = keep
+        argv = asked[0]
+        self.assertEqual(argv[-3:], ["--", "--width", "720"], "Omarchy's default 300 px cut the first row off")
+        self.assertIn("Keep the Matte Black theme", argv[2])
+
     def test_everything_back_and_nothing_left(self):
         before = {k: v[0] for k, v in snapshot(HOME).items()}
         texts = {p: (HOME / p).read_text() for p in (".config/hypr/looknfeel.lua", ".config/gtk-4.0/gtk.css",

@@ -25,6 +25,7 @@ import fcntl
 import os
 import random
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -50,6 +51,8 @@ sys.exit(main(sys.argv[1:]))
 """
 WAIT_GONE = 10        # seconds to see the plugin's folder go; still there = only switched off
 KEEP_THEME, KEEP_BACKGROUND = "theme", "background"
+MENU_WIDTH = 720      # px, for the "keep which?" menu
+APP_CLASS = "io.github.jesuslovesyou1013.omaskins"
 
 
 # --------------------------------------------------------------------------- the copy outside the plugin
@@ -117,8 +120,9 @@ def wait_for_engine(wait=5.0, sleep=time.sleep):
 # --------------------------------------------------------------------------- the look, back to Omarchy's
 
 def strip_require(looknfeel=None):
-    """OmaSkins' line (and the comment above it) out of looknfeel.lua; everything else as it was.
-    True when the file changed."""
+    """OmaSkins' line and every comment OmaSkins put above it out of looknfeel.lua; everything else as
+    it was. Earlier versions added their comment again without the line (2026-10-08: a real file had
+    five), so every such comment goes, wherever it sits. True when the file changed."""
     looknfeel = Path(looknfeel or data.HYPR_DIR / "looknfeel.lua")
     try:
         lines = looknfeel.read_text().split("\n")
@@ -126,9 +130,7 @@ def strip_require(looknfeel=None):
         return False
     out = []
     for line in lines:
-        if line.strip() == data.CORNERS_REQUIRE:
-            if out and out[-1].startswith("-- Added by OmaSkins Manager"):
-                out.pop()
+        if line.strip() == data.CORNERS_REQUIRE or line.startswith("-- Added by OmaSkins Manager"):
             while out and out[-1] == "":     # the blank line OmaSkins put before its comment
                 out.pop()
             continue
@@ -272,9 +274,12 @@ def ask(theme, owner):
     keep_theme = f"Keep the {data.display_name(theme)} theme"
     keep_bg = "Keep this background"
     try:
-        r = subprocess.run(["omarchy-menu-select", "OmaSkins removed: theme and background don't match",
+        # Omarchy's menu is 300 px unless told: too narrow for these rows (owner, 2026-10-08: the first
+        # one was cut off mid-word). Wide enough for the longest theme name at a large text size.
+        r = subprocess.run(["omarchy-menu-select", "Theme and background don't match. Keep which?",
                             f"\U000F03D8\t{keep_theme}\twith one of its own backgrounds",
-                            f"\U000F02E9\t{keep_bg}\tand switch to its theme, {data.display_name(owner)}"],
+                            f"\U000F02E9\t{keep_bg}\tand switch to its theme, {data.display_name(owner)}",
+                            "--", "--width", str(MENU_WIDTH)],
                            capture_output=True, text=True, timeout=600, env=data.child_env())
     except (OSError, subprocess.SubprocessError):
         return None
@@ -327,7 +332,28 @@ def delete_own(folders=None):
 
 # --------------------------------------------------------------------------- all of it
 
+def close_windows(run=None, kill=os.kill, wait=3.0, sleep=time.sleep):
+    """An OmaSkins window still open would go on writing its cache (2026-10-08: ~/.cache/omaskins came
+    back that way), and it runs from a folder that no longer exists: it's closed first."""
+    if run is None:
+        from . import run
+    pids = {int(c["pid"]) for c in run.hypr_clients() if c.get("class") == APP_CLASS and c.get("pid")}
+    for pid in pids:
+        try:
+            kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    end = time.monotonic() + wait
+    while pids and time.monotonic() < end and any(c.get("class") == APP_CLASS for c in run.hypr_clients()):
+        sleep(0.2)
+    return len(pids)
+
+
 def uninstall(run=None, choose=ask, notify=None, log=print):
+    try:
+        close_windows(run)
+    except Exception as e:
+        log(f"closing OmaSkins' window: {e!r}")
     failed = restore_look(run, log)
     try:
         still_removed = restore_builtins(run, log)
