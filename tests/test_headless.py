@@ -1484,7 +1484,7 @@ class GlobalCorners(unittest.TestCase):
             self.run_action(True, 10)
 
 
-class PrototypeChangesNothing(unittest.TestCase):
+class ReadingChangesNothing(unittest.TestCase):
     def test_reading_everything_leaves_home_untouched(self):
         build_fixture()
         before = snapshot(HOME)

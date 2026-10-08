@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# omarchy:summary=OmaSkins Manager — browse and manage Omarchy themes, backgrounds and fonts (prototype)
+# omarchy:summary=OmaSkins Manager — browse and manage Omarchy themes, backgrounds and fonts
 import os
 import sys
 

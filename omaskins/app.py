@@ -1,7 +1,7 @@
 """OmaSkins Manager — browse and manage Omarchy themes, backgrounds and fonts.
 
-PROTOTYPE: every button is real-looking but only shows the Omarchy command it
-would run. Nothing on the system is changed (see data.py).
+The window only. Whatever changes the system goes through run.py and its allow-list;
+data.py describes each action (see `Action`) and reads everything shown here.
 """
 
 import itertools
@@ -29,7 +29,6 @@ APP_ID = "io.github.jesuslovesyou1013.omaskins"
 TITLE = "OmaSkins Manager"
 CHECK = "\U000f012c"  # nf-md-check — a plain mark, never a checkbox (same as OmaPlugs)
 CARD_W, CARD_H = 272, 153  # 16:9, the shape of omarchy.org screenshots
-PROTOTYPE_NOTE = "Prototype"  # until it is packaged and installable from GitHub (owner, 2026-10-02)
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -2228,8 +2227,7 @@ class Window(Adw.ApplicationWindow):
 
         frame = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         frame.add_css_class("frame-root")
-        frame.set_overflow(Gtk.Overflow.HIDDEN)  # the banner is clipped to the frame's rounded corners
-        frame.append(label(PROTOTYPE_NOTE, "prototype-banner", wrap=True))
+        frame.set_overflow(Gtk.Overflow.HIDDEN)  # clipped to the frame's rounded corners
         frame.append(self.stack)
         self.toasts = Adw.ToastOverlay()
         self.toasts.set_child(frame)
@@ -2959,7 +2957,7 @@ class Window(Adw.ApplicationWindow):
             self.toasts.add_toast(Adw.Toast(title=text, timeout=4))
         bg(lambda: data.save_to_pictures(bgd.path, pictures), done)
 
-    # ---- the prototype's one "action"
+    # ---- a theme card's right-click action
     def quick_theme_action(self, entry):
         """The one thing a theme card's right-click menu offers: Add, Remove or Restore."""
         if entry.removed:
@@ -2994,7 +2992,7 @@ class Window(Adw.ApplicationWindow):
             if a.steps:
                 self._perform(a, on_done)
                 return
-            self.toasts.add_toast(Adw.Toast(title=f"Prototype, nothing changed. Would run: {a.command}", timeout=6))
+            self.toasts.add_toast(Adw.Toast(title=f"Nothing changed. Would run: {a.command}", timeout=6))
             if on_done:
                 on_done()
         if a.password and not explained:  # always asked, even from right-click: say why a password will come up
@@ -3003,7 +3001,7 @@ class Window(Adw.ApplicationWindow):
                                      f"This {'will' if a.steps else 'would'} run:\n\n{a.command}"
                                      + ("\n\nA terminal opens for your password; OmaSkins carries on once it's done."
                                         if any(st[0] == "terminal" for st in a.steps)
-                                        else "" if a.steps else "\n\n(Prototype: nothing will actually change.)"))
+                                        else "" if a.steps else "\n\n(Nothing will actually change.)"))
             d.add_response("cancel", "Cancel")
             d.add_response("ok", a.label)
             d.set_response_appearance("ok", Adw.ResponseAppearance.DESTRUCTIVE if a.label in ("Remove", "Hide")
@@ -3014,7 +3012,7 @@ class Window(Adw.ApplicationWindow):
             d.present(self)
         elif a.label == "Remove" and confirm:
             note = f"{a.note}\n\n" if a.note else ""
-            tail = "" if a.steps else "\n\n(Prototype: nothing will actually be removed.)"
+            tail = "" if a.steps else "\n\n(Nothing will actually be removed.)"
             d = Adw.AlertDialog(heading="Remove?", body=f"{note}This {'will' if a.steps else 'would'} run:\n\n"
                                                          f"{a.command}{tail}")
             d.add_response("cancel", "Cancel")

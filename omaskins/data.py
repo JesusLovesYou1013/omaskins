@@ -1,11 +1,9 @@
-"""Read-only data for OmaSkins: themes, backgrounds, fonts, and what an export would hold.
+"""What OmaSkins knows: themes, backgrounds, fonts, its own settings, and what an export holds.
 
-PROTOTYPE RULE: nothing in this module changes the system. It reads Omarchy's
-theme folders, asks fontconfig/pacman what is installed, and downloads public
-pages and screenshots into its own cache (~/.cache/omaskins). Every "action"
-only *describes* the Omarchy command it would run (see `Action`); the UI shows
-that text instead of running it. The one exception is `save_to_pictures`, which
-copies a background into ~/Pictures on request (never overwriting anything).
+It reads Omarchy's theme folders, asks fontconfig/pacman what is installed, and downloads public
+pages and screenshots into its own cache (~/.cache/omaskins). Every `Action` describes one thing a
+button does: the text shown before it runs, and the `steps` run.py carries out (run.py's allow-list
+decides what may run at all). OmaSkins' own settings files are written here.
 
 Where things live (Omarchy 4.x):
     /usr/share/omarchy/themes/<name>/          built-in themes ($OMARCHY_PATH/themes)
@@ -77,13 +75,13 @@ SWATCH_KEYS = ("background", "foreground", "accent", "selection", "red", "yellow
 
 @dataclass
 class Action:
-    """What a button *would* do. The prototype shows `command` and runs nothing."""
+    """What a button does: `command` is shown to you first, `steps` is what run.perform() carries out."""
     label: str
     command: str
     note: str = ""        # extra line for the confirmation dialog
     blocked: str = ""     # set = the button is greyed out, and this says why
     password: str = ""    # set = it asks for your password, and this says why (always confirmed first)
-    steps: tuple = ()     # set = LIVE: what run.perform() really does; empty = prototype, shown only
+    steps: tuple = ()     # what run.perform() really does; empty = shown only (a blocked action)
     busy: str = ""        # shown while a live action runs, e.g. "Applying Nord…"
     done: str = ""        # shown when it worked (default: "<label>: done")
     bar: int = -1         # >= 0: the busy toast carries an ASCII progress bar starting at this percent
@@ -1375,8 +1373,7 @@ def background_actions(bg, theme_name):
 def save_to_pictures(src, pictures):
     """Copy a background's original file into `pictures`, byte for byte (full quality).
 
-    The one real action in the prototype (owner's request). Never overwrites: a different
-    file with the same name gets "-2", "-3"... Returns (destination, already_there).
+    Never overwrites: a different file with the same name gets "-2", "-3"... Returns (destination, already_there).
     """
     src, pictures = Path(src), Path(pictures)
     pictures.mkdir(parents=True, exist_ok=True)
@@ -1590,7 +1587,7 @@ def export_plan(theme, community, background, font, fonts_pkgs=None):
 
 
 def export_summary_json(items):
-    """The manifest the zip would carry (shown in the prototype, never written)."""
+    """The manifest the zip would carry (shown before exporting, never written by this)."""
     return json.dumps({"format": "omaskins-share/1",
                        "items": [{"kind": i.kind, "name": i.name, "how": i.how, "detail": i.detail} for i in items]},
                       indent=2)
@@ -1622,7 +1619,7 @@ def thumbnail(src, width=480):
         return src
 
 
-# --------------------------------------------------------------------------- rotation (prototype: in memory only)
+# --------------------------------------------------------------------------- rotation
 
 # Dawn & Dusk follow the sun where you are: sunrise to sunset is Dawn's theme set, sunset to sunrise
 # Dusk's. Where you are = the weather widget's location (Omarchy's own setting, with coordinates), else

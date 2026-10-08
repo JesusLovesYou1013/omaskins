@@ -347,7 +347,6 @@ dialog .dialog-host, floating-sheet, dialog sheet {{ border-radius: 0; }}
 toast {{ background: {bg}; color: {fg}; border: 1px solid {frame}; border-radius: 0; }}
 
 /* ---- OmaSkins additions ---- */
-.prototype-banner {{ background: {rgba(accent, 0.12)}; color: {accent}; padding: 6px 18px; }}
 
 /* sub-tabs (Browse / Installed) sit under the main tabs, smaller and quieter */
 .subtabbar {{ padding: 6px 18px 6px 18px; }}

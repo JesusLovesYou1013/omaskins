@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.jesuslovesyou1013.omaskins",
   "name": "OmaSkins",
-  "version": "0.5.0",
+  "version": "1.0.0",
   "author": "JesusLovesYou1013",
   "license": "GPL-3.0",
   "description": "Browse and manage Omarchy themes, backgrounds and fonts, and rotate themes and backgrounds on a schedule that keeps running with the app closed, with separate day and night theme sets. Pauses while the screen is locked or the screensaver runs.",
@@ -16,7 +16,7 @@
   },
   "barWidget": {
     "displayName": "OmaSkins",
-    "description": "Next theme or background, or open OmaSkins",
+    "description": "Next theme or background, pause either one, or open OmaSkins",
     "category": "Appearance",
     "allowMultiple": false,
     "defaultSection": "right"
