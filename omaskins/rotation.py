@@ -12,7 +12,9 @@ A slot is skipped (nothing changes; the next slot tries again) when:
 - you arrived at the desktop (login, reboot, waking from sleep) less than GRACE ago;
 - it's the first slot after you picked a theme or background yourself with Omarchy's own switchers
   (left untouched; the engine only notices the change): your pick skips the next rotation, and a
-  notification says until when it stays.
+  notification says until when it stays;
+- it's the first slot after you pressed Next theme or Next background in the bar's palette menu:
+  you stopped on one you like, so it stays through that slot too (no notification).
 
 What a slot changes, and how:
 - Only the backgrounds you picked, the way you picked them: themes change with Omarchy's
@@ -414,8 +416,9 @@ _ENABLED = {}
 # --------------------------------------------------------------------------- skip ahead (the bar's palette menu)
 #
 # The palette menu asks the running engine (one writer for the rotation's state): it leaves the request in
-# REQUEST and the engine carries it out within half a second. Skipping ahead is the rotation moving on early,
-# not "your pick": the schedule carries on as before (no pause, no notification).
+# REQUEST and the engine carries it out within half a second. What you stop on is your pick: the next
+# slot is skipped, as after Omarchy's own switchers, so a Next pressed two minutes before a slot is not
+# replaced two minutes later (owner, 2026-10-08). No notification: Next is often pressed several times.
 REQUEST = Path(os.environ.get("XDG_RUNTIME_DIR") or data.OMASKINS_STATE) / "omaskins-next"
 WHATS = ("theme", "background")
 
@@ -463,8 +466,9 @@ def all_themes():
 
 def skip_ahead(desktop, what, rng=random, now=None):
     """The next theme or background now. From the rotation's own lists, in its no-repeat rounds, when it
-    rotates that; otherwise Omarchy's own next background, or the next installed theme (Omarchy's own
-    apply, which picks its background as usual)."""
+    rotates that; otherwise Omarchy's own next background, or the next installed theme. Palette
+    "Next theme" keeps the wallpaper (colours only); "Next background" never changes the theme.
+    Either one skips the next rotation slot."""
     now = time.time() if now is None else now
     st = load_state()
     theme = data.current_theme_name()
@@ -475,21 +479,24 @@ def skip_ahead(desktop, what, rng=random, now=None):
     themes = [n for n in plan.checked.get(plan.period_now(time.localtime(now)), []) if installed_theme(n)]
     ok = False
     if what == "theme":
+        pick, from_rotation = None, False
         if plan.themes and [n for n in themes if n != theme]:
             pick = choose(themes, st["theme_shown"], theme, rng, key=str)
-            bg = choose(plan.pool(pick), [], None, rng) if plan.backgrounds else None
-            if real(data.STATE_DIR / "background") != current and os.path.isfile(current):
-                desktop.set_background(current)   # off Omarchy's copy of the old theme first (no visible change)
-            ok = desktop.set_theme(pick, bg)
-            if ok:
-                st["theme_shown"].append(pick)
+            from_rotation = True
         else:
             names = all_themes()
             if theme in names and len(names) > 1:
                 pick = names[(names.index(theme) + 1) % len(names)]
             else:
                 pick = names[0] if names else None
-            ok = bool(pick) and desktop.apply_theme(pick)
+        if pick:
+            # Off Omarchy's copy of the old theme first (no visible change), then colours only —
+            # wallpaper stays (palette "Next theme"; scheduled change()/mix_it_up still pair as before).
+            if real(data.STATE_DIR / "background") != current and os.path.isfile(current):
+                desktop.set_background(current)
+            ok = desktop.set_theme(pick, None)
+            if ok and from_rotation:
+                st["theme_shown"].append(pick)
         if ok:
             theme = data.current_theme_name()
             current = canonical_background(theme)
@@ -506,8 +513,10 @@ def skip_ahead(desktop, what, rng=random, now=None):
                 st["bg_shown"].append(current)
     if ok:
         log("skipped ahead:", what, theme, current)
-        # The engine's own change: not counted as your pick (no pause of the schedule).
-        st.update(last_theme=theme, last_bg=current, last_change={"at": now, "theme": theme, "path": current})
+        # The engine made the change (last_theme / last_bg, so tick() doesn't see it as a switcher
+        # pick and notify), but you asked for it: it stays through the next slot.
+        st.update(last_theme=theme, last_bg=current, last_change={"at": now, "theme": theme, "path": current},
+                  pick_skip=next(slot_times(now, plan.minutes), None))
         save_state(st)
     return ok
 

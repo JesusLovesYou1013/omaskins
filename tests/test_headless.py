@@ -2810,7 +2810,7 @@ class SkipAhead(unittest.TestCase):
                 self.did = []
 
             def set_theme(self, name, background=None):
-                self.did.append(("rotation theme", name))
+                self.did.append(("rotation theme", name, background))
                 write(data.STATE_DIR / "theme.name", name)
                 return True
 
@@ -2828,22 +2828,47 @@ class SkipAhead(unittest.TestCase):
                 return True
         self.desk = FakeDesktop()
 
-    def test_without_rotation_omarchys_own_next(self):
+    def test_without_rotation_theme_only_then_omarchy_bg_next(self):
         names = self.r.all_themes()
         self.assertGreater(len(names), 1)
         write(data.STATE_DIR / "theme.name", names[0])
         self.assertTrue(self.r.skip_ahead(self.desk, "theme"))
-        self.assertEqual(self.desk.did, [("omarchy theme", names[1])], "the next theme by name, Omarchy's apply")
+        theme_calls = [c for c in self.desk.did if c[0] == "rotation theme"]
+        self.assertEqual(theme_calls, [("rotation theme", names[1], None)],
+                         "next installed theme by name; wallpaper kept (no Omarchy apply)")
+        self.assertFalse(any(c[0] == "omarchy theme" for c in self.desk.did),
+                         "must not use apply_theme (that would pick a new background)")
+        # Rebase onto the theme's own file is OK; a *new* wallpaper pick is not.
+        new_bgs = [c for c in self.desk.did if c[0] == "background"]
+        self.assertTrue(all(Path(c[1]).is_file() for c in new_bgs))
+        self.desk.did.clear()
         self.assertTrue(self.r.skip_ahead(self.desk, "background"))
         self.assertEqual(self.desk.did[-1], ("omarchy next background",))
 
-    def test_not_counted_as_your_pick(self):
+    def test_next_theme_stays_through_the_next_slot(self):
         names = self.r.all_themes()
         write(data.STATE_DIR / "theme.name", names[0])
-        self.r.skip_ahead(self.desk, "theme")
+        now = time.mktime((2026, 10, 8, 9, 18, 0, 0, 0, -1))      # two minutes before a 20-minute slot
+        plan = data.RotationPlan(names[0])
+        plan.minutes = 20
+        data.save_rotation(plan)
+        self.r.skip_ahead(self.desk, "theme", now=now)
         st = data.rotation_status()
-        self.assertEqual(st["last_theme"], names[1], "the engine's own change: the schedule carries on")
-        self.assertNotIn("pick_skip", st)
+        self.assertEqual(st["last_theme"], names[1], "the engine's own change: tick() sees no switcher pick")
+        slot = time.mktime((2026, 10, 8, 9, 20, 0, 0, 0, -1))
+        self.assertEqual(st["pick_skip"], slot, "9:18 Next -> the 9:20 slot is skipped")
+        self.assertEqual(self.r.next_change(now, st, 20), slot + 20 * 60, "first change after it: 9:40")
+
+    def test_next_background_stays_through_the_next_slot(self):
+        names = self.r.all_themes()
+        write(data.STATE_DIR / "theme.name", names[0])
+        now = time.mktime((2026, 10, 8, 9, 18, 0, 0, 0, -1))
+        plan = data.RotationPlan(names[0])
+        plan.minutes = 20
+        data.save_rotation(plan)
+        self.assertTrue(self.r.skip_ahead(self.desk, "background", now=now))
+        st = data.rotation_status()
+        self.assertEqual(st["pick_skip"], time.mktime((2026, 10, 8, 9, 20, 0, 0, 0, -1)))
 
     def test_with_theme_rotation_its_own_list(self):
         names = self.r.all_themes()[:3]
@@ -2855,6 +2880,36 @@ class SkipAhead(unittest.TestCase):
         self.r.skip_ahead(self.desk, "theme")
         self.assertEqual(self.desk.did[-1][0], "rotation theme")
         self.assertIn(self.desk.did[-1][1], names[1:], "one of the rotation's themes, not the current one")
+        self.assertIsNone(self.desk.did[-1][2], "palette next theme: no paired background")
+
+    def test_theme_skip_keeps_wallpaper_even_when_backgrounds_rotate(self):
+        """Regression: with Backgrounds (and Mix) on, palette Next theme used to pair a new bg."""
+        # Use themes that actually ship backgrounds in the fixture (aura + tokyo-night + nord builtin).
+        names = ["aura", "tokyo-night", "nord"]
+        plan = data.RotationPlan(names[0])
+        plan.themes = True
+        plan.backgrounds = True
+        plan.mix = True
+        plan.checked["All day"] = list(names)
+        # Leave theme_picks empty: pool() treats unchecked picks as "all backgrounds of that theme".
+        data.save_rotation(plan)
+        write(data.STATE_DIR / "theme.name", names[0])
+        # Point the link at aura's own file so rebase (if any) is unambiguous.
+        aura_bg = HOME / ".config/omarchy/themes/aura/backgrounds/aura-1.jpg"
+        link = data.STATE_DIR / "background"
+        link.unlink(missing_ok=True)
+        link.symlink_to(aura_bg)
+        before_bg = self.r.canonical_background(names[0])
+        self.assertTrue(self.r.skip_ahead(self.desk, "theme"))
+        theme_calls = [c for c in self.desk.did if c[0] == "rotation theme"]
+        self.assertEqual(len(theme_calls), 1)
+        self.assertIn(theme_calls[0][1], names[1:])
+        self.assertIsNone(theme_calls[0][2], "set_theme(..., None): colours only")
+        # Any set_background must be rebase to the *same* wallpaper, not a fresh choose() pick.
+        for c in self.desk.did:
+            if c[0] == "background":
+                self.assertEqual(os.path.realpath(c[1]), os.path.realpath(before_bg),
+                                 "rebase only; must not pick a new background")
 
     def test_asks_the_running_engine(self):
         import fcntl
