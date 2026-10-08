@@ -14,7 +14,9 @@ A slot is skipped (nothing changes; the next slot tries again) when:
   (left untouched; the engine only notices the change): your pick skips the next rotation, and a
   notification says until when it stays;
 - it's the first slot after you pressed Next theme or Next background in the bar's palette menu:
-  you stopped on one you like, so it stays through that slot too (no notification).
+  you stopped on one you like, so it stays through that slot too (no notification);
+- you paused it in the palette menu. Themes and backgrounds pause separately (data.rotation_paused):
+  with one paused the other keeps taking its turns; with both paused nothing changes until you resume.
 
 What a slot changes, and how:
 - Only the backgrounds you picked, the way you picked them: themes change with Omarchy's
@@ -326,6 +328,9 @@ def tick(desktop, now=None, rng=random):
 
     others = [n for n in themes if n != theme]
     pool = plan.pool(theme) if plan.backgrounds else []
+    paused = data.rotation_paused()
+    all_paused = not ((plan.themes and "theme" not in paused) or (plan.backgrounds and "background" not in paused))
+    st["paused"] = sorted(paused)
     minutes = plan.minutes
     slot = time.strftime("%Y-%m-%d %H:%M", clock) if minute_of_day(clock) % minutes == 0 else None
     landed = plan.running() and slot and slot != st.get("last_slot")
@@ -347,14 +352,15 @@ def tick(desktop, now=None, rng=random):
         # (18:05:00.4), which made "at or before the skipped 18:05" false and a pick got cut short.
         slot_at = time.mktime(clock[:5] + (0, 0, 0, -1))
         reason = (away or
-                  ("you just arrived" if slot_at - st.get("session_start", 0) <= GRACE else
+                  ("you paused it" if all_paused else
+                   "you just arrived" if slot_at - st.get("session_start", 0) <= GRACE else
                    "your own pick" if slot_at <= (st.get("pick_skip") or 0) else
                    "you just came back" if slot_at - st.get("away_at", 0) <= GRACE else ""))
         if reason:
             log("slot skipped:", reason)
             st["last_skip"] = {"at": now, "reason": reason}
         else:
-            theme, current = change(desktop, plan, st, theme, current, themes, others, pool, rng, now)
+            theme, current = change(desktop, plan, st, theme, current, themes, others, pool, rng, now, paused)
 
     st.update(
         status="running" if plan.running() else "off",
@@ -370,7 +376,7 @@ def tick(desktop, now=None, rng=random):
     return st
 
 
-def change(desktop, plan, st, theme, current, themes, others, pool, rng, now):
+def change(desktop, plan, st, theme, current, themes, others, pool, rng, now, paused=frozenset()):
     """What one slot changes (owner's design, one interval for both switches):
     - Backgrounds only: the next bright background, a round of all of them before any repeats.
     - Themes only: the next theme; your background stays.
@@ -378,14 +384,19 @@ def change(desktop, plan, st, theme, current, themes, others, pool, rng, now):
       comes in with one of its own.
     - Whenever the current theme isn't in the list that applies now (Dawn, Dusk or the everyday one,
       e.g. you just took it out, or Dusk began), the slot changes the theme.
-    - Mix it up! (with both on): see mix_it_up()."""
-    if plan.mix and plan.themes and plan.backgrounds:
+    - Mix it up! (with both on): see mix_it_up().
+    - Paused in the palette menu (`paused`): that one sits its turns out. Themes paused: the theme stays
+      and its backgrounds keep taking turns, round after round. Backgrounds paused: every slot is the
+      next theme's, and your background stays."""
+    themes_on = plan.themes and "theme" not in paused
+    bgs_on = plan.backgrounds and "background" not in paused
+    if plan.mix and themes_on and bgs_on:
         return mix_it_up(desktop, plan, st, theme, current, themes, others, rng, now)
     bg_left = [p for p in pool if real(p) not in st["bg_shown"] and real(p) != current]
-    theme_turn = plan.themes and others and (not plan.backgrounds or theme not in themes or not bg_left)
+    theme_turn = themes_on and others and (not bgs_on or theme not in themes or not bg_left)
     if theme_turn:
         pick = choose(themes, st["theme_shown"], theme, rng, key=str)
-        bg = choose(plan.pool(pick), [], None, rng) if plan.backgrounds else None
+        bg = choose(plan.pool(pick), [], None, rng) if bgs_on else None
         if real(data.STATE_DIR / "background") != current and os.path.isfile(current):
             # The link points at Omarchy's copy of the current theme, which the new theme replaces:
             # point it at the same picture in the theme's own folder first (no visible change).
@@ -398,7 +409,7 @@ def change(desktop, plan, st, theme, current, themes, others, pool, rng, now):
                       last_change={"at": now, "theme": theme, "path": current})
         else:
             log("omarchy-theme-set failed:", pick)
-    elif plan.backgrounds:
+    elif bgs_on:
         bg = choose(pool, st["bg_shown"], current, rng)
         if bg and desktop.set_background(bg):
             current = real(bg)
@@ -788,8 +799,11 @@ def main(argv):
         return 0
     if len(argv) == 2 and argv[0] == "next":
         return 0 if request_next(argv[1]) else 1
+    if len(argv) == 2 and argv[0] in ("pause", "resume"):
+        return 0 if data.set_rotation_paused(argv[1], argv[0] == "pause") is not None else 1
     if argv == ["status"]:
         print(json.dumps(data.rotation_status(), indent=1, sort_keys=True))
         return 0
-    print("usage: omaskins-rotate run [--plugin-id <id>] | tick | status | next theme|background", file=sys.stderr)
+    print("usage: omaskins-rotate run [--plugin-id <id>] | tick | status | next theme|background"
+          " | pause theme|background | resume theme|background", file=sys.stderr)
     return 2

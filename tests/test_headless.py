@@ -791,6 +791,52 @@ class ClockThemeRotation(ClockBase):
         self.assertEqual(self.d.set, [before], "only the same-picture re-point, never another image")
         self.assertEqual(os.path.realpath(data.STATE_DIR / "background"), before)
 
+    def test_paused_themes_keep_the_theme_and_its_backgrounds_take_turns(self):
+        self.themes_on(backgrounds=True)
+        data.set_rotation_paused("theme", True)
+        self.addCleanup(data.ROTATION_PAUSED.unlink, missing_ok=True)
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 40))                       # far more slots than tokyo-night has pictures
+        self.assertEqual(self.d.themes, [], "themes are paused: tokyo-night stays")
+        self.assertGreaterEqual(len(self.d.set), 8, "its backgrounds keep changing, round after round")
+        self.assertTrue(set(self.d.set) <= set(self.tn.values()), "only tokyo-night's own pictures")
+
+    def test_paused_backgrounds_keep_the_picture_and_themes_take_turns(self):
+        self.themes_on(backgrounds=True)
+        data.set_rotation_paused("background", True)
+        self.addCleanup(data.ROTATION_PAUSED.unlink, missing_ok=True)
+        before = self.r.canonical_background("tokyo-night")
+        self.arrive(at(8, 30))
+        self.run_until(at(9, 10))
+        self.assertEqual(len(self.d.themes), 3, "every slot is a theme's turn")
+        self.assertTrue(all(bg is None for _, bg in self.d.themes), "no theme brings a background")
+        self.assertEqual(os.path.realpath(data.STATE_DIR / "background"), before)
+
+    def test_both_paused_nothing_changes_until_resumed(self):
+        self.themes_on(backgrounds=True)
+        data.set_rotation_paused("theme", True)
+        data.set_rotation_paused("background", True)
+        self.addCleanup(data.ROTATION_PAUSED.unlink, missing_ok=True)
+        self.arrive(at(8, 30))
+        st = self.run_until(at(9, 20))
+        self.assertEqual((self.d.themes, self.d.set), ([], []))
+        self.assertEqual(st["last_skip"]["reason"], "you paused it")
+        self.assertEqual(st["paused"], ["background", "theme"])
+        data.set_rotation_paused("background", False)
+        self.run_until(at(9, 30))
+        self.assertTrue(self.d.set, "resumed: backgrounds change again")
+        self.assertEqual(self.d.themes, [], "themes are still paused")
+
+    def test_pause_and_resume_from_the_command_line(self):
+        self.addCleanup(data.ROTATION_PAUSED.unlink, missing_ok=True)
+        self.assertEqual(self.r.main(["pause", "theme"]), 0)
+        self.assertEqual(self.r.main(["pause", "background"]), 0)
+        self.assertEqual(data.ROTATION_PAUSED.read_text(), "theme background\n", "what the palette menu reads")
+        self.assertEqual(self.r.main(["resume", "theme"]), 0)
+        self.assertEqual(data.rotation_paused(), {"background"})
+        self.assertEqual(self.r.main(["pause", "wallpaper"]), 1)
+        self.assertEqual(data.rotation_paused(), {"background"}, "an unknown word changes nothing")
+
     def test_both_cycle_the_themes_backgrounds_then_the_next_theme(self):
         self.themes_on(backgrounds=True)
         self.plan.checked["All day"] = ["tokyo-night", "aura"]

@@ -1895,6 +1895,31 @@ class RotationPlan:
 # OmaSkins closed. The engine's own bookkeeping (timers, what was shown) lives in ROTATION_STATE.
 ROTATION_FILE = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omaskins" / "rotation.json"
 ROTATION_STATE = OMASKINS_STATE / "rotation-state.json"
+# What the bar's palette menu paused: "theme", "background", both or nothing, on one line. Its own small
+# file (not rotation.json, your settings, nor the engine's state): the menu's command writes it, the engine
+# and the menu read it. It stays across restarts until you resume.
+ROTATION_PAUSED = OMASKINS_STATE / "rotation-paused"
+PAUSABLE = ("theme", "background")
+
+
+def rotation_paused():
+    try:
+        return {w for w in ROTATION_PAUSED.read_text().split() if w in PAUSABLE}
+    except OSError:
+        return set()
+
+
+def set_rotation_paused(what, paused):
+    """Pause or resume one of the two; the other is left as it is. Returns what is paused now."""
+    if what not in PAUSABLE:
+        return None
+    now = rotation_paused()
+    now.add(what) if paused else now.discard(what)
+    ROTATION_PAUSED.parent.mkdir(parents=True, exist_ok=True)
+    tmp = ROTATION_PAUSED.with_name(".rotation-paused.tmp")
+    tmp.write_text(" ".join(w for w in PAUSABLE if w in now) + "\n")
+    tmp.replace(ROTATION_PAUSED)
+    return now
 
 
 def load_rotation(current_theme=""):
