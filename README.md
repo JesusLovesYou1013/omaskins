@@ -128,7 +128,10 @@ rotate through.
 link the stock installer uses. Everything else (a theme that isn't listed, your own backgrounds, a
 font that isn't from a package) is copied into the file, so it works for someone who has never seen
 it. On import you tick what to bring in, then choose to just import or to also apply the look the
-file was exported with; names that already exist are merged, never copied. Any work that needs your
+file was exported with: theme, background and font, corners, transparency, Qt apps, text size, the
+rotation that was in use (a saved set with unsaved changes comes back exactly so) and what was
+paused. An export with **Also apply** on import is how to get everything back after removing and
+re-adding OmaSkins; names that already exist are merged, never copied. Any work that needs your
 password (fonts, built-in themes) is done at once, in Omarchy's own installer window, and can be
 cancelled.
 

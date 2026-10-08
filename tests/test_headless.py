@@ -2059,8 +2059,65 @@ class ShareImport(unittest.TestCase):
             self.assertEqual((data.USER_BACKGROUNDS / "nord/mine.png").read_text(), "my picture", "own background")
             self.assertEqual(data.rotation_sets()["Evenings"], before["sets"]["Evenings"], "saved rotation set")
             back = data.load_rotation("nord").to_dict()
-            for key in ("themes", "backgrounds", "minutes", "mix", "dawn_dusk"):
+            for key in ("themes", "backgrounds", "minutes", "mix", "dawn_dusk", "checked", "theme_picks",
+                        "solo_picks", "period", "set_name"):
                 self.assertEqual(back[key], before["rotation"][key], f"rotation: {key}")
+        finally:
+            data.current_font, run.perform, data.builtin_package = saved_font, saved_perform, saved_pkg
+
+    def test_a_changed_set_and_a_pause_come_back_exactly(self):
+        """The rotation in use is a saved set with changes not saved to it, and backgrounds are paused:
+        exported, everything of OmaSkins' wiped (as removing it does), imported with "Also apply": the
+        set as saved, the changed setup in use under its name, and the pause (owner, 2026-10-08)."""
+        from omaskins import run
+        saved_font, saved_perform, saved_pkg = data.current_font, run.perform, data.builtin_package
+        data.current_font = lambda: "JetBrainsMono Nerd Font"
+        data.builtin_package = lambda: ""
+        run.perform = lambda steps, *a, **k: None
+        try:
+            plan = data.RotationPlan("tokyo-night")
+            plan.themes, plan.backgrounds, plan.minutes, plan.mix = True, True, 20, False
+            plan.checked["Dawn"] = ["tokyo-night", "aura"]
+            plan.theme_picks["aura"] = {str(HOME / ".config/omarchy/themes/aura/backgrounds/aura-1.jpg")}
+            data.save_rotation_set("Crazy", plan)
+            plan = data.use_rotation_set("Crazy", "tokyo-night")
+            plan.minutes, plan.mix = 5, True                      # changed, not saved to the set
+            plan.checked["Dawn"] = ["aura", "tokyo-night", "nord"]
+            plan.theme_picks["tokyo-night"] = {str(OMARCHY / "themes/tokyo-night/backgrounds/0-a.jpg"),
+                                               str(HOME / ".config/omarchy/backgrounds/tokyo-night/mine.png")}
+            data.save_rotation(plan)
+            data.set_rotation_paused("background", True)
+            self.assertTrue(data.set_has_changes(data.load_rotation("tokyo-night")))
+            before = (json.loads(data.ROTATION_FILE.read_text()), data.rotation_sets(), data.rotation_paused())
+            manifest, _ = self.share.write_zip(self.zip, [])
+            self.assertEqual(manifest["rotation_paused"], ["background"])
+
+            shutil.rmtree(data.ROTATION_FILE.parent)              # ~/.config/omaskins
+            shutil.rmtree(data.OMASKINS_STATE, ignore_errors=True)
+            self.assertEqual((data.rotation_sets(), data.rotation_paused()), ({}, set()))
+
+            manifest = self.share.read_zip(self.zip)
+            rows = self.share.items(manifest)
+            row = next(r for r in rows if r["id"] == "rotation")
+            self.assertIn("“Crazy”, with changes", row["label"])
+            self.assertIn("set:Crazy", row["needs"])
+            done, note, failed = self.share.run_import(self.zip, manifest, {r["id"] for r in rows}, apply=True)
+            self.assertEqual(failed, [], (done, note))
+            after = (json.loads(data.ROTATION_FILE.read_text()), data.rotation_sets(), data.rotation_paused())
+            self.assertEqual(after[0], before[0], "the rotation in use: every list, pick and switch")
+            self.assertEqual(after[1], before[1], "the saved sets, and no “Imported …” one beside them")
+            self.assertEqual(after[2], before[2], "what was paused")
+            self.assertTrue(data.set_has_changes(data.load_rotation("tokyo-night")), "still shown as changed")
+
+            # "Just import" (nothing applied) keeps the old way: the changed setup arrives as its own set.
+            shutil.rmtree(data.ROTATION_FILE.parent)
+            shutil.rmtree(data.OMASKINS_STATE, ignore_errors=True)
+            done, note, failed = self.share.run_import(self.zip, manifest, {r["id"] for r in rows}, apply=False)
+            self.assertEqual(failed, [], (done, note))
+            names = list(data.rotation_sets())
+            self.assertEqual(len(names), 2)
+            self.assertTrue(any(n.startswith("Imported ") for n in names), names)
+            self.assertEqual(data.rotation_paused(), set(), "nothing applied, so nothing paused")
         finally:
             data.current_font, run.perform, data.builtin_package = saved_font, saved_perform, saved_pkg
 

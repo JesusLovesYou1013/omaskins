@@ -8,7 +8,9 @@ OmaSkins knows what's there before unpacking anything:
 - backgrounds you added yourself, as the files;
 - fonts: Arch packages by name; fonts not in the repos (AUR, self-built) or from no package, as files;
 - the rotation: the saved set in use by name, or (no set, or unsaved changes) the whole setup;
-  every saved set; background choices as theme + file name, never full paths;
+  every saved set; background choices as theme + file name, never full paths; what is paused in the
+  palette menu. A set in use with unsaved changes comes back with "Also apply" exactly so: the set as
+  saved, and the changed setup in use under its name (2026-10-08; it used to arrive as "Imported …");
 - the look: current theme, background and font, Rounded Corners, Transparency, text size, built-ins hidden
   or removed, Aether's blueprints, the sort order. Not the location: Dawn & Dusk works that out on
   each machine (when it's switched on, then once per boot).
@@ -374,6 +376,7 @@ def collect(community):
         "qt_apps": qtstyle.enabled(),
         "text_size": text_size,
         "rotation": rotation,
+        "rotation_paused": sorted(data.rotation_paused()),
         "rotation_sets": sets,
         "aether_blueprints": blueprints,
         "sort": data.sort_mode(),
@@ -551,8 +554,14 @@ def items(manifest):
     if "settings" in rotation:
         setup = rotation["settings"]
         needs = [f"theme:{n}" for n in sorted(_setup_themes(setup)) if n in themes]
-        out.append({"id": "rotation", "group": "Rotation sets", "label": "The rotation in use (not a saved set)",
-                    "detail": "comes in as a set named “Imported …”", "state": "new", "needs": needs})
+        of = setup.get("set_name") if isinstance(setup, dict) else None
+        if of and of in (manifest.get("rotation_sets") or {}):   # a saved set, changed since it was saved
+            out.append({"id": "rotation", "group": "Rotation sets", "label": f"In use there: “{of}”, with changes",
+                        "detail": "Also apply: exactly as it was · Just import: a set named “Imported …”",
+                        "state": "new", "needs": needs + [f"set:{of}"]})
+        else:
+            out.append({"id": "rotation", "group": "Rotation sets", "label": "The rotation in use (not a saved set)",
+                        "detail": "comes in as a set named “Imported …”", "state": "new", "needs": needs})
     elif rotation.get("set") in (manifest.get("rotation_sets") or {}):
         out.append({"id": "rotation", "group": "Rotation sets", "label": f"In use there: “{rotation['set']}”",
                     "detail": "the set that was in use", "state": "new", "needs": [f"set:{rotation['set']}"]})
@@ -927,11 +936,16 @@ def _run_import(zip_path, manifest, chosen, apply, progress=None):
             sets[name] = theirs
             done.append(f"Added Rotation set “{name}”")
     rotation = manifest.get("rotation") or {}
-    in_use = None
+    in_use = exact = None
     if "rotation" in chosen:
         step("The rotation that was in use")
-        if "settings" in rotation:
+        of = rotation["settings"].get("set_name") if isinstance(rotation.get("settings"), dict) else None
+        if apply and of and of in sets:
+            # A saved set with changes not saved to it: back exactly so, in use under its own name.
+            exact = dict(here(rotation["settings"]), set_name=of)
+        elif "settings" in rotation:
             theirs = here(rotation["settings"])
+            theirs.pop("set_name", None)   # a set's own content never names itself
             same = next((k for k, v in sets.items() if json.dumps(v, sort_keys=True) == json.dumps(theirs, sort_keys=True)), None)
             in_use = same or f"Imported {time.strftime('%Y-%m-%d %H:%M')}"
             if not same:
@@ -955,7 +969,7 @@ def _run_import(zip_path, manifest, chosen, apply, progress=None):
 
     if apply:
         step("Applying the look (theme, background, font, corners, rotation)")
-        done += apply_look(manifest, chosen, as_here, pics, in_use, note)
+        done += apply_look(manifest, chosen, as_here, pics, in_use, note, exact)
     n = total + 1   # past the last step: the whole bar
     if progress:
         progress({"step": total, "total": total, "text": "Finished", "download": None, "finished": True})
@@ -1049,12 +1063,24 @@ def transparency_step_of(manifest):
     return step if isinstance(step, int) and 0 <= step < len(data.TRANSPARENCY_STEPS) else None
 
 
-def apply_look(manifest, chosen, as_here, pics, in_use, note):
+def apply_look(manifest, chosen, as_here, pics, in_use, note, exact=None):
     """"Also apply": the rotation that was in use, corners, text size and font, then the theme and the
-    very background it had."""
+    very background it had. `exact` = the setup that was in use, when it was a saved set with changes."""
     from . import run
     done = []
     current = manifest.get("current") or {}
+    if exact:
+        plan = data.RotationPlan.from_dict(exact, data.current_theme_name())
+        plan.set_name = exact["set_name"]
+        data.save_rotation(plan)
+        done.append(f"Rotation: “{plan.set_name}”, with the changes it had")
+    if "rotation" in chosen and isinstance(manifest.get("rotation_paused"), list):
+        for what in data.PAUSABLE:
+            data.set_rotation_paused(what, what in manifest["rotation_paused"])
+        if manifest["rotation_paused"]:
+            done.append("Paused as it was there: " + " and ".join(
+                {"theme": "themes", "background": "backgrounds"}[w] for w in data.PAUSABLE
+                if w in manifest["rotation_paused"]))
     if in_use and in_use in data.rotation_sets():
         data.use_rotation_set(in_use, data.current_theme_name())
         done.append(f"Rotation: “{in_use}”")
