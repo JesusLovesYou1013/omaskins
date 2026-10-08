@@ -1,9 +1,19 @@
 # OmaSkins Manager
 
-An app for [Omarchy](https://omarchy.org) to browse and manage the look of your desktop in one
-place: themes, backgrounds and fonts, a rotation that changes them on a schedule, rounded corners,
-window transparency, and Qt apps and file dialogs that follow the theme. Also called OmaSkins for
-short.
+An app for [Omarchy](https://omarchy.org) to manage the look of your desktop in one place. Also
+called OmaSkins for short.
+
+![OmaSkins Manager: the Themes tab, with rounded corners and transparency on](preview.png)
+
+- **Themes, backgrounds and fonts**: browse every community theme on omarchy.org and every Nerd Font
+  package, add and remove them, and switch with one click.
+- **Rotation**: change theme and background on a schedule that keeps running with the app closed, with
+  day and night theme sets, any theme with any background, and Next and Pause in the bar.
+- **Rounded corners**: one radius for windows, menus and popups, whatever the theme.
+- **Transparency**: five steps for every see-through window, with blur behind, and Omarchy's menus,
+  panels, Nautilus, file dialogs and Qt apps following along.
+- **Share**: your whole setup in one file, to move to another machine or to get back later.
+- **Clean removal**: removing OmaSkins puts everything back the way Omarchy ships it.
 
 **Requirements:** Python 3 with PyGObject, GTK4 and libadwaita, plus ImageMagick for thumbnails.
 All of these ship with a stock Omarchy install. Installing needs no password. Optional: the GitHub
@@ -16,6 +26,9 @@ CLI (`gh`, signed in) gives Themes its **Top Picks** order; without it themes so
 Or **Setup › Plugins › Add Plugin** with that URL, then enable it (Omarchy adds plugins switched off).
 
 ## Opening OmaSkins
+
+The window opens floating and centred, at 70% of the screen's width and 75% of its height
+(Super+T tiles it, as with any window).
 
 Once it's on, any of these:
 
