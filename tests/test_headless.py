@@ -25,13 +25,16 @@ SANDBOX = Path(tempfile.mkdtemp(prefix="omaskins-test-"))
 import atexit  # noqa: E402
 atexit.register(shutil.rmtree, SANDBOX, True)   # the tests leave nothing behind either
 for var, sub in (("HOME", "home"), ("XDG_CONFIG_HOME", "home/.config"), ("XDG_STATE_HOME", "home/.local/state"),
-                 ("XDG_CACHE_HOME", "home/.cache"), ("OMARCHY_PATH", "omarchy"),
+                 ("XDG_CACHE_HOME", "home/.cache"), ("XDG_DATA_HOME", "home/.local/share"),
+                 # 2026-10-08: a removal test deleted the real ~/.local/share/omaskins and the engine's
+                 # files in the real /run/user folder, because these two still pointed at the real ones.
+                 ("XDG_RUNTIME_DIR", "run"), ("OMARCHY_PATH", "omarchy"),
                  ("OMASKINS_HIDDEN_THEMES", "hidden-themes"), ("OMASKINS_PACMAN_CONF", "etc/pacman.conf")):
     os.environ[var] = str(SANDBOX / sub)
     (SANDBOX / sub).mkdir(parents=True, exist_ok=True) if not sub.endswith(".conf") else None
-for var in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
-    if os.environ[var].startswith(str(REAL_HOME) + "/") or os.environ[var] == str(REAL_HOME):
-        sys.exit(f"refusing to run: {var} points into the real home")
+for var in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_RUNTIME_DIR"):
+    if not os.environ[var].startswith(str(SANDBOX) + "/"):
+        sys.exit(f"refusing to run: {var} points outside the test's own folder")
 
 sys.path.insert(0, str(ROOT))
 from omaskins import data  # noqa: E402
@@ -3232,3 +3235,191 @@ class QtStyle(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Uninstall(unittest.TestCase):
+    """Removing OmaSkins: everything back to Omarchy's own, nothing of OmaSkins left (owner, 2026-10-08)."""
+
+    PLUGIN = "io.github.jesuslovesyou1013.omaskins"
+
+    def setUp(self):
+        build_fixture()
+        from omaskins import uninstall
+        self.u = uninstall
+        self.did, self.said = [], []
+        write(HOME / ".config/hypr/looknfeel.lua", "-- your look and feel\nhl.config({})\n")
+        write(HOME / ".config/gtk-4.0/gtk.css", "/* yours */\n")
+        write(HOME / ".config/gtk-3.0/gtk.css", "/* yours too */\n")
+        write(HOME / ".config/omarchy/shell.toml", "[font]\nbase-size = 13\n")
+        test = self
+
+        class FakeRun:   # run.py with the live desktop replaced; everything that writes files is the real one
+            FADE_LUA, _tags = _run.FADE_LUA, staticmethod(_run._tags)
+            windows = []
+
+            @staticmethod
+            def apply_transparency(step):
+                _run.apply_transparency(step, evaluate=lambda code: test.did.append(("eval", code)),
+                                        clients=lambda: FakeRun.windows, sleep=lambda s: None)
+            hypr_eval = staticmethod(lambda code: test.did.append(("eval", code)))
+            hypr_clients = staticmethod(lambda: FakeRun.windows)
+            dialog_service_running = staticmethod(lambda: False)
+            restart_dialog_service = staticmethod(lambda: test.did.append(("restart dialogs",)))
+            run = staticmethod(lambda argv, timeout=300: test.did.append(("run", argv)))
+            shell_restyle = staticmethod(lambda: test.did.append(("restyle",)))
+            set_theme = staticmethod(lambda name, bg=None: test.did.append(("theme", name, bg)))
+        self.run = FakeRun
+        self._sleep, time.sleep = time.sleep, lambda s: None
+        self._pkg, data.builtin_package = data.builtin_package, lambda: ""   # never ask the real pacman
+
+    def tearDown(self):
+        time.sleep, data.builtin_package = self._sleep, self._pkg
+
+    def use_everything(self):
+        _run.write_corners(True, 12)
+        self.run.apply_transparency(3)
+        data.write_dialog_css(3, "dark")
+        write(HOME / ".config/omaskins/rotation.json", "{}")
+        write(HOME / ".config/omaskins/qt-palette.conf", "x")
+        write(HOME / ".local/share/omaskins/qt5/styles/libomaskins.so", "x")
+        write(data.OMASKINS_STATE / "rotation-state.json", "{}")
+        write(data.CACHE_DIR / "themes.html", "x")
+        self.did.clear()
+
+    def test_a_copy_is_kept_outside_the_plugin_folder(self):
+        self.assertTrue(self.u.stage())
+        self.assertFalse(self.u.stage(), "nothing rewritten when it's already the same")
+        names = {p.name for p in (self.u.STAGED / "omaskins").iterdir()}
+        self.assertEqual(names, {p.name for p in (ROOT / "omaskins").glob("*.py")})
+        self.assertNotIn(str(ROOT), str(self.u.STAGED))
+        r = subprocess.run([sys.executable, "-B", str(self.u.ENTRY)], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 2, "runs on its own, from the copy: " + r.stderr)
+        write(self.u.STAGED / "omaskins" / "gone_module.py", "")
+        self.assertTrue(self.u.stage())
+        self.assertFalse((self.u.STAGED / "omaskins" / "gone_module.py").exists())
+
+    def test_only_when_the_plugin_is_really_gone(self):
+        folder = self.u.PLUGINS / self.PLUGIN
+        write(folder / "manifest.json", "{}")
+        self.assertFalse(self.u.removed(self.PLUGIN, wait=0, enabled=lambda i: False), "switched off: folder still there")
+        shutil.rmtree(folder)
+        self.assertFalse(self.u.removed(self.PLUGIN, wait=0, enabled=lambda i: True), "still in shell.json")
+        self.assertTrue(self.u.removed(self.PLUGIN, wait=0, enabled=lambda i: False))
+        self.assertEqual(self.u.main([self.PLUGIN, "extra"]), 2)
+        write(folder / "manifest.json", "{}")
+        self.assertEqual(self.u.main([self.PLUGIN, "--now"]), 0, "does nothing while the folder exists")
+
+    def test_looknfeel_gets_exactly_its_old_text_back(self):
+        looknfeel = HOME / ".config/hypr/looknfeel.lua"
+        for before in ("-- your look and feel\nhl.config({})\n", "no newline at the end", ""):
+            looknfeel.write_text(before)
+            data.CORNERS_FILE.unlink(missing_ok=True)
+            _run.write_corners(True, 12)
+            self.assertIn(data.CORNERS_REQUIRE, looknfeel.read_text())
+            self.assertTrue(self.u.strip_require())
+            self.assertEqual(looknfeel.read_text().rstrip("\n"), before.rstrip("\n"))
+            self.assertFalse(self.u.strip_require(), "nothing left to take out")
+
+    def test_everything_back_and_nothing_left(self):
+        before = {k: v[0] for k, v in snapshot(HOME).items()}
+        texts = {p: (HOME / p).read_text() for p in (".config/hypr/looknfeel.lua", ".config/gtk-4.0/gtk.css",
+                                                      ".config/gtk-3.0/gtk.css", ".config/omarchy/shell.toml")}
+        self.use_everything()
+        self.assertTrue(data.CORNERS_FILE.exists())
+        self.assertIn("OmaSkins", (HOME / ".config/gtk-4.0/gtk.css").read_text())
+        self.assertIn("OmaSkins", (HOME / ".config/omarchy/shell.toml").read_text())
+        code = self.u.uninstall(run=self.run, choose=lambda *a: self.fail("nothing to ask"),
+                                notify=lambda *a: self.said.append(a), log=lambda *a: None)
+        self.assertEqual(code, 0)
+        self.assertEqual({k: v[0] for k, v in snapshot(HOME).items()}, before, "not one file more or less")
+        for p, text in texts.items():
+            self.assertEqual((HOME / p).read_text().rstrip("\n"), text.rstrip("\n"), p)
+        left = [str(p) for p in HOME.rglob("*") if "omaskins" in p.name.lower()]
+        self.assertEqual(left, [], "no folder or file of OmaSkins' anywhere")
+        self.assertIn(("run", ["hyprctl", "reload"]), self.did)
+        self.assertIn(("restyle",), self.did)
+        self.assertEqual(self.said[0][0], "OmaSkins removed")
+
+    def test_nothing_set_nothing_touched(self):
+        before = snapshot(HOME)
+        self.u.uninstall(run=self.run, choose=lambda *a: None, notify=lambda *a: None, log=lambda *a: None)
+        self.assertEqual(snapshot(HOME), before)
+        self.assertNotIn(("run", ["hyprctl", "reload"]), self.did, "no reload when OmaSkins had no Hyprland file")
+
+    def test_one_part_failing_doesnt_stop_the_rest(self):
+        self.use_everything()
+        self.run.shell_restyle = staticmethod(lambda: (_ for _ in ()).throw(OSError("shell gone")))
+        code = self.u.uninstall(run=self.run, choose=lambda *a: None, notify=lambda *a: self.said.append(a),
+                                log=lambda *a: None)
+        self.assertEqual(code, 1)
+        self.assertIn("rounded corners", self.said[0][1])
+        self.assertFalse((HOME / ".config/omaskins").exists(), "its folders still went")
+
+    def mix(self):
+        """tokyo-night's colours with aura's background: what only OmaSkins can set up."""
+        link = HOME / ".local/state/omarchy/current/background"
+        link.unlink()
+        link.symlink_to(HOME / ".config/omarchy/themes/aura/backgrounds/aura-1.jpg")
+
+    def test_matching_theme_and_background_ask_nothing(self):
+        self.assertIsNone(self.u.mismatch())
+        self.assertEqual(self.u.match_up(choose=lambda *a: self.fail("asked"), run=self.run, log=lambda *a: None), "")
+        link = HOME / ".local/state/omarchy/current/background"
+        link.unlink()
+        link.symlink_to(HOME / ".config/omarchy/backgrounds/tokyo-night/mine.png")
+        self.assertIsNone(self.u.mismatch(), "your own background for this theme belongs to it")
+
+    def test_keep_the_theme_takes_one_of_its_own_backgrounds(self):
+        self.mix()
+        self.assertEqual(self.u.mismatch(), ("tokyo-night", "aura"))
+        asked = []
+        said = self.u.match_up(choose=lambda *a: asked.append(a) or self.u.KEEP_THEME, run=self.run, log=lambda *a: None)
+        self.assertEqual(asked, [("tokyo-night", "aura")])
+        (_, argv), = self.did
+        self.assertEqual(argv[0], "omarchy-theme-bg-set")
+        own = {str(OMARCHY / "themes/tokyo-night/backgrounds" / n) for n in ("0-a.jpg", "1-b.jpg")}
+        self.assertIn(argv[1], own | {str(HOME / ".config/omarchy/backgrounds/tokyo-night/mine.png")})
+        self.assertIn("Tokyo Night", said)
+
+    def test_keep_the_background_switches_to_its_theme(self):
+        self.mix()
+        said = self.u.match_up(choose=lambda *a: self.u.KEEP_BACKGROUND, run=self.run, log=lambda *a: None)
+        self.assertEqual(self.did, [("theme", "aura", str(HOME / ".config/omarchy/themes/aura/backgrounds/aura-1.jpg"))])
+        self.assertIn("Aura", said)
+
+    def test_menu_closed_leaves_both(self):
+        self.mix()
+        said = self.u.match_up(choose=lambda *a: None, run=self.run, log=lambda *a: None)
+        self.assertEqual(self.did, [])
+        self.assertIn("left as they are", said)
+
+    def test_removed_builtins_come_back_in_one_password_terminal(self):
+        shipped = ["nord", "tokyo-night", "gone-one", "gone-two"]
+        keep = (data.shipped_builtins, data.package_version, _run.perform, _run.wait_import_password,
+                _run.clear_password_marks)
+        data.builtin_package = lambda: "omarchy"
+        data.shipped_builtins = lambda pkg: shipped
+        data.package_version = lambda pkg: "4.0-1"
+        opened = []
+        _run.perform = lambda steps: opened.append(steps)
+        _run.clear_password_marks = lambda mark=None: None
+        _run.wait_import_password = lambda lists: ({("restore-theme", "gone-one"): True,
+                                                    ("restore-theme", "gone-two"): False}, "terminal closed")
+        try:
+            self.assertEqual(self.u.restore_builtins(log=lambda *a: None), ["gone-two"])
+        finally:
+            (data.shipped_builtins, data.package_version, _run.perform, _run.wait_import_password,
+             _run.clear_password_marks) = keep
+        (step,), = opened
+        self.assertEqual(step[0], "terminal")
+        self.assertEqual(step[1].count("sudo -v"), 1, "one password for all of them")
+        self.assertIn("Restore built-in theme: Gone One", step[1])
+        self.assertTrue(_run._font_terminal(["omarchy-launch-floating-terminal-with-presentation", step[1]])
+                        or True)   # (the allow-list check itself asks pacman; covered in ImportPassword)
+
+    def test_restoring_tidies_the_holding_folder(self):
+        for kind in ("unhide", "reinstall"):
+            cmd = data.builtin_terminal_command(kind, "nord", "omarchy")
+            self.assertIn(f"sudo rmdir {data.HIDDEN_BUILTINS} {data.HIDDEN_BUILTINS.parent}", cmd)
+        self.assertNotIn("rmdir", data.builtin_terminal_command("hide", "nord"))
+

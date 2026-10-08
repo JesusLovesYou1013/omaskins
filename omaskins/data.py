@@ -1290,18 +1290,20 @@ def builtin_terminal_command(kind, name, package=""):
     unhide: move it back + drop the rule. reinstall (no hidden copy): drop the rule + pacman -S."""
     rule, themes, hidden, conf = _no_extract(name), BUILTIN_THEMES, HIDDEN_BUILTINS, PACMAN_CONF
     drop_rule = f"sudo sed -i '\\|^{rule.replace('*', '[*]')}$|d' {conf}"
+    # The holding folders go once the last hidden theme has left (rmdir only ever removes an empty folder).
+    tidy = f"(sudo rmdir {hidden} {hidden.parent} 2>/dev/null; true)"
     if kind == "hide":
         return (f"echo 'Removing {name}...'; [ ! -e {hidden}/{name} ] && sudo mkdir -p {hidden} && "
                 f"sudo mv {themes}/{name} {hidden}/{name} && "
                 f"(grep -qxF '{rule}' {conf} || sudo sed -i '/^\\[options\\]/a {rule}' {conf})")
     if kind == "unhide":
         return (f"echo 'Restoring {name}...'; [ ! -e {themes}/{name} ] && "
-                f"sudo mv {hidden}/{name} {themes}/{name} && {drop_rule}")
+                f"sudo mv {hidden}/{name} {themes}/{name} && {drop_rule} && {tidy}")
     if kind == "reinstall":
         if not PKG_OK.fullmatch(package):
             raise ValueError(f"unexpected package name: {package!r}")
         return (f"echo 'Reinstalling {name}...'; {drop_rule} && sudo pacman -S --noconfirm {package} && "
-                f"sudo rm -rf {hidden}/{name}")
+                f"sudo rm -rf {hidden}/{name} && {tidy}")
     raise ValueError(kind)
 
 

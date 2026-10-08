@@ -38,6 +38,9 @@ Item {
   // for Omarchy's menus and panels (shell.toml) go too. Inline, not in a script, because `omarchy plugin remove` deletes this folder
   // right after disabling it (CtrlZ Guard's way). The service is also destroyed on a normal shell exit or
   // reload; while the id is still in shell.json (as a plugin or its bar icon) this does nothing.
+  // Removed (not just turned off): the last step starts OmaSkins' remover, a copy the engine keeps in
+  // OmaSkins' state folder. It waits to see this folder really gone, then puts transparency, corners and
+  // the rest back to Omarchy's own and deletes OmaSkins' folders (omaskins/uninstall.py).
   readonly property string removeCommand:
     "sleep 1; c=\"${XDG_CONFIG_HOME:-$HOME/.config}\"; d=\"${XDG_DATA_HOME:-$HOME/.local/share}\"; " +
     "grep -qF '\"" + pluginId + "\"' \"$c/omarchy/shell.json\" 2>/dev/null && exit 0; " +
@@ -52,7 +55,9 @@ Item {
     "rmdir \"$d/themes/Adwaita-dark/gtk-3.0\" \"$d/themes/Adwaita-dark\" 2>/dev/null; " +
     "m=\"$c/mimeapps.list\"; " +
     "[ -f \"$m\" ] && sed -i --follow-symlinks '/^application\\/x-omaskins-setup=" +
-    pluginId.replace(/\./g, "\\.") + "\\.desktop;\\?$/d' \"$m\"; true"
+    pluginId.replace(/\./g, "\\.") + "\\.desktop;\\?$/d' \"$m\"; " +
+    "u=\"${XDG_STATE_HOME:-$HOME/.local/state}/omaskins/uninstall/omaskins-uninstall\"; " +
+    "[ -f \"$u\" ] && exec python3 -B \"$u\" " + pluginId + "; true"
 
   Component.onDestruction: {
     engine.running = false

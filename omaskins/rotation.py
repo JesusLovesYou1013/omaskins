@@ -749,6 +749,13 @@ def run(plugin_id=None):
             log("added Style › OmaSkins to Omarchy's menu")
     except Exception as e:
         log("launcher and menu registration failed:", repr(e))
+    # A copy of the remover outside this folder, which `omarchy plugin remove` deletes (see uninstall.py).
+    try:
+        from . import uninstall
+        if uninstall.stage():
+            log("remover copied to", uninstall.STAGED)
+    except Exception as e:
+        log("copying the remover failed:", repr(e))
     # Font previews downloaded before they were slimmed: once, in the background (a few ms each).
     def slim_previews():
         try:
