@@ -178,11 +178,13 @@ def clone_transfer(line):
     return int(got), rate
 
 
-def run_with_progress(argv, progress, stall=DOWNLOAD_STALL, limit=DOWNLOAD_LIMIT, transfer=None):
+def run_with_progress(argv, progress, stall=DOWNLOAD_STALL, limit=DOWNLOAD_LIMIT, transfer=None, max_bytes=None):
     """Like run(), but reads the command's progress lines as they come (git writes them to stderr,
     each update ending in \r) and calls progress(percent) whenever the overall figure goes up.
     transfer(bytes received, bytes per second), if given, hears git's own figures as they change.
-    Stopped when it sends nothing at all for `stall` seconds, or once it has taken `limit` seconds."""
+    Stopped when it sends nothing at all for `stall` seconds, once it has taken `limit` seconds, or
+    once git says it has received more than `max_bytes` (default data.MAX_THEME)."""
+    max_bytes = data.MAX_THEME if max_bytes is None else max_bytes
     check(argv)
     p = subprocess.Popen(list(argv), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                          stderr=subprocess.PIPE, env=data.child_env())
@@ -214,7 +216,11 @@ def run_with_progress(argv, progress, stall=DOWNLOAD_STALL, limit=DOWNLOAD_LIMIT
             if pct is not None and pct > best:
                 best = pct
                 progress(pct)
-            if transfer and (got := clone_transfer(line)):
+            got = clone_transfer(line)
+            if got and got[0] > max_bytes and not why:
+                why.append(f"stopped: larger than {max_bytes // data.MIB} MB")
+                p.kill()
+            if transfer and got:
                 transfer(*got)
     p.stderr.close()
     p.wait()
@@ -1089,8 +1095,8 @@ def _perform(steps, progress=None, notify=None, transfer=None):
     for step in steps:
         kind, args = step[0], step[1:]
         if kind == "run":
-            if progress and args[0][:2] == ["git", "clone"]:
-                r = run_with_progress(args[0], progress, transfer=transfer)
+            if args[0][:2] == ["git", "clone"]:   # always watched: the stall, time and size limits
+                r = run_with_progress(args[0], progress or (lambda pct: None), transfer=transfer)
             else:
                 r = run(args[0])
             if r.returncode != 0:

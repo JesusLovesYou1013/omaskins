@@ -3423,3 +3423,43 @@ class Uninstall(unittest.TestCase):
             self.assertIn(f"sudo rmdir {data.HIDDEN_BUILTINS} {data.HIDDEN_BUILTINS.parent}", cmd)
         self.assertNotIn("rmdir", data.builtin_terminal_command("hide", "nord"))
 
+
+class DownloadLimits(unittest.TestCase):
+    """Nothing is downloaded past its limit; each limit is the largest on offer plus about 10%."""
+
+    def test_limits_as_measured(self):
+        m = data.MIB
+        self.assertEqual((data.MAX_IMAGE, data.MAX_FONT_PACKAGE, data.MAX_THEME), (52 * m, 111 * m, 384 * m))
+        for limit, largest in ((data.MAX_IMAGE, 47.36), (data.MAX_FONT_PACKAGE, 100.68), (data.MAX_THEME, 348.67)):
+            self.assertTrue(1.09 <= limit / m / largest <= 1.11, (limit, largest))
+
+    def test_a_theme_download_past_the_limit_is_stopped(self):
+        from omaskins import run
+        check, run.check = run.check, lambda argv: None
+        try:
+            line = "Receiving objects:  66% (40/60), 3.00 MiB | 2.52 MiB/s"
+            r = run.run_with_progress(["sh", "-c", f"printf '{line}\\r' >&2; sleep 30"], lambda pct: None,
+                                      max_bytes=2 * data.MIB)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("larger than 2 MB", r.stderr)
+            r = run.run_with_progress(["sh", "-c", f"printf '{line}\\r' >&2"], lambda pct: None)
+            self.assertEqual(r.returncode, 0, "well under the real limit")
+        finally:
+            run.check = check
+
+    def test_the_font_popularity_pages_are_limited_too(self):
+        import urllib.request
+        class Big:
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+            def read(self, n=-1):
+                self.asked = n
+                return b"x" * (n if n > 0 else 10)
+        big = Big()
+        keep, urllib.request.urlopen = urllib.request.urlopen, lambda *a, **k: big
+        data.PKGSTATS_CACHE.unlink(missing_ok=True)
+        try:
+            self.assertEqual(data.font_popularity(force=True), {})
+        finally:
+            urllib.request.urlopen = keep
+        self.assertEqual(big.asked, data.MAX_PAGE + 1, "never read to the end, whatever the size")

@@ -54,11 +54,19 @@ OMASKINS_STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) /
 THEMES_PAGE = "https://omarchy.org/themes/"
 SITE = "https://omarchy.org"
 PAGE_TTL = 24 * 3600
-USER_AGENT = "OmaSkins/0.1 (+prototype)"
+USER_AGENT = "OmaSkins/1.0 (+https://github.com/JesusLovesYou1013/omaskins)"
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
 PREVIEW_NAMES = ("preview.png", "preview.jpg", "preview.jpeg", "preview.webp", "preview.gif", "preview.bmp")
-MAX_DOWNLOAD = 8 * 1024 * 1024  # a screenshot or colors.toml; anything bigger is refused
-MAX_IMAGE = 40 * 1024 * 1024    # a background can be a big 4K PNG
+# Download limits: nothing is read or saved past them (a wrong or hostile link can't fill memory or disk).
+# Each is the largest one on offer when measured (2026-10-08, all 146 themes on omarchy.org and all 76
+# Nerd Font packages in the Arch repos) plus about 10% (owner, 2026-10-08). Measure again before raising.
+MIB = 1024 * 1024
+MAX_PAGE = 1 * MIB      # a list or a small text file: the themes page (150 KB), a colors.toml, a
+                        # backgrounds listing, a pkgstats page (28 KB). These grow with every theme
+                        # added, so they get room rather than 10%.
+MAX_DOWNLOAD = MAX_PAGE
+MAX_IMAGE = 52 * MIB    # one picture: the largest background is 47.4 MiB (Naysayer's "3-pac-man.png")
+MAX_THEME = 384 * MIB   # one theme download: the largest repository is 348.7 MiB (Sakura Mochi)
 
 # The palette keys shown on a theme page, in Omarchy's own order.
 SWATCH_KEYS = ("background", "foreground", "accent", "selection", "red", "yellow", "orange",
@@ -264,7 +272,10 @@ def font_popularity(force=False):
             try:
                 with urllib.request.urlopen(f"{PKGSTATS_API}?query={prefix}&limit=250&offset={offset}",
                                             timeout=20) as r:
-                    page = json.loads(r.read().decode())
+                    raw = r.read(MAX_PAGE + 1)
+                if len(raw) > MAX_PAGE:
+                    raise ValueError("pkgstats page larger than expected")
+                page = json.loads(raw.decode())
             except (OSError, ValueError):
                 break
             rows = page.get("packagePopularities") or []
@@ -695,7 +706,7 @@ def child_env():
 # package is deleted. The app loads that file privately (not installed, only OmaSkins sees it).
 
 PREVIEW_FONTS = CACHE_DIR / "font-previews"
-MAX_FONT_PACKAGE = 200 * 1024 * 1024
+MAX_FONT_PACKAGE = 111 * MIB   # the largest Nerd Font package is 100.7 MiB (ttf-iosevka-nerd)
 
 
 FONT_SIZES_CACHE = CACHE_DIR / "font-sizes.json"   # matched preview sizes (app.matched_size), per font set
