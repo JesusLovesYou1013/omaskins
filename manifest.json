@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.jesuslovesyou1013.omaskins",
   "name": "OmaSkins",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "author": "JesusLovesYou1013",
   "license": "GPL-3.0",
   "description": "Add and switch themes, backgrounds and fonts, and rotate them on a schedule. Rounded corners and five steps of window transparency. Can skip and pause rotation of themes and backgrounds separately. If you're into mix and match craziness, try Mix it up: something new every switch, random theme and background combos from the ones you've enabled. Removing OmaSkins reverts rounded corners and transparency to Omarchy default, but all themes, backgrounds and fonts installed while using it remain.",

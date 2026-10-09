@@ -54,6 +54,15 @@ THEMES_PAGE = "https://omarchy.org/themes/"
 SITE = "https://omarchy.org"
 PAGE_TTL = 24 * 3600
 USER_AGENT = "OmaSkins/1.0 (+https://github.com/JesusLovesYou1013/omaskins)"
+
+
+def version():
+    """The plugin's version, from the manifest beside this package ('' when it can't be read)."""
+    try:
+        found = json.loads((Path(__file__).resolve().parent.parent / "manifest.json").read_text()).get("version")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return found if isinstance(found, str) else ""
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp")
 PREVIEW_NAMES = ("preview.png", "preview.jpg", "preview.jpeg", "preview.webp", "preview.gif", "preview.bmp")
 # Download limits: nothing is read or saved past them (a wrong or hostile link can't fill memory or disk).

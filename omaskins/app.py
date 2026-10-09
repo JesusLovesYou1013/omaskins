@@ -2233,8 +2233,16 @@ class Window(Adw.ApplicationWindow):
         frame.add_css_class("frame-root")
         frame.set_overflow(Gtk.Overflow.HIDDEN)  # clipped to the frame's rounded corners
         frame.append(self.stack)
+        # The version, small in the bottom right corner: drawn over the window, so nothing moves for it.
+        over = Gtk.Overlay(child=frame)
+        if data.version():
+            mark = label("v" + data.version(), "app-version")
+            mark.set_halign(Gtk.Align.END)
+            mark.set_valign(Gtk.Align.END)
+            mark.set_can_target(False)
+            over.add_overlay(mark)
         self.toasts = Adw.ToastOverlay()
-        self.toasts.set_child(frame)
+        self.toasts.set_child(over)
         self.set_content(self.toasts)
 
         keys = Gtk.EventControllerKey()

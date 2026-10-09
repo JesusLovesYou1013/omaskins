@@ -287,6 +287,7 @@ listview > row:focus-visible {{ outline: 1px solid {sel_border}; outline-offset:
 .plugin-name {{ font-weight: bold; font-size: {t.font_px * 1.15:.1f}px; color: {fg}; }}
 .dim {{ color: {dim}; }}
 .small {{ font-size: {t.font_px * 0.9:.1f}px; }}
+.app-version {{ color: {dim}; font-size: {t.font_px * 0.7:.1f}px; opacity: 0.55; margin: 0 18px 7px 0; }}
 .section-title {{ color: {accent}; font-weight: bold; padding-top: 6px; }}
 .kv-key {{ color: {dim}; }}
 .mono {{ font-family: "{family}", monospace; }}

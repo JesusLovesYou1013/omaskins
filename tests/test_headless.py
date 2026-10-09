@@ -1948,6 +1948,13 @@ class Thumbnails(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(data.CACHE_DIR.stat().st_mode), 0o700)
 
 
+class Version(unittest.TestCase):
+    def test_version_is_the_manifests(self):
+        manifest = json.loads((Path(data.__file__).resolve().parent.parent / "manifest.json").read_text())
+        self.assertEqual(data.version(), manifest["version"])
+        self.assertRegex(data.version(), r"^\d+\.\d+\.\d+$")
+
+
 class GitInThemeFolders(unittest.TestCase):
     """git is only run in a theme folder whose .git/config is what a clone writes: any other key can
     name a program for git to start (core.fsmonitor, filters, includes)."""
