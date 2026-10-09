@@ -12,11 +12,13 @@ import json
 import re
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -39,6 +41,7 @@ for var in ("HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME", "XDG_
 sys.path.insert(0, str(ROOT))
 from omaskins import data  # noqa: E402
 from omaskins import run as _run  # noqa: E402
+from omaskins import share  # noqa: E402
 
 
 def _no_windows(argv):
@@ -1926,6 +1929,82 @@ class Thumbnails(unittest.TestCase):
         out = subprocess.run(["magick", "identify", "-format", "%w", str(t1)], capture_output=True, text=True)
         self.assertEqual(out.stdout, "320")
         self.assertEqual(data.thumbnail(src, 320), t1)
+
+    @unittest.skipUnless(shutil.which("magick"), "ImageMagick not installed")
+    def test_thumbnail_of_a_private_picture_stays_private(self):
+        # A 0600 picture must not become a copy other accounts can read, whatever the umask.
+        src = SANDBOX / "private.png"
+        subprocess.run(["magick", "-size", "800x600", "xc:#993366", str(src)], check=True)
+        src.chmod(0o600)
+        data.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        data.CACHE_DIR.chmod(0o755)                      # as an earlier version left it
+        was = os.umask(0o022)
+        try:
+            thumb = data.thumbnail(src, 200)
+        finally:
+            os.umask(was)
+        self.assertNotEqual(thumb, src)
+        self.assertEqual(stat.S_IMODE(thumb.stat().st_mode), 0o600)
+        self.assertEqual(stat.S_IMODE(data.CACHE_DIR.stat().st_mode), 0o700)
+
+
+class GitInThemeFolders(unittest.TestCase):
+    """git is only run in a theme folder whose .git/config is what a clone writes: any other key can
+    name a program for git to start (core.fsmonitor, filters, includes)."""
+
+    PLAIN = ('[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = false\n'
+             '\tlogallrefupdates = true\n[remote "origin"]\n\turl = https://github.com/a/b.git\n'
+             '\tfetch = +refs/heads/*:refs/remotes/origin/*\n[branch "main"]\n\tremote = origin\n'
+             '\tmerge = refs/heads/main\n')
+
+    def setUp(self):
+        self.repo = Path(tempfile.mkdtemp(dir=SANDBOX))
+        self.addCleanup(shutil.rmtree, self.repo, True)
+
+    def test_a_plain_clone_is_recognised(self):
+        write(self.repo / ".git/config", self.PLAIN)
+        self.assertTrue(share.plain_clone(self.repo))
+
+    def test_anything_more_in_the_config_is_refused(self):
+        for extra in ("[core]\n\tfsmonitor = touch pwned\n", "\tfsmonitor = touch pwned\n",
+                      "[include]\n\tpath = ../evil\n", '[filter "x"]\n\tclean = touch pwned\n',
+                      "[extensions]\n\tworktreeConfig = true\n", "[core]\n\tsshCommand = touch pwned\n",
+                      "[core]\n\tbare = false \\\n", "garbage\n"):
+            write(self.repo / ".git/config", self.PLAIN + extra)
+            self.assertFalse(share.plain_clone(self.repo), extra)
+        write(self.repo / ".git/config", self.PLAIN)
+        write(self.repo / ".git/config.worktree", "[core]\n\tfsmonitor = touch pwned\n")
+        self.assertFalse(share.plain_clone(self.repo))
+
+    @unittest.skipUnless(shutil.which("git"), "git not installed")
+    def test_a_planted_fsmonitor_never_runs(self):
+        # The reported case: a theme folder whose .git came from somewhere else names a command in
+        # core.fsmonitor, and the Share window's `git status` would start it.
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+        write(self.repo / "colors.toml", "x = 1\n")
+        for cmd in (["init", "-q"], ["add", "."], ["commit", "-qm", "x"]):
+            subprocess.run(["git", "-C", str(self.repo), *cmd], check=True, env=env, capture_output=True)
+        self.assertIsNotNone(share._git(self.repo, "status", "--porcelain"), "a plain repository is read")
+        marker = self.repo / "pwned"
+        hook = self.repo / "hook.sh"
+        write(hook, f"#!/bin/sh\ntouch '{marker}'\n")
+        hook.chmod(0o755)
+        with open(self.repo / ".git/config", "a") as f:
+            f.write(f"[core]\n\tfsmonitor = {hook}\n")
+        self.assertIsNone(share._git(self.repo, "status", "--porcelain"))
+        self.assertFalse(marker.exists(), "the planted command ran")
+
+    def test_a_setup_file_with_git_metadata_is_refused(self):
+        path = self.repo / "bad.omaskins"
+        with zipfile.ZipFile(path, "w") as z:
+            z.writestr(share.MANIFEST, json.dumps({"format": share.FORMAT}))
+            z.writestr("themes/evil/colors.toml", "x = 1\n")
+            z.writestr("themes/evil/.git/config", "[core]\n\tfsmonitor = touch pwned\n")
+        with self.assertRaises(share.BadZip):
+            share.read_zip(path)
+        self.assertTrue(share._git_metadata("themes/evil/sub/.GIT/index"))
+        self.assertFalse(share._git_metadata("themes/evil/.gitignore"))
 
 
 def tearDownModule():

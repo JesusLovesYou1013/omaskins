@@ -749,6 +749,7 @@ def run(plugin_id=None):
             log("added Style › OmaSkins to Omarchy's menu")
     except Exception as e:
         log("launcher and menu registration failed:", repr(e))
+    data.private_cache()
     # A copy of the remover outside this folder, which `omarchy plugin remove` deletes (see uninstall.py).
     try:
         from . import uninstall

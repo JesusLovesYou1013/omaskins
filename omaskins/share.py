@@ -251,10 +251,52 @@ def register_file_type(launcher=None):
 
 # --------------------------------------------------------------------------- export
 
-def _git(path, *args):
+# What `git clone` writes to .git/config. Anything else there (core.fsmonitor, a filter, an include)
+# can name a program for git to run, so a folder with more than this is never handed to git.
+_PLAIN_GIT_CONFIG = {"core": {"repositoryformatversion", "filemode", "bare", "logallrefupdates", "ignorecase",
+                              "precomposeunicode", "symlinks"},
+                     "remote": {"url", "fetch"},
+                     "branch": {"remote", "merge", "vscode-merge-base"}}
+_GIT_SECTION = re.compile(r'\[([A-Za-z0-9-]+)(?: "[^"\\]*")?\]')
+_GIT_KEY = re.compile(r"([A-Za-z][A-Za-z0-9-]*)\s*=\s*[^\\]*")
+
+
+def plain_clone(path):
+    """True when `path`/.git is a folder whose config holds only what a clone writes."""
+    git = Path(path) / ".git"
     try:
-        return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=20,
-                              env=data.child_env())
+        if git.is_symlink() or not git.is_dir() or (git / "config").is_symlink():
+            return False
+        if (git / "config.worktree").exists():
+            return False
+        text = (git / "config").read_text()
+    except (OSError, UnicodeDecodeError):
+        return False
+    allowed = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        section = _GIT_SECTION.fullmatch(line)
+        if section:
+            allowed = _PLAIN_GIT_CONFIG.get(section.group(1).lower())
+            if allowed is None:
+                return False
+            continue
+        key = _GIT_KEY.fullmatch(line)
+        if not key or allowed is None or key.group(1).lower() not in allowed:
+            return False
+    return True
+
+
+def _git(path, *args):
+    """Read-only git in a theme's folder, and only in a plain clone (see plain_clone)."""
+    if not plain_clone(path):
+        return None
+    try:
+        return subprocess.run(["git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                               "-C", str(path), *args], capture_output=True, text=True, timeout=20,
+                              env={**data.child_env(), "GIT_OPTIONAL_LOCKS": "0"})
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -266,7 +308,7 @@ def _theme_entry(t, listed_by_name):
     listed = listed_by_name.get(t.name)
     if listed and (t.path / ".git").is_dir():
         status = _git(t.path, "status", "--porcelain")
-        head = _git(t.path, "rev-parse", "HEAD")
+        head = _git(t.path, "rev-parse", "HEAD") if status is not None else None
         if status is not None and status.returncode == 0 and not status.stdout.strip():
             return {"name": t.name, "kind": "link", "repo": listed.repo_url,
                     "commit": head.stdout.strip() if head and head.returncode == 0 else ""}, []
@@ -419,9 +461,13 @@ def write_zip(dest, community, progress=None, collected=None):
 _SAFE_NAME = re.compile(r"[A-Za-z0-9._+\- ()]+")
 
 
+def _git_metadata(name):
+    return any(part.lower() == ".git" for part in PurePosixPath(name).parts)
+
+
 def _safe_member(name):
     p = PurePosixPath(name)
-    return (not p.is_absolute() and ".." not in p.parts and p.parts
+    return (not p.is_absolute() and not _git_metadata(name) and ".." not in p.parts and p.parts
             and p.parts[0] in ("themes", "backgrounds", "fonts", "current", "aether-blueprints")
             and all(_SAFE_NAME.fullmatch(part) and not part.startswith("..") for part in p.parts))
 
@@ -701,9 +747,11 @@ class _Pictures:
 
 
 def _unpack_theme(z, name, note):
-    """A theme not here yet: themes/<name>/ into ~/.config/omarchy/themes, without the files that run code."""
+    """A theme not here yet: themes/<name>/ into ~/.config/omarchy/themes, without the files that run code
+    and without git's own folder (an export never has one; its config can name programs to run)."""
     prefix = f"themes/{name}/"
-    members = [i for i in z.infolist() if i.filename.startswith(prefix) and not i.is_dir()]
+    members = [i for i in z.infolist() if i.filename.startswith(prefix) and not i.is_dir()
+               and not _git_metadata(i.filename)]
     dropped = sorted({PurePosixPath(i.filename).name for i in members if denied(PurePosixPath(i.filename).name)})
     stage = data.PARTIAL_THEMES / name
     shutil.rmtree(stage, ignore_errors=True)

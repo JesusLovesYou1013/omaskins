@@ -40,6 +40,7 @@ if "FONTCONFIG_FILE" not in os.environ:
 from omaskins import run  # noqa: E402
 
 run.ensure_window_rules()
+run.data.private_cache()
 
 from omaskins.app import main  # noqa: E402
 

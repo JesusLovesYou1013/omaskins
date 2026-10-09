@@ -148,12 +148,18 @@ re-adding OmaSkins; names that already exist are merged, never copied. Any work 
 password (fonts, built-in themes) is done at once, in Omarchy's own installer window, and can be
 cancelled.
 
+A setup file is checked before anything is taken from it. A theme in it comes in without the files
+that run code (as Omarchy does for downloaded themes) and never with git's own folder: a file that
+carries one is refused. When exporting, `git` is only asked about a theme folder whose `.git/config`
+holds what a plain clone writes; any other theme is copied into the file instead.
+
 ## What it writes
 
 While it's on:
 
 - `~/.config/omaskins/` (your settings), `~/.local/state/omaskins/` (the engine's notes and a copy of
-  its remover), `~/.cache/omaskins/` (downloaded screenshots and previews);
+  its remover), `~/.cache/omaskins/` (downloaded screenshots and previews; readable by you only, since previews are
+  small copies of your pictures);
 - one row in `~/.config/omarchy/extensions/omarchy-menu.jsonc`, a hidden launcher entry and the
   `.omaskins` file type in `~/.local/share/`.
 

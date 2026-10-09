@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import time
 import tomllib
@@ -175,8 +176,19 @@ def repo_key(url):
 
 # --------------------------------------------------------------------------- network + cache
 
+def private_cache():
+    """The cache folder, open to its owner only: it holds small copies of pictures that may be private."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if stat.S_IMODE(CACHE_DIR.stat().st_mode) != 0o700:
+            CACHE_DIR.chmod(0o700)
+    except OSError:
+        pass
+    return CACHE_DIR
+
+
 def _cache(*parts):
-    p = CACHE_DIR.joinpath(*parts)
+    p = private_cache().joinpath(*parts)
     p.parent.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -1612,6 +1624,7 @@ def thumbnail(src, width=480):
     try:
         subprocess.run(["magick", f"{src}[0]", "-thumbnail", f"{width}x", "-strip", str(tmp)],
                        capture_output=True, timeout=30, check=True, env=child_env())
+        tmp.chmod(0o600)
         tmp.replace(dest)
         return dest
     except (OSError, subprocess.SubprocessError):
