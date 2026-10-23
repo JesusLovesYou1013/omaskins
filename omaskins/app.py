@@ -59,6 +59,19 @@ def esc(text):
     return GLib.markup_escape_text(str(text))
 
 
+def own_alpha_css(bg, a, b, blur):
+    """OmaSkins' own see-through background: `a` focused, `b` unfocused, from the theme's background `bg`.
+    With blur, it asks Hyprland for blur behind its whole window: GTK 4.24+ tells Hyprland where to blur
+    (ext-background-effect-v1) and Hyprland then blurs nowhere else, so none asked for meant none at all
+    (2026-10-22). A backdrop blur of 10px or more asks for it; Hyprland draws its own blur there. The big
+    picture view (its own window, dimmed over the whole screen) blurs what's behind it the same way. Only
+    what's BEHIND a window is blurred: its own pictures (thumbnails, the big picture) are drawn on top, sharp."""
+    return ("window.omaskins, window.omaskins.csd { background: none; }\n"
+            f".frame-root {{ background: {theme.rgba(bg, a)}; }}\n"
+            f"window.omaskins:backdrop .frame-root {{ background: {theme.rgba(bg, b)}; }}\n"
+            + ("window.omaskins, window.image-preview { backdrop-filter: blur(12px); }\n" if blur else ""))
+
+
 def label(text="", css="", xalign=0, **kw):
     lab = Gtk.Label(label=text, xalign=xalign, **kw)
     for c in css.split():
@@ -2136,6 +2149,7 @@ class Window(Adw.ApplicationWindow):
         Gtk.StyleContext.add_provider_for_display(Gdk.Display.get_default(), self.alpha_css,
                                                   Gtk.STYLE_PROVIDER_PRIORITY_USER + 1)
         self._alpha, self._alpha_fade, self._bg = data.transparency_values(data.transparency_step())[:2], 0, None
+        self._blur = data.transparency_values(data.transparency_step())[2]
         self.reload_theme()
 
         main = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
@@ -2370,16 +2384,14 @@ class Window(Adw.ApplicationWindow):
         """OmaSkins' own background at `a` (focused) / `b` (unfocused); nothing else in it changes."""
         self._alpha = (a, b)
         bg = self._bg or "#000000"
-        self.alpha_css.load_from_string(
-            "window.omaskins, window.omaskins.csd { background: none; }\n"
-            f".frame-root {{ background: {theme.rgba(bg, a)}; }}\n"
-            f"window.omaskins:backdrop .frame-root {{ background: {theme.rgba(bg, b)}; }}\n")
+        self.alpha_css.load_from_string(own_alpha_css(bg, a, b, self._blur))
 
     def _fade_alpha(self, step, seconds=1.5, frames=10):
         """Fade OmaSkins' own background to a step, together with the other windows' fade."""
         if self._alpha_fade:
             GLib.source_remove(self._alpha_fade)
         (a0, b0), (a1, b1) = self._alpha, data.transparency_values(step)[:2]
+        self._blur = data.transparency_values(step)[2]   # blur behind it from the fade's first frame
         frame = [0]
 
         def tick():

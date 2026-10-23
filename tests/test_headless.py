@@ -57,6 +57,7 @@ _run.hypr_clients = _no_windows
 _run.nautilus_windows = lambda: {}   # never ask the real Nautilus what it has open...
 _NAUTILUS_RESTART = _run.nautilus_restart   # the real one, only ever driven with fakes in a test
 _run.nautilus_restart = _no_windows   # ...and never restart it
+_run.nautilus_running = lambda: False   # ...nor look for the real one (a running one would be quit)
 _run.restart_dialog_service = _no_windows   # nor Omarchy's real dialog service
 _run.dialog_service_running = lambda: False
 data.theme_mode = lambda: "dark"   # never ask the real Omarchy (each test sets what it needs)
@@ -2805,6 +2806,72 @@ class NautilusTransparency(unittest.TestCase):
         self.assertEqual(data.DIALOG_GREYS["dark"][0], "#1d1d20", "the same grey as the file dialogs")
         self.assertEqual(data.nautilus_css(data.TRANSPARENCY_DEFAULT), "", "Omarchy's default: nothing of ours")
         self.assertIn("alpha(#1d1d20, 1)", data.nautilus_css(0), "step 1: solid")
+
+    def test_nautilus_asks_for_blur_only_with_blur(self):
+        # GTK 4.24+ tells Hyprland where to blur (ext-background-effect-v1); Hyprland blurs nowhere else.
+        line = "window.nautilus-window { backdrop-filter: blur(12px); }"
+        for step in (2, 3, 4):
+            css = data.nautilus_css(step)
+            self.assertTrue(data.transparency_values(step)[2])
+            self.assertIn("}\n" + line + "\n" + data.NAUTILUS_CSS_END, css, "last, after the dark greys")
+            self.assertEqual(css.count("backdrop-filter"), 1)
+        self.assertFalse(data.transparency_values(0)[2])
+        self.assertNotIn("backdrop-filter", data.nautilus_css(0), "no blur: none asked for")
+        self.assertEqual(data.nautilus_css(data.TRANSPARENCY_DEFAULT), "")
+
+    def test_omaskins_own_window_asks_for_blur_only_with_blur(self):
+        from omaskins import app  # needs GTK, like the app
+        line = "window.omaskins, window.image-preview { backdrop-filter: blur(12px); }"   # and the big view
+        on = app.own_alpha_css("#1d1d20", 0.75, 0.68, True)
+        self.assertIn(line, on)
+        self.assertIn(".frame-root { background: ", on, "its background stays its own")
+        self.assertNotIn("backdrop-filter", app.own_alpha_css("#1d1d20", 0.75, 0.68, False))
+        for step in range(len(data.TRANSPARENCY_STEPS)):
+            css = app.own_alpha_css("#000000", *data.transparency_values(step))
+            self.assertEqual(line in css, bool(data.transparency_values(step)[2]), f"step {step}")
+
+    def test_pictures_are_never_blurred(self):
+        # Owner, 2026-10-22: thumbnails and the big picture stay sharp (wallpapers must be easy to see). Only
+        # the two windows ask Hyprland for blur BEHIND them (the big view's dimmed backdrop included); no rule
+        # for a picture, a thumbnail or anything inside a window carries a backdrop-filter, a blur or a filter
+        # that blurs, at any step. (The Rotation tab's left-out dimming is saturate/brightness, never blur.)
+        import re
+        from omaskins import app, theme  # needs GTK, like the app
+        css = theme.build_css(theme.load_theme())
+        for step in range(len(data.TRANSPARENCY_STEPS)):
+            css += app.own_alpha_css("#000000", *data.transparency_values(step))
+        windows = {"window.omaskins", "window.image-preview"}
+        for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css):
+            sel = selector.strip().split("*/")[-1].strip()
+            if any(k in sel for k in ("thumb", "picture", "zoom-btn")) or any(w + " " in sel for w in windows):
+                self.assertNotIn("backdrop-filter", body, sel)
+                self.assertNotIn("blur", body, sel)
+            if "backdrop-filter" in body:
+                self.assertEqual({x.strip() for x in sel.split(",")}, windows, "only the windows themselves")
+        self.assertTrue(issubclass(app.ImagePreview, app.Gtk.Window), "the big view is its own window (surface)")
+
+    def test_an_idle_nautilus_is_quit_to_read_its_new_look(self):
+        quit_ = []
+        q = lambda: quit_.append(1)
+        self.assertTrue(_run.nautilus_quit_idle(running=lambda: True, windows=lambda: {}, quit_=q))
+        self.assertEqual(quit_, [1], "running, no window: quit")
+        self.assertFalse(_run.nautilus_quit_idle(running=lambda: True, quit_=q,
+                                                 windows=lambda: {"/org/gnome/Nautilus/window/1": ["file:///x"]}))
+        asked = []
+        self.assertFalse(_run.nautilus_quit_idle(running=lambda: False, windows=lambda: asked.append(1) or {}, quit_=q))
+        self.assertEqual((quit_, asked), ([1], []), "open windows are left alone; not running: not even asked")
+
+    def test_slider_quits_an_idle_nautilus(self):
+        idle = []
+        saved = _run.nautilus_quit_idle
+        _run.nautilus_quit_idle = lambda *a, **k: idle.append(1)
+        try:
+            _run.apply_transparency(3, evaluate=lambda c: None, clients=lambda: [], sleep=lambda s: None)
+            self.assertEqual(idle, [1], "its stylesheet changed and no window is open")
+            _run.apply_transparency(3, evaluate=lambda c: None, clients=lambda: [], sleep=lambda s: None)
+            self.assertEqual(idle, [1], "no change: left alone")
+        finally:
+            _run.nautilus_quit_idle = saved
 
     def test_the_rest_of_gtk_css_is_left_alone(self):
         write(data.GTK4_CSS, "/* mine */\nlabel { color: red; }\n")

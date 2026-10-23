@@ -2215,7 +2215,7 @@ def nautilus_css(step):
     Nautilus's window. Empty at the default step (then Hyprland fades it as Omarchy does)."""
     if step == TRANSPARENCY_DEFAULT:
         return ""
-    a, b, _ = transparency_values(step)
+    a, b, blur = transparency_values(step)
     w = "window.nautilus-window"
 
     def greys(mode):
@@ -2239,6 +2239,10 @@ def nautilus_css(step):
         "@media (prefers-color-scheme: dark) {",
         *("  " + line for line in greys("dark")),
         "}",
+        # GTK 4.24+ tells Hyprland where to blur behind it (ext-background-effect-v1), and Hyprland then blurs
+        # only there: nothing asked for meant no blur at all. A backdrop blur of 10px or more asks for the
+        # whole window; Hyprland draws its own blur there.
+        *([f"{w} {{ backdrop-filter: blur(12px); }}"] if blur else []),
         NAUTILUS_CSS_END]) + "\n"
 
 

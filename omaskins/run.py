@@ -855,6 +855,23 @@ def nautilus_windows():
     return {w: re.findall(r"'([^']+)'", uris) for w, uris in found}
 
 
+def nautilus_running():
+    return bool(subprocess.run(["pgrep", "-x", "nautilus"], capture_output=True).stdout.strip())
+
+
+def nautilus_quit_idle(running=None, windows=None, quit_=None):
+    """Nautilus stays running after its last window closes and keeps the stylesheet it started with, so a new
+    window would still show the old look (2026-10-22: the blur line was ignored by a Nautilus left running).
+    With no window open, quit it: the next one starts fresh and reads it. True if it was quit."""
+    running = running or nautilus_running
+    windows = windows or nautilus_windows
+    quit_ = quit_ or (lambda: subprocess.run(["nautilus", "-q"], capture_output=True, timeout=10, env=data.child_env()))
+    if not running() or windows():   # asked only while it runs (asking would start it)
+        return False
+    quit_()
+    return True
+
+
 def nautilus_restart(windows, evaluate=None, clients=None, sleep=time.sleep, quit_=None, open_=None):
     """Quit Nautilus and reopen each of its windows on the same folders and workspaces, so it reads its
     stylesheet again (GTK reads it only when Nautilus starts)."""
@@ -1034,6 +1051,8 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
         open_windows = nautilus_windows()
         if open_windows:
             nautilus_restart(open_windows, evaluate, clients, sleep)
+        else:
+            nautilus_quit_idle()
     update_hypr_file()
 
 

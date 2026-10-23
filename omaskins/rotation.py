@@ -615,6 +615,8 @@ class DialogLook:
                 # OmaSkins' slider restarts an open Nautilus (you're looking at it then).
                 if data.write_nautilus_css(step):
                     log("Nautilus look rewritten")
+                    if _run.nautilus_quit_idle():   # one left running with no window would keep the old look
+                        log("Nautilus (no window open) quit, so it reads it when it next opens")
                 if data.write_shell_block(step):
                     log("Omarchy's menus and panels: transparency rewritten")
                 if data.write_dialog_css(step):
