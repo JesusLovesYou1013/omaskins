@@ -2,6 +2,7 @@ import QtQuick
 import Quickshell
 import Quickshell.Io
 import qs.Commons
+import qs.Commons as Commons
 import qs.Ui
 
 // OmaSkins' palette in the bar. A click drops a small panel down from the icon (Omarchy's own panel, laid
@@ -16,7 +17,7 @@ Panel {
   moduleName: "io.github.jesuslovesyou1013.omaskins"
   manageIpc: false
 
-  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color foreground: bar ? bar.foreground : Commons.Color.foreground
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property string pluginDir:
     decodeURIComponent(Qt.resolvedUrl(".").toString().replace(/^file:\/\//, "").replace(/\/$/, ""))
@@ -133,12 +134,12 @@ Panel {
           width: parent.width
           title: "OmaSkins"
           meta: root.themeLabel
-          foreground: Color.popups.text
+          foreground: root.foreground
           fontFamily: root.fontFamily
           iconComponent: Component {
             Text {
               text: "󰏘"
-              color: Color.popups.text
+              color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
             }
@@ -146,7 +147,7 @@ Panel {
         }
 
         PanelSeparator {
-          foreground: Color.popups.text
+          foreground: root.foreground
         }
 
         Repeater {
@@ -159,7 +160,7 @@ Panel {
             leftAlign: true
             iconText: modelData.icon
             text: modelData.label
-            foreground: Color.popups.text
+            foreground: root.foreground
             fontFamily: root.fontFamily
             hasCursor: root.cursor === index
             onHovered: function(isHovered) { if (isHovered) root.cursor = index }
