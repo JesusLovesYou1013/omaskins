@@ -16,11 +16,13 @@ def _in_try_omarchy_vm():
         return False
 
 
-# Try Omarchy VM: GTK's OpenGL renderer on virgl garbles tooltips and other small popups, and Zink
-# (inherited from a terminal that uses it) swaps red and blue. Draw in software there; on real
-# hardware GTK keeps its GPU renderer. An explicit GSK_RENDERER still wins. (Try Omarchy reports 04c, 07.)
+# Try Omarchy VM: Zink (inherited from a terminal that uses it) swaps red and blue, so OmaSkins drops it
+# and draws with GTK's OpenGL renderer on virgl, the VM's real GPU. (It drew in software here for a
+# while, because virgl garbled tooltips: report 07. Gone with GTK 4.24.1 + Mesa 26.2.5, checked
+# 2026-10-28, and software drawing dropped most frames of the big view's animation.) GL, not GTK's own
+# pick: its Vulkan choice here is the CPU (lavapipe). An explicit GSK_RENDERER still wins. (Report 04c.)
 if _in_try_omarchy_vm():
-    os.environ.setdefault("GSK_RENDERER", "cairo")
+    os.environ.setdefault("GSK_RENDERER", "gl")
     os.environ.pop("MESA_LOADER_DRIVER_OVERRIDE", None)
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))

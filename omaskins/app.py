@@ -74,7 +74,12 @@ def own_alpha_css(bg, a, b, blur):
             f"window.omaskins:backdrop .frame-root {{ background-color: {theme.rgba(bg, b)}; }}\n"
             + ("window.omaskins, window.image-preview { backdrop-filter: blur(12px); }\n"
                # the big view drawing the desktop itself: nothing to blur behind it
-               "window.image-preview.self-blur { backdrop-filter: none; }\n" if blur else ""))
+               "window.image-preview.self-blur { backdrop-filter: none; }\n" if blur else "")
+            # Under the big view OmaSkins keeps its focused look: the big view starts from a picture of it
+            # focused, so nothing changes behind it, and fading to the unfocused look repainted the whole
+            # window, costing the big view's animation its frames.
+            + "window.omaskins.under-preview .frame-root { transition: none; }\n"
+            f"window.omaskins.under-preview:backdrop .frame-root {{ background-color: {theme.rgba(bg, a)}; }}\n")
 
 
 def label(text="", css="", xalign=0, **kw):
@@ -249,10 +254,16 @@ class ImagePreview(Gtk.Window):
     and it closed only sometimes). Esc, or switching to another window, closes it too."""
 
     def __init__(self, parent, src, small=None, desktop=None):
-        super().__init__(transient_for=parent, modal=True, decorated=False, title="OmaSkins preview")
+        # Not modal: Hyprland dims a modal window's parent (decoration:dim_modal), which blinked OmaSkins dark
+        # before the big view's first frame covered it (owner's recording, 2026-10-28). It covers the whole
+        # screen and closes on any click, so nothing reaches OmaSkins meanwhile anyway.
+        super().__init__(transient_for=parent, decorated=False, title="OmaSkins preview")
         # OmaSkins' own app id (Hyprland's class): without it the window had the launcher's name, so OmaSkins'
         # rules missed it and Hyprland faded the whole window, picture and all (owner, 2026-10-27).
         self.set_application(parent.get_application())
+        parent.add_css_class("under-preview")
+        # Once OmaSkins has the focus back (no change to see), or has lost it to another window (it fades).
+        self.connect("destroy", lambda *_: GLib.timeout_add(150, lambda: parent.remove_css_class("under-preview")))
         self.add_css_class("image-preview")
         monitor = parent.get_display().get_monitor_at_surface(parent.get_surface())
         geo = monitor.get_geometry() if monitor else None
@@ -293,7 +304,18 @@ class ImagePreview(Gtk.Window):
             desktop = Gdk.Texture.new_from_bytes(GLib.Bytes.new(png)) if png else None
         except GLib.Error:
             desktop = None
-        cls(parent, src, small, desktop).present()
+        # The sharp copy first, if it comes within 0.15 s (nothing on screen changes meanwhile): taking a
+        # big picture in mid-animation cost a visible stall.
+        opened = []
+
+        def show(big=None):
+            if not opened:
+                opened.append(cls(parent, src, big or small, desktop))
+                opened[0].present()
+            return False
+        IMAGES.get(src, PREVIEW_WIDTH, show, priority=-2)
+        if not opened:
+            GLib.timeout_add(150, show)
 
     def _focus_changed(self, _w, _p):
         """Switching to another window closes it, once it has had the focus (not before it gets it)."""
@@ -378,8 +400,14 @@ class BlurringDesktop(Gtk.Widget):
         if self.steps and self._start is None:
             # Each step drawn once, a pixel big, where the top bar covers it: the renderer takes each picture
             # in the first time it draws it, which mid-fade cost a frame every step on this VM.
+            # The blend and the dim too, so the renderer has those ready as well (a first run spent half a
+            # second preparing them on the fade's first frame).
+            dot = Graphene.Rect().init(0, 0, 1, 1)
             for step in self.steps:
-                snap.append_texture(step, Graphene.Rect().init(0, 0, 1, 1))
+                snap.push_opacity(0.5)
+                snap.append_scaled_texture(step, Gsk.ScalingFilter.LINEAR, dot)
+                snap.pop()
+            snap.append_color(Gdk.RGBA(red=0, green=0, blue=0, alpha=0.5), dot)
             self._warm = True
 
 
@@ -417,6 +445,12 @@ class ZoomIn(Gtk.Widget):
 
     def do_snapshot(self, snap):
         if self.progress <= 0:
+            # Drawn a pixel small under the top bar while it waits, so the renderer has the picture in
+            # hand before it grows (taking it in on the zoom's first frame stalled it).
+            snap.save()
+            snap.scale(0.001, 0.001)
+            self.snapshot_child(self._child, snap)
+            snap.restore()
             return
         scale = self.FROM + (1 - self.FROM) * self.progress
         cx, cy = self.get_width() / 2, self.get_height() / 2

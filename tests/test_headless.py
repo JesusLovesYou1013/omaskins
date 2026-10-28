@@ -2886,6 +2886,18 @@ class NautilusTransparency(unittest.TestCase):
         self.assertLess(app.ZoomIn.FROM, 1)
         css = app.own_alpha_css("#000000", 0.75, 0.68, True)
         self.assertIn("window.image-preview.self-blur { backdrop-filter: none; }", css, "no blur asked for behind it")
+        self.assertIn("window.omaskins.under-preview .frame-root { transition: none; }", css,
+                      "OmaSkins doesn't fade under the big view: that repaint cost the animation its frames")
+        self.assertIn("window.omaskins.under-preview:backdrop .frame-root { background-color: "
+                      + app.theme.rgba("#000000", 0.75) + "; }", css,
+                      "nor changes look: the big view starts from a picture of it focused")
+        self.assertNotIn("modal=True", (ROOT / "omaskins" / "app.py").read_text(),
+                         "Hyprland dims a modal's parent: OmaSkins blinked dark as the big view opened")
+        self.assertIn("window.omaskins.under-preview .frame-root { transition: none; }",
+                      app.own_alpha_css("#000000", 1.0, 1.0, False))
+        launcher = (ROOT / "omaskins-manager").read_text()
+        self.assertIn('os.environ.setdefault("GSK_RENDERER", "gl")', launcher, "the VM draws on its GPU")
+        self.assertNotIn('"cairo"', launcher)
 
     def test_an_idle_nautilus_is_quit_to_read_its_new_look(self):
         quit_ = []
