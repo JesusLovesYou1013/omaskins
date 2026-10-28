@@ -619,6 +619,8 @@ class DialogLook:
                         log("Nautilus (no window open) quit, so it reads it when it next opens")
                 if data.write_shell_block(step):
                     log("Omarchy's menus and panels: transparency rewritten")
+                if data.write_blur_requests(step):
+                    log("blur behind every window: GTK4 and foot asked for it")
                 if data.write_dialog_css(step):
                     self.pending = True
                     log("file dialog look rewritten")

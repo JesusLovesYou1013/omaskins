@@ -168,6 +168,7 @@ def restore_look(run=None, log=print):
         data.save_transparency(data.TRANSPARENCY_DEFAULT)
         data.write_shell_block(data.TRANSPARENCY_DEFAULT)
         data.write_nautilus_css(data.TRANSPARENCY_DEFAULT)
+        data.write_blur_requests(0)   # no blur: both blocks go
 
     def dialogs():
         if data.write_dialog_css(data.TRANSPARENCY_DEFAULT):

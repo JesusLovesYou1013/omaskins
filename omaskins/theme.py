@@ -406,6 +406,8 @@ gridview > child:focus-visible {{ outline: 1px solid {sel_border}; outline-offse
 .zoom-btn:hover {{ background: rgba(0, 0, 0, 0.8); }}
 /* the big view: covers the screen, see-through and lightly dimmed; the picture sits in the middle */
 window.image-preview {{ background: rgba(0, 0, 0, 0.30); }}
+/* ...unless it draws the desktop itself (BlurringDesktop dims as it blurs) */
+window.image-preview.self-blur {{ background: none; }}
 .tile.off label {{ color: {dim}; }}
 .rot-grid:disabled .tile {{ opacity: 0.55; }}
 /* themes left out while Themes rotation is on: greyed, but they still open (to look at their backgrounds) */

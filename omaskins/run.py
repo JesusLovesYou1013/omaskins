@@ -808,16 +808,30 @@ def hypr_eval(code):
 # Lua state, with this flag, is cleared then too, so the next launch sets them again).
 # render_unfocused: it may redraw on a hidden workspace, so a theme change never shows old colours when
 # you switch back (it only redraws when something changes: one redraw per theme change).
+# The big view draws the desktop behind it itself and blurs it up from sharp over half a second (owner,
+# 2026-10-27: the desktop should turn gradually to a blur; Hyprland's blur can only fade in finished, which
+# looked like a layer laid over it). So Hyprland neither animates nor blurs it, and it stays fully solid.
 WINDOW_RULES_LUA = """
-if not omaskins_window_rules then
-  omaskins_window_rules = true
+if not omaskins_window_rules_3 then
+  omaskins_window_rules_3 = true
   hl.window_rule({ match = { class = "^io.github.jesuslovesyou1013.omaskins$", title = "^OmaSkins Manager$" },
                    float = true, center = true, size = { "(monitor_w*0.7)", "(monitor_h*0.75)" },
                    render_unfocused = true })
   hl.window_rule({ match = { class = "^io.github.jesuslovesyou1013.omaskins$", title = "^OmaSkins preview$" },
-                   float = true, center = true, border_size = 0, no_shadow = true })
+                   float = true, move = { 0, 0 }, border_size = 0, no_shadow = true, no_anim = true,
+                   no_blur = true, opacity = "1 1" })
 end
 """
+
+
+def screenshot(output):
+    """The screen `output` as PNG bytes (grim), or None."""
+    try:
+        shot = subprocess.run(["grim", "-l", "0", "-o", output, "-"], capture_output=True, timeout=5,
+                              env=data.child_env())
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return shot.stdout if shot.returncode == 0 and shot.stdout else None
 
 
 def ensure_window_rules(evaluate=None):
@@ -974,6 +988,13 @@ local function shell_blur(on)
   end
   F.shell_blur:set_enabled(on)
 end
+local function bar_blur(on)
+  -- Blur behind the top bar, while OmaSkins' top bar switch is on (see data.BAR_BLUR_RULE).
+  if not F.bar_blur then
+    F.bar_blur = """ + data.BAR_BLUR_RULE + """
+  end
+  F.bar_blur:set_enabled(on)
+end
 local function dialogs(own)
   -- File dialogs (Omarchy's dialog service) out of Hyprland's fade while OmaSkins styles them.
   if not F.dialogs then
@@ -1047,6 +1068,9 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
     # the windows' blur.
     data.write_shell_block(step)
     evaluate(FADE_LUA + f"shell_blur({'true' if after[2] else 'false'})")
+    evaluate(FADE_LUA + f"bar_blur({'true' if data.top_bar_blur(step) else 'false'})")
+    # Apps that tell Hyprland where to blur (GTK4, foot) ask for the same blur behind their windows.
+    data.write_blur_requests(step)
     if data.write_nautilus_css(step):
         open_windows = nautilus_windows()
         if open_windows:
@@ -1063,6 +1087,15 @@ def set_qt_apps(on):
         qtstyle.remove()
         update_hypr_file()
     # On: the rotation engine builds the style, then updates omaskins.lua (it watches for this).
+
+
+def set_top_bar(on, evaluate=None):
+    """The top bar see-through (one step behind the rest) or solid; the shell re-reads its file live."""
+    evaluate = evaluate or hypr_eval
+    data.save_top_bar(on)
+    step = data.transparency_step()
+    data.write_shell_block(step)
+    evaluate(FADE_LUA + f"bar_blur({'true' if data.top_bar_blur(step) else 'false'})")
 
 
 def dialog_service_running():
@@ -1197,6 +1230,8 @@ def _perform(steps, progress=None, notify=None, transfer=None):
             apply_transparency(*args)
         elif kind == "qt_apps":
             set_qt_apps(*args)
+        elif kind == "top_bar":
+            set_top_bar(*args)
         elif kind == "notify":  # tell the window something is live now (it restyles itself)
             if notify:
                 notify(args[0])

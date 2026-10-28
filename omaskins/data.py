@@ -2080,7 +2080,22 @@ def corners_file_text(on, px):
         lines.append(f"hl.config({{ decoration = {{ rounding = {int(px)} }} }})")
     else:
         lines.append("-- Rounded Corners is off: each theme's own rounding applies.")
-    return "\n".join(lines) + "\n" + TRANSPARENCY_LUA + QT_LUA
+    return "\n".join(lines) + "\n" + FOCUS_FADE_LUA + TRANSPARENCY_LUA + QT_LUA
+
+
+# Focus changes fade (owner, 2026-10-27: moving between apps, by mouse or keys, flashed): the windows'
+# focused/unfocused levels cross-fade over half a second instead of jumping. Omarchy turns this animation
+# off; OmaSkins turns it on with its own Hyprland file, so removing OmaSkins brings Omarchy's back.
+# Hyprland's speed is in tenths of a second; the curve is one Omarchy defines.
+FOCUS_FADE = 'hl.animation({ leaf = "fadeSwitch", enabled = true, speed = 5, bezier = "easeInOutCubic" })'
+# Apps that draw their own see-through background (OmaSkins itself, Nautilus, the file dialogs) fade it the
+# same way, with the same curve, so every window eases together instead of those few jumping (owner,
+# 2026-10-27: "a flash of the level of transparency at the moment of focus shift").
+FOCUS_FADE_CSS = "transition: background-color 500ms cubic-bezier(0.65, 0.05, 0.36, 1);"
+FOCUS_FADE_LUA = f"""
+-- Moving between apps fades the windows' levels over half a second instead of a jump (Omarchy: off).
+{FOCUS_FADE}
+"""
 
 
 # --------------------------------------------------------------------------- transparency
@@ -2113,11 +2128,48 @@ SHELL_NAMESPACES = "^(omarchy-menu|omarchy-keyboard-panel|omarchy-notifications|
 SHELL_BLUR_RULE = f'hl.layer_rule({{ match = {{ namespace = "{SHELL_NAMESPACES}" }}, blur = true, ignore_alpha = 0.05 }})'
 
 
+# The top bar (owner, 2026-10-27; a switch, off by default): one step behind the rest, so it stays a little
+# darker. Solid at the first three steps (the third gives it Omarchy's own window level, barely see-through),
+# then the level of the step before. Blur behind it with the windows' blur. Its double-click (Omarchy's
+# own "transparent" bar) still works: that clears the background whatever the level, and the blur with it
+# (nothing under ignore_alpha is blurred).
+TOP_BAR_FILE = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omaskins" / "top-bar"   # "on"
+BAR_NAMESPACE = "^omarchy-bar$"
+BAR_BLUR_RULE = f'hl.layer_rule({{ match = {{ namespace = "{BAR_NAMESPACE}" }}, blur = true, ignore_alpha = 0.05 }})'
+
+
+def top_bar_enabled():
+    try:
+        return TOP_BAR_FILE.read_text().strip() == "on"
+    except OSError:
+        return False
+
+
+def save_top_bar(on):
+    if on:
+        TOP_BAR_FILE.parent.mkdir(parents=True, exist_ok=True)
+        TOP_BAR_FILE.write_text("on\n")
+    else:
+        TOP_BAR_FILE.unlink(missing_ok=True)
+
+
+def top_bar_alpha(step, on=None):
+    """The bar's level at a step, or None for Omarchy's own (solid): the switch off, or the first two steps."""
+    if not (top_bar_enabled() if on is None else on) or step <= TRANSPARENCY_DEFAULT:
+        return None
+    return transparency_values(step - 1)[0]
+
+
+def top_bar_blur(step, on=None):
+    return top_bar_alpha(step, on) is not None and transparency_values(step)[2]
+
+
 def shell_block(step):
     if step == TRANSPARENCY_DEFAULT:
         return ""
-    a = transparency_values(step)[0]
-    return "\n".join([SHELL_START] + [f"[{s}]\nbackground-alpha = {a:g}\n" for s in SHELL_SURFACES] + [SHELL_END]) + "\n"
+    a, bar = transparency_values(step)[0], top_bar_alpha(step)
+    return "\n".join([SHELL_START] + [f"[{s}]\nbackground-alpha = {a:g}\n" for s in SHELL_SURFACES]
+                     + ([f"[bar]\nbackground-alpha = {bar:g}\n"] if bar is not None else []) + [SHELL_END]) + "\n"
 
 
 def write_shell_block(step):
@@ -2160,6 +2212,15 @@ if type(omaskins_t) == "string" then
     if blur == "blur" then
       """ + TRANSPARENCY_BLUR + """
       """ + SHELL_BLUR_RULE + """
+      -- The top bar too, while its switch is on (see TOP_BAR_FILE): every step with blur gives it a level.
+      local okb, fb = pcall(io.open, config_dir .. "/omaskins/top-bar", "r")
+      if okb and fb then
+        local bar = fb:read("*l")
+        fb:close()
+        if bar == "on" then
+          """ + BAR_BLUR_RULE + """
+        end
+      end
     end
   end
 end
@@ -2234,6 +2295,7 @@ def nautilus_css(step):
         f"{w} .content-pane scrolledwindow, {w} .content-pane toolbarview, {w} .sidebar-pane toolbarview,",
         f"{w} placessidebar, {w} .navigation-sidebar,",
         f"{w} headerbar, {w} .top-bar {{ background-color: transparent; box-shadow: none; }}",
+        f"{w}, {w}.background, {w} .sidebar-pane {{ {FOCUS_FADE_CSS} }}",   # focus changes fade, like the rest
         # Light or dark follows Omarchy's setting live (GTK 4.16+), so a theme switch needs no restart.
         *greys("light"),
         "@media (prefers-color-scheme: dark) {",
@@ -2253,19 +2315,24 @@ def _sidebar_layer(base):
 
 
 def _write_css_block(path, start_mark, end_mark, block):
-    """Put one OmaSkins block in a GTK stylesheet (replacing its last one), leaving anything else in the file
+    """Put one OmaSkins block in a GTK stylesheet (replacing it where it stands), leaving anything else in the file
     alone; an empty block removes it (and the file too, if nothing else was ever in it). True if changed."""
     try:
         text = path.read_text()
     except OSError:
         text = ""
     start, end = text.find(start_mark), text.find(end_mark)
-    if start >= 0 and end > start:
-        before, after = text[:start].rstrip("\n"), text[end + len(end_mark):].lstrip("\n")
-        rest = (before + "\n\n" + after) if before and after else (before + "\n" if before else after)
+    found = start >= 0 and end > start
+    if found and block:
+        # Replaced where it stands, so two blocks in one file never swap places (each swap is a change).
+        after = text[end + len(end_mark):].lstrip("\n")
+        new = text[:start] + block + ("\n" + after if after else "")
     else:
         rest = text
-    new = (rest.rstrip("\n") + "\n\n" + block) if rest.strip() and block else (block or rest)
+        if found:
+            before, after = text[:start].rstrip("\n"), text[end + len(end_mark):].lstrip("\n")
+            rest = (before + "\n\n" + after) if before and after else (before + "\n" if before else after)
+        new = (rest.rstrip("\n") + "\n\n" + block) if rest.strip() and block else (block or rest)
     if new == text:
         return False
     if new.strip():
@@ -2281,6 +2348,44 @@ def _write_css_block(path, start_mark, end_mark, block):
 def write_nautilus_css(step):
     """OmaSkins' Nautilus block in ~/.config/gtk-4.0/gtk.css; gone at the default step. True if changed."""
     return _write_css_block(GTK4_CSS, NAUTILUS_CSS_START, NAUTILUS_CSS_END, nautilus_css(step))
+
+
+# --------------------------------------------------------------------------- blur behind every window
+#
+# Apps on newer toolkits (GTK 4.24+: Ghostty, Nautilus, every GTK4 app; foot 1.28) tell Hyprland where to
+# blur behind their windows (ext-background-effect-v1), and Hyprland 0.56 then blurs only there, whatever its
+# own blur setting says. They ask for nothing (Hyprland's opacity makes them see-through, not the app), so
+# they had no blur at all while the rest did. OmaSkins asks for each toolkit, in one place: the same blur
+# behind every window, at every step where Hyprland blurs (Omarchy's default too), none at the solid step.
+# Only BEHIND the window: what the app draws (text, pictures, video) is never blurred. Read by apps opened
+# afterwards; removed with OmaSkins.
+GTK4_BLUR_START = "/* >>> OmaSkins Manager: blur behind every window, like Hyprland's own (set it in OmaSkins) */"
+GTK4_BLUR_END = "/* <<< OmaSkins Manager: blur */"
+# A backdrop blur of 10px or more asks Hyprland for the whole window (GTK's threshold); Hyprland draws its
+# own blur there, behind the window. Popovers, menus and tooltips aren't `window`s: untouched.
+GTK4_BLUR_CSS = "window { backdrop-filter: blur(12px); }"
+FOOT_INI = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "foot" / "foot.ini"
+FOOT_BLUR_START = "# >>> OmaSkins: blur behind foot, like every other window (set it in OmaSkins)"
+FOOT_BLUR_END = "# <<< OmaSkins: blur"
+# foot asks for blur only while its own background isn't solid: 0.99 looks the same (Hyprland's opacity
+# does the fading), and both colour schemes, as Omarchy's themes may be either.
+FOOT_BLUR_INI = "\n".join(f"[{s}]\nblur=yes\nalpha=0.99" for s in ("colors-dark", "colors-light"))
+
+
+def blur_wanted(step):
+    """Hyprland blurs behind windows at this step: the steps with blur, and Omarchy's default."""
+    return step == TRANSPARENCY_DEFAULT or transparency_values(step)[2]
+
+
+def write_blur_requests(step):
+    """Ask for blur behind every window, for each toolkit that has to ask; gone without blur. True if changed."""
+    on = blur_wanted(step)
+    gtk = _write_css_block(GTK4_CSS, GTK4_BLUR_START, GTK4_BLUR_END,
+                           "\n".join([GTK4_BLUR_START, GTK4_BLUR_CSS, GTK4_BLUR_END]) + "\n" if on else "")
+    foot = FOOT_INI.exists() and _write_css_block(   # Omarchy's own file: only ever a block in it
+        FOOT_INI, FOOT_BLUR_START, FOOT_BLUR_END,
+        "\n".join([FOOT_BLUR_START, FOOT_BLUR_INI, FOOT_BLUR_END]) + "\n" if on else "")
+    return gtk or foot
 
 
 # --------------------------------------------------------------------------- file dialogs
@@ -2372,6 +2477,8 @@ def dialog_css(step, mode):
         f"{fc} treeview.view header button, {fc} placessidebar list, {fc} actionbar, {fc} revealer, {fc} searchbar,",
         f"{d} .dialog-action-area {{ background-color: transparent; background-image: none; box-shadow: none; }}",
         f"{fc} placessidebar {{ background-color: alpha({sidebar}, {extra(a):g}); }}",
+        f"{d}.background, {d}.background.csd, {d} headerbar.titlebar, {d} .titlebar headerbar, {fc} placessidebar "
+        f"{{ {FOCUS_FADE_CSS} }}",   # focus changes fade, like the rest
         f"{d}:backdrop filechooser placessidebar {{ background-color: alpha({sidebar}, {extra(b):g}); }}",
         DIALOG_CSS_END]) + "\n"
 
@@ -2419,6 +2526,12 @@ def transparency_action(step):
     step = max(0, min(len(TRANSPARENCY_STEPS) - 1, int(step)))
     return Action("Transparency", f"fade windows to step {step + 1} of 5; save {TRANSPARENCY_FILE}",
                   steps=(("apply_transparency", step),))
+
+
+def top_bar_action(on):
+    """No password. The shell re-reads its file live; the blur behind the bar follows at once."""
+    return Action("Top bar", "make the top bar see-through with the rest" if on else "make the top bar solid again",
+                  steps=(("top_bar", bool(on)),))
 
 
 def qt_apps_action(on):

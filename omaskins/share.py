@@ -423,6 +423,7 @@ def collect(community):
         # should land on the same look, not the same step number.
         "transparency_values": data.transparency_line(data.transparency_step()),
         "qt_apps": qtstyle.enabled(),
+        "top_bar": data.top_bar_enabled(),
         "text_size": text_size,
         "text_size_set": text_size_set,
         "rotation": rotation,
@@ -624,6 +625,7 @@ def items(manifest):
         ("corners", "Rounded Corners", bool(corners), f"{corners.get('px')} px" if corners.get("on") else "off"),
         ("transparency", "Transparency", transparency_step_of(manifest) is not None,
          f"step {(transparency_step_of(manifest) or 0) + 1} of {len(data.TRANSPARENCY_STEPS)}"),
+        ("top_bar", "Top bar", isinstance(manifest.get("top_bar"), bool), "on" if manifest.get("top_bar") else "off"),
         ("qt_apps", "Qt apps", isinstance(manifest.get("qt_apps"), bool), "on" if manifest.get("qt_apps") else "off"),
         ("text_size", "Text size", bool(manifest.get("text_size") or manifest.get("text_size_set")),
          f"{manifest['text_size_set']} px" if manifest.get("text_size_set") else str(manifest.get("text_size") or "")),
@@ -1149,6 +1151,9 @@ def apply_look(manifest, chosen, as_here, pics, in_use, note, exact=None):
     if "transparency" in chosen and step is not None:
         run.perform(data.transparency_action(step).steps)
         done.append(f"Transparency: step {step + 1} of {len(data.TRANSPARENCY_STEPS)}")
+    if "top_bar" in chosen and isinstance(manifest.get("top_bar"), bool):
+        run.perform(data.top_bar_action(manifest["top_bar"]).steps)
+        done.append(f"Top bar: {'on' if manifest['top_bar'] else 'off'}")
     if "qt_apps" in chosen and isinstance(manifest.get("qt_apps"), bool):
         run.perform(data.qt_apps_action(manifest["qt_apps"]).steps)
         done.append(f"Qt apps: {'on' if manifest['qt_apps'] else 'off'}")

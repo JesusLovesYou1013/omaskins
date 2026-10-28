@@ -18,10 +18,12 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Gdk", "4.0")
+gi.require_version("Graphene", "1.0")
+gi.require_version("Gsk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Pango", "1.0")
 gi.require_version("PangoCairo", "1.0")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, PangoCairo  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gsk, Gtk, Pango, PangoCairo  # noqa: E402
 
 from . import data, qtstyle, rotation, run, share, theme  # noqa: E402
 
@@ -67,9 +69,12 @@ def own_alpha_css(bg, a, b, blur):
     picture view (its own window, dimmed over the whole screen) blurs what's behind it the same way. Only
     what's BEHIND a window is blurred: its own pictures (thumbnails, the big picture) are drawn on top, sharp."""
     return ("window.omaskins, window.omaskins.csd { background: none; }\n"
-            f".frame-root {{ background: {theme.rgba(bg, a)}; }}\n"
-            f"window.omaskins:backdrop .frame-root {{ background: {theme.rgba(bg, b)}; }}\n"
-            + ("window.omaskins, window.image-preview { backdrop-filter: blur(12px); }\n" if blur else ""))
+            # background-color (not the shorthand) so a focus change fades like every other window.
+            f".frame-root {{ background-image: none; background-color: {theme.rgba(bg, a)}; {data.FOCUS_FADE_CSS} }}\n"
+            f"window.omaskins:backdrop .frame-root {{ background-color: {theme.rgba(bg, b)}; }}\n"
+            + ("window.omaskins, window.image-preview { backdrop-filter: blur(12px); }\n"
+               # the big view drawing the desktop itself: nothing to blur behind it
+               "window.image-preview.self-blur { backdrop-filter: none; }\n" if blur else ""))
 
 
 def label(text="", css="", xalign=0, **kw):
@@ -228,7 +233,7 @@ def picture(w, h, src=None, width=480, priority=1, zoom=False):
     btn = Gtk.Button(icon_name="zoom-in-symbolic", tooltip_text="View larger", halign=Gtk.Align.END,
                      valign=Gtk.Align.START, margin_top=6, margin_end=6)
     btn.add_css_class("zoom-btn")
-    btn.connect("clicked", lambda b: ImagePreview(b.get_root(), src, IMAGES.peek(src, width)).present())
+    btn.connect("clicked", lambda b: ImagePreview.open(b.get_root(), src, IMAGES.peek(src, width)))
     over.add_overlay(btn)
     return ExactSize(over, w, h)
 
@@ -243,8 +248,11 @@ class ImagePreview(Gtk.Window):
     click ANYWHERE closes it (as a picture-sized window, clicks beside it went to whatever was below,
     and it closed only sometimes). Esc, or switching to another window, closes it too."""
 
-    def __init__(self, parent, src, small=None):
+    def __init__(self, parent, src, small=None, desktop=None):
         super().__init__(transient_for=parent, modal=True, decorated=False, title="OmaSkins preview")
+        # OmaSkins' own app id (Hyprland's class): without it the window had the launcher's name, so OmaSkins'
+        # rules missed it and Hyprland faded the whole window, picture and all (owner, 2026-10-27).
+        self.set_application(parent.get_application())
         self.add_css_class("image-preview")
         monitor = parent.get_display().get_monitor_at_surface(parent.get_surface())
         geo = monitor.get_geometry() if monitor else None
@@ -255,7 +263,14 @@ class ImagePreview(Gtk.Window):
         self.holder = ExactSize(self.pic, *self._size(None))
         self.holder.set_halign(Gtk.Align.CENTER)
         self.holder.set_valign(Gtk.Align.CENTER)
-        self.set_child(self.holder)
+        if desktop is None:   # no picture of the screen: Hyprland's blur, as before (GTK asks for it)
+            self.set_child(ZoomIn(self.holder))
+        else:
+            self.add_css_class("self-blur")
+            behind = BlurringDesktop(desktop)
+            over = Gtk.Overlay(child=behind)
+            over.add_overlay(ZoomIn(self.holder, after=lambda: behind.progress >= ZoomIn.AT_BLUR))
+            self.set_child(over)
         self._show(small)
         IMAGES.get(src, PREVIEW_WIDTH, self._show, priority=-2)
         keys = Gtk.EventControllerKey()
@@ -267,6 +282,18 @@ class ImagePreview(Gtk.Window):
         self.connect("notify::is-active", self._focus_changed)
         self.connect("close-request", lambda *_: setattr(self, "_was_active", False) or False)  # however it closes: once
         self._was_active = False
+
+    @classmethod
+    def open(cls, parent, src, small=None):
+        """With blur on, with a picture of the screen under it (run.screenshot), to blur the desktop up itself."""
+        monitor = parent.get_display().get_monitor_at_surface(parent.get_surface())
+        blur = data.transparency_values(data.transparency_step())[2]   # as own_alpha_css's
+        png = run.screenshot(monitor.get_connector()) if blur and monitor and monitor.get_connector() else None
+        try:
+            desktop = Gdk.Texture.new_from_bytes(GLib.Bytes.new(png)) if png else None
+        except GLib.Error:
+            desktop = None
+        cls(parent, src, small, desktop).present()
 
     def _focus_changed(self, _w, _p):
         """Switching to another window closes it, once it has had the focus (not before it gets it)."""
@@ -287,6 +314,138 @@ class ImagePreview(Gtk.Window):
         if texture is not None:
             self.pic.set_paintable(texture)
             self.holder.resize(*self._size(texture))
+
+
+class BlurringDesktop(Gtk.Widget):
+    """The big view's background: the desktop as it was (a screenshot), going from sharp to blurred and
+    lightly dimmed over half a second, so the desktop itself turns to a blur rather than a blurred layer
+    appearing over it (owner, 2026-10-27). Hyprland's blur can't do that: it only fades a finished blur in.
+    A full-screen blur every frame is too slow without a real GPU, so it blurs a few steps once, small
+    (blurred, the lost detail doesn't show), and fades from one step to the next."""
+
+    RADIUS = 24        # about Omarchy's own blur (size 5, 2 passes)
+    STEPS = 6
+    DIM = 0.30         # as window.image-preview's background
+    DURATION = 0.5     # seconds, like OmaSkins' focus fade
+
+    def __init__(self, texture):
+        super().__init__(hexpand=True, vexpand=True)
+        self.texture, self.steps, self.progress, self._start, self._warm = texture, None, 0.0, None, False
+        self.add_tick_callback(self._tick)
+
+    def _blur_steps(self):
+        # Blurred by the CPU: ~0.1 s for all of them, where this VM's GL renderer took over a second.
+        renderer, tw, th = Gsk.CairoRenderer(), self.texture.get_width(), self.texture.get_height()
+        renderer.realize_for_display(self.get_display())
+        px = tw / self.get_width()   # screenshot pixels per window pixel
+        steps = [self.texture]
+        for i in range(1, self.STEPS + 1):
+            r = self.RADIUS * i / self.STEPS
+            f = 0.5 if r <= 8 else 0.25
+            w, h = max(1, round(tw * f)), max(1, round(th * f))
+            snap = Gtk.Snapshot()
+            blurred(snap, self.texture, w, h, r * px * f)
+            steps.append(renderer.render_texture(snap.to_node(), Graphene.Rect().init(0, 0, w, h)))
+        renderer.unrealize()
+        return steps
+
+    def _tick(self, _w, _clock):
+        if self.steps is None:   # once it has its size (the blur is in window pixels)
+            if self.get_width() > 0:
+                self.steps = self._blur_steps()
+                self.queue_draw()   # one frame that hands them all to the renderer before it starts
+            return True
+        now = GLib.get_monotonic_time() / 1e6   # not the frame clock's: it lags after blurring the steps
+        if self._start is None and not self._warm:
+            return True
+        self._start = self._start if self._start is not None else now
+        t = min(1.0, (now - self._start) / self.DURATION)
+        self.progress = 4 * t ** 3 if t < 0.5 else 1 - (-2 * t + 2) ** 3 / 2   # ease in-out, cubic
+        self.queue_draw()
+        return t < 1.0
+
+    def do_snapshot(self, snap):
+        whole = Graphene.Rect().init(0, 0, self.get_width(), self.get_height())
+        steps = self.steps or [self.texture]
+        at = self.progress * (len(steps) - 1)
+        i = min(int(at), len(steps) - 2) if len(steps) > 1 else 0
+        snap.append_scaled_texture(steps[i], Gsk.ScalingFilter.LINEAR, whole)
+        if at - i > 0 and len(steps) > 1:   # the next step over it, partly (cheaper than a cross-fade node)
+            snap.push_opacity(at - i)
+            snap.append_scaled_texture(steps[i + 1], Gsk.ScalingFilter.LINEAR, whole)
+            snap.pop()
+        snap.append_color(Gdk.RGBA(red=0, green=0, blue=0, alpha=self.DIM * self.progress), whole)
+        if self.steps and self._start is None:
+            # Each step drawn once, a pixel big, where the top bar covers it: the renderer takes each picture
+            # in the first time it draws it, which mid-fade cost a frame every step on this VM.
+            for step in self.steps:
+                snap.append_texture(step, Graphene.Rect().init(0, 0, 1, 1))
+            self._warm = True
+
+
+class ZoomIn(Gtk.Widget):
+    """The big picture growing out of its centre as it fades in (owner, 2026-10-27: liked Hyprland's pop-in
+    from an earlier try), once the blur behind it is mostly there (`after`), so the picture never shows up
+    over a still-sharp desktop."""
+
+    AT_BLUR = 0.8      # of the blur done
+    FROM = 0.85        # of its size (Omarchy's pop-in starts at 87%)
+    DURATION = 0.28    # seconds: quick, but you see it grow
+
+    def __init__(self, child, after=lambda: True):
+        super().__init__(hexpand=True, vexpand=True)
+        self._child, self._after, self._start, self.progress = child, after, None, 0.0
+        child.set_parent(self)
+        self.add_tick_callback(self._tick)
+
+    def _tick(self, *_):
+        now = GLib.get_monotonic_time() / 1e6
+        if self._start is None:
+            if not self._after():
+                return True
+            self._start = now
+        t = min(1.0, (now - self._start) / self.DURATION)
+        self.progress = 1 - (1 - t) ** 3   # ease out, cubic
+        self.queue_draw()
+        return t < 1.0
+
+    def do_measure(self, orientation, for_size):
+        return self._child.measure(orientation, for_size)
+
+    def do_size_allocate(self, width, height, baseline):
+        self._child.allocate(width, height, baseline, None)
+
+    def do_snapshot(self, snap):
+        if self.progress <= 0:
+            return
+        scale = self.FROM + (1 - self.FROM) * self.progress
+        cx, cy = self.get_width() / 2, self.get_height() / 2
+        snap.save()
+        snap.translate(Graphene.Point().init(cx, cy))
+        snap.scale(scale, scale)
+        snap.translate(Graphene.Point().init(-cx, -cy))
+        snap.push_opacity(self.progress)
+        self.snapshot_child(self._child, snap)
+        snap.pop()
+        snap.restore()
+
+    def do_dispose(self):
+        if self._child is not None:
+            self._child.unparent()
+            self._child = None
+
+
+def blurred(snap, texture, w, h, r):
+    """`texture` drawn at w×h, blurred by r: its edge pixels stretched out past the edges, so the blur
+    doesn't pull in darkness there."""
+    m = int(r * 3) + 1
+    snap.push_blur(r)
+    for x0, x1, tx, tw in ((-m, 0, -m, w * m), (0, w, 0, w), (w, w + m, w - (w - 1) * m, w * m)):
+        for y0, y1, ty, th in ((-m, 0, -m, h * m), (0, h, 0, h), (h, h + m, h - (h - 1) * m, h * m)):
+            snap.push_clip(Graphene.Rect().init(x0, y0, x1 - x0, y1 - y0))
+            snap.append_texture(texture, Graphene.Rect().init(tx, ty, tw, th))
+            snap.pop()
+    snap.pop()
 
 
 # --------------------------------------------------------------------------- font metrics
@@ -2355,6 +2514,16 @@ class Window(Adw.ApplicationWindow):
         self._transparency_at = data.transparency_step()
         self.transparency.connect("value-changed", self._on_transparency)
         box.append(self.transparency)
+        # The top bar see-through too, a step behind the rest (owner, 2026-10-27): off by default.
+        bar = Gtk.Box(spacing=10, margin_start=24, valign=Gtk.Align.CENTER,
+                      tooltip_text="The top bar see-through too, one step behind the rest so it stays a little "
+                                   "darker, with blur behind it. Solid at steps 1 and 2. Double-click "
+                                   "the bar still clears it as before.")
+        bar.append(label("Top bar", valign=Gtk.Align.CENTER))
+        self.bar_switch = Gtk.Switch(active=data.top_bar_enabled(), valign=Gtk.Align.CENTER)
+        self.bar_switch.connect("notify::active", lambda w, _p: w.get_active() != data.top_bar_enabled()
+                                and self.do_action(data.top_bar_action(w.get_active())))
+        bar.append(self.bar_switch)
         # Qt apps (VLC, KeePassXC, ...) in the theme's colours and transparency: on by default.
         qt = Gtk.Box(spacing=10, margin_start=24, valign=Gtk.Align.CENTER,
                      tooltip_text="Qt apps (VLC, KeePassXC, ...) in the theme's colours, see-through like the "
@@ -2366,6 +2535,7 @@ class Window(Adw.ApplicationWindow):
         qt.append(self.qt_switch)
         outer = Gtk.Box(valign=Gtk.Align.CENTER)
         outer.append(box)
+        outer.append(bar)
         outer.append(qt)
         return outer
 
@@ -2420,9 +2590,11 @@ class Window(Adw.ApplicationWindow):
         return False
 
     def _sync_transparency(self):
-        """The slider shows the saved step (an import, or OmaSkins open twice); the Qt apps switch too."""
+        """The slider shows the saved step (an import, or OmaSkins open twice); the two switches too."""
         if self.qt_switch.get_active() != qtstyle.enabled():
             self.qt_switch.set_active(qtstyle.enabled())
+        if self.bar_switch.get_active() != data.top_bar_enabled():
+            self.bar_switch.set_active(data.top_bar_enabled())
         if "transparency" in self._timers or self._transparency_at == data.transparency_step():
             return
         self._transparency_syncing = True

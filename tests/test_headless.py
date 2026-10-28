@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 import zipfile
 from pathlib import Path
@@ -1510,7 +1511,9 @@ class ReadingChangesNothing(unittest.TestCase):
         code, = sent
         for part in ('class = "^io.github.jesuslovesyou1013.omaskins$"', 'title = "^OmaSkins Manager$"',
                      "float = true", "center = true", '"(monitor_w*0.7)", "(monitor_h*0.75)"',
-                     'title = "^OmaSkins preview$"', "border_size = 0", "if not omaskins_window_rules then"):
+                     'title = "^OmaSkins preview$"', "border_size = 0", "if not omaskins_window_rules_3 then",
+                     # the big view draws the desktop blurring itself: Hyprland neither animates nor blurs it
+                     "move = { 0, 0 }", "no_anim = true", "no_blur = true", 'opacity = "1 1"'):
             self.assertIn(part, code)
         if shutil.which("lua"):
             lua = SANDBOX / "rules.lua"
@@ -2126,6 +2129,7 @@ class ShareImport(unittest.TestCase):
             write(data.CORNERS_FILE, data.corners_file_text(True, 20))
             data.save_transparency(4)                       # step 5
             qtstyle.save_enabled(False)                     # Qt apps off (on is the default)
+            data.save_top_bar(True)                         # top bar see-through (off is the default)
             write(data.TEXT_SIZE_STATE, json.dumps({"base": 15, "wrote": None}))
             data.save_sort_mode("az")
             data.set_hidden_in_omaskins("nord", True)   # not the theme in use (that one is never hidden)
@@ -2146,7 +2150,7 @@ class ShareImport(unittest.TestCase):
             self.assertEqual(manifest["transparency_values"], "0.65 0.56 blur", "the levels travel, not just a number")
 
             # --- wipe all of it (a fresh machine as far as OmaSkins is concerned)
-            for f in (data.CORNERS_FILE, data.TRANSPARENCY_FILE, qtstyle.SETTING, data.TEXT_SIZE_STATE,
+            for f in (data.CORNERS_FILE, data.TRANSPARENCY_FILE, qtstyle.SETTING, data.TOP_BAR_FILE, data.TEXT_SIZE_STATE,
                       data.UI_STATE, data.BUILTIN_STATE, data.ROTATION_FILE):
                 f.unlink(missing_ok=True)
             data.ROTATION_SETS.unlink(missing_ok=True)
@@ -2158,7 +2162,7 @@ class ShareImport(unittest.TestCase):
             # --- import everything, "Also apply"
             manifest = self.share.read_zip(self.zip)
             rows = {r["id"] for r in self.share.items(manifest)}
-            for wanted in ("corners", "transparency", "qt_apps", "text_size", "blueprints", "set:Evenings", "rotation",
+            for wanted in ("corners", "transparency", "qt_apps", "top_bar", "text_size", "blueprints", "set:Evenings", "rotation",
                            "hide:nord"):
                 self.assertIn(wanted, rows, f"an import row for {wanted}")
             done, note, failed = self.share.run_import(self.zip, manifest, rows, apply=True)
@@ -2168,6 +2172,7 @@ class ShareImport(unittest.TestCase):
             self.assertIn(("apply_corners", True, 20), performed, "corners")
             self.assertIn(("apply_transparency", 4), performed, "transparency: step 5")
             self.assertIn(("qt_apps", False), performed, "Qt apps off")
+            self.assertIn(("top_bar", True), performed, "top bar on")
             self.assertEqual(json.loads(data.TEXT_SIZE_STATE.read_text())["base"], before["text"], "text size")
             self.assertEqual(data.sort_mode(), before["sort"], "sort order")
             self.assertIn("nord", data.hidden_in_omaskins(), "hidden built-in theme")
@@ -2824,7 +2829,7 @@ class NautilusTransparency(unittest.TestCase):
         line = "window.omaskins, window.image-preview { backdrop-filter: blur(12px); }"   # and the big view
         on = app.own_alpha_css("#1d1d20", 0.75, 0.68, True)
         self.assertIn(line, on)
-        self.assertIn(".frame-root { background: ", on, "its background stays its own")
+        self.assertIn(".frame-root { background-image: none; background-color: ", on, "its background stays its own")
         self.assertNotIn("backdrop-filter", app.own_alpha_css("#1d1d20", 0.75, 0.68, False))
         for step in range(len(data.TRANSPARENCY_STEPS)):
             css = app.own_alpha_css("#000000", *data.transparency_values(step))
@@ -2846,9 +2851,41 @@ class NautilusTransparency(unittest.TestCase):
             if any(k in sel for k in ("thumb", "picture", "zoom-btn")) or any(w + " " in sel for w in windows):
                 self.assertNotIn("backdrop-filter", body, sel)
                 self.assertNotIn("blur", body, sel)
-            if "backdrop-filter" in body:
+            if "backdrop-filter" in body and "backdrop-filter: none" not in body:
                 self.assertEqual({x.strip() for x in sel.split(",")}, windows, "only the windows themselves")
         self.assertTrue(issubclass(app.ImagePreview, app.Gtk.Window), "the big view is its own window (surface)")
+
+    def test_the_big_view_blurs_the_desktop_up_from_sharp(self):
+        # Owner, 2026-10-27: the desktop should turn gradually to a blur, not a blurred layer appear over it.
+        from omaskins import app  # needs GTK, like the app
+        shot = app.Gdk.MemoryTexture.new(64, 40, app.Gdk.MemoryFormat.R8G8B8A8,
+                                         app.GLib.Bytes.new(bytes(range(256)) * 40), 256)
+        desk = app.BlurringDesktop(shot)
+        self.assertEqual(desk.progress, 0.0, "starts as the desktop itself, sharp, undimmed")
+        snap = app.Gtk.Snapshot()
+        desk.do_snapshot(snap)
+        self.assertIsNotNone(snap.to_node())
+        white = app.Gdk.MemoryTexture.new(64, 40, app.Gdk.MemoryFormat.R8G8B8A8,
+                                          app.GLib.Bytes.new(b"\xff" * 64 * 40 * 4), 256)
+        snap = app.Gtk.Snapshot()
+        app.blurred(snap, white, 32, 20, 4)
+        renderer = app.Gsk.CairoRenderer()
+        renderer.realize_for_display(app.Gdk.Display.get_default())
+        out = renderer.render_texture(snap.to_node(), app.Graphene.Rect().init(0, 0, 32, 20))
+        renderer.unrealize()
+        down = app.Gdk.TextureDownloader.new(out)
+        pixels = down.download_bytes()[0].get_data()
+        self.assertGreater(min(pixels), 250, "blurred right up to the screen's edges, never darkened there")
+        # The picture grows out of its centre once most of the blur is there, not over a still-sharp desktop.
+        zoom = app.ZoomIn(app.Gtk.Label(), after=lambda: desk.progress >= app.ZoomIn.AT_BLUR)
+        zoom._tick()
+        self.assertEqual(zoom.progress, 0.0, "blur not there yet: picture not shown")
+        desk.progress = 0.8
+        zoom._tick()
+        self.assertIsNotNone(zoom._start, "80% blurred: it starts growing")
+        self.assertLess(app.ZoomIn.FROM, 1)
+        css = app.own_alpha_css("#000000", 0.75, 0.68, True)
+        self.assertIn("window.image-preview.self-blur { backdrop-filter: none; }", css, "no blur asked for behind it")
 
     def test_an_idle_nautilus_is_quit_to_read_its_new_look(self):
         quit_ = []
@@ -2887,6 +2924,55 @@ class NautilusTransparency(unittest.TestCase):
         data.write_nautilus_css(2)
         data.write_nautilus_css(data.TRANSPARENCY_DEFAULT)
         self.assertFalse(data.GTK4_CSS.exists(), "only ours was in it: the file goes too")
+
+    def test_every_window_asks_for_the_same_blur_behind_it(self):
+        # Owner, 2026-10-27: Ghostty, foot and other terminals had no blur (GTK 4.24 and foot 1.28 tell Hyprland
+        # where to blur; they asked for nothing). One place asks for every toolkit, wherever Hyprland blurs.
+        omarchy_foot = "[main]\ninclude=~/x/foot.ini\n\n[text-bindings]\nshift+return=\\x1b\\r\n"
+        write(data.FOOT_INI, omarchy_foot)
+        write(data.GTK4_CSS, "/* mine */\nlabel { color: red; }\n")
+        data.write_nautilus_css(3)
+        for step in (data.TRANSPARENCY_DEFAULT, 2, 3, 4):
+            self.assertTrue(data.blur_wanted(step), f"step {step}")
+            data.write_blur_requests(step)
+            gtk, foot = data.GTK4_CSS.read_text(), data.FOOT_INI.read_text()
+            self.assertEqual(gtk.count(data.GTK4_BLUR_START + "\n" + data.GTK4_BLUR_CSS + "\n" + data.GTK4_BLUR_END), 1)
+            self.assertEqual(gtk.count(data.NAUTILUS_CSS_START), 1, "Nautilus's block stays as it is")
+            self.assertTrue(foot.startswith(omarchy_foot.rstrip("\n")), "Omarchy's own lines untouched")
+            self.assertEqual(foot.count("blur=yes"), 2, "dark and light themes")
+            self.assertEqual(foot.count("alpha=0.99"), 2)
+        self.assertFalse(data.write_blur_requests(4), "same: no change")
+        self.assertFalse(data.blur_wanted(0))
+        self.assertTrue(data.write_blur_requests(0), "the solid step: no blur asked for")
+        self.assertEqual(data.FOOT_INI.read_text().rstrip("\n"), omarchy_foot.rstrip("\n"))
+        self.assertNotIn("OmaSkins Manager: blur", data.GTK4_CSS.read_text())
+        self.assertIn(data.NAUTILUS_CSS_START, data.GTK4_CSS.read_text())
+        self.assertTrue(data.GTK4_CSS.read_text().startswith("/* mine */\nlabel { color: red; }"))
+
+    def test_the_blur_is_only_behind_windows(self):
+        # Behind the window only: never on what's in it, and not on menus, popovers or tooltips.
+        import re
+        rules = re.findall(r"([^{}]+)\{([^{}]*)\}", data.GTK4_BLUR_CSS)
+        self.assertEqual([s.strip() for s, _ in rules], ["window"])
+        self.assertEqual(rules[0][1].strip(), "backdrop-filter: blur(12px);")
+
+    def test_no_foot_no_foot_block(self):
+        data.FOOT_INI.unlink(missing_ok=True)
+        data.write_blur_requests(3)
+        self.assertFalse(data.FOOT_INI.exists(), "foot's file is Omarchy's: never made by OmaSkins")
+
+    def test_removal_takes_the_blur_requests_away(self):
+        write(data.FOOT_INI, "[main]\nfont=x\n")
+        data.write_blur_requests(3)
+        saved = data.transparency_step
+        data.transparency_step = lambda: data.TRANSPARENCY_DEFAULT
+        try:
+            from omaskins import uninstall
+            uninstall.restore_look(run=types.SimpleNamespace(apply_transparency=lambda s: None), log=lambda *a: None)
+        finally:
+            data.transparency_step = saved
+        self.assertEqual(data.FOOT_INI.read_text().rstrip("\n"), "[main]\nfont=x")
+        self.assertFalse(data.GTK4_CSS.exists() and "blur" in data.GTK4_CSS.read_text())
 
     def test_nautilus_is_reopened_not_faded(self):
         calls, restarted = [], []
@@ -3073,6 +3159,64 @@ class ShellSurfaces(unittest.TestCase):
         self.assertIn("background-alpha = 0.75", data.SHELL_TOML.read_text())
         self.assertTrue(data.write_shell_block(data.TRANSPARENCY_DEFAULT))
         self.assertEqual(data.SHELL_TOML.read_text(), "[font]\nbase-size = 14\n", "Omarchy's look again, file as it was")
+
+    def test_top_bar_one_step_behind_the_rest(self):
+        # Owner, 2026-10-27: solid at steps 1 and 2, then each step gets the level the rest had a step before.
+        self.assertTrue(str(data.TOP_BAR_FILE).startswith(str(SANDBOX)))
+        data.save_top_bar(True)
+        try:
+            levels = [data.top_bar_alpha(s) for s in range(len(data.TRANSPARENCY_STEPS))]
+            self.assertEqual(levels, [None, None, data.OMARCHY_OPACITY[0], 0.85, 0.75])
+            self.assertEqual([data.top_bar_blur(s) for s in range(5)], [False, False, True, True, True])
+            write(data.SHELL_TOML, "[font]\nbase-size = 14\n\n[bar]\nbackground-alpha = 1.0\n")
+            data.write_shell_block(4)
+            text = data.SHELL_TOML.read_text()
+            self.assertIn("[bar]\nbackground-alpha = 0.75\n\n" + data.SHELL_END, text, "inside our block, last: it wins")
+            self.assertTrue(text.startswith("[font]\nbase-size = 14\n\n[bar]\nbackground-alpha = 1.0\n"), "yours untouched")
+            data.write_shell_block(1)
+            self.assertNotIn("0.75", data.SHELL_TOML.read_text())
+            data.write_shell_block(2)
+            self.assertIn("[bar]\nbackground-alpha = 0.985\n", data.SHELL_TOML.read_text())
+            calls = []
+            _run.set_top_bar(False, evaluate=calls.append)
+            self.assertFalse(data.top_bar_enabled())
+            self.assertNotIn("[bar]\nbackground-alpha = 0.985", data.SHELL_TOML.read_text(), "off: Omarchy's own bar")
+            self.assertTrue(calls[-1].endswith("bar_blur(false)"))
+            _run.set_top_bar(True, evaluate=calls.append)
+            self.assertTrue(calls[-1].endswith("bar_blur(false)"), "Omarchy's default step: the bar stays solid")
+            data.save_transparency(3)
+            _run.set_top_bar(True, evaluate=calls.append)
+            self.assertTrue(calls[-1].endswith("bar_blur(true)"))
+            self.assertIn("[bar]\nbackground-alpha = 0.85\n", data.SHELL_TOML.read_text(), "step 4: step 3's level")
+        finally:
+            data.save_top_bar(False)
+            data.TRANSPARENCY_FILE.unlink(missing_ok=True)
+
+    def test_self_drawn_backgrounds_fade_with_the_windows(self):
+        # Owner, 2026-10-27: OmaSkins, Nautilus and the file dialogs draw their own focused/unfocused levels;
+        # they jumped while Hyprland eased the rest. Same 0.5 s and curve as Hyprland's (easeInOutCubic).
+        from omaskins import app  # needs GTK, like the app
+        self.assertIn("500ms cubic-bezier(0.65, 0.05, 0.36, 1)", data.FOCUS_FADE_CSS)
+        self.assertIn('speed = 5, bezier = "easeInOutCubic"', data.FOCUS_FADE)
+        for step in (0, 2, 3, 4):
+            self.assertIn(data.FOCUS_FADE_CSS, data.nautilus_css(step))
+            self.assertIn(data.FOCUS_FADE_CSS, data.dialog_css(step, "light"))
+            self.assertIn(data.FOCUS_FADE_CSS, app.own_alpha_css("#000000", *data.transparency_values(step)))
+
+    def test_focus_changes_fade_over_half_a_second(self):
+        # Owner, 2026-10-27: moving between apps should cross-fade (0.5 s), not flash; only while OmaSkins'
+        # Hyprland file is there (its removal brings Omarchy's instant switch back).
+        for on in (True, False):
+            text = data.corners_file_text(on, 20)
+            self.assertEqual(text.count(data.FOCUS_FADE), 1)
+            self.assertLess(text.index(data.FOCUS_FADE), text.index("o.window({ tag = \"default-opacity\" }"))
+        self.assertIn('leaf = "fadeSwitch", enabled = true, speed = 5,', data.FOCUS_FADE, "5 tenths = 0.5 s")
+
+    def test_top_bar_off_by_default(self):
+        data.TOP_BAR_FILE.unlink(missing_ok=True)
+        self.assertFalse(data.top_bar_enabled())
+        self.assertEqual({data.top_bar_alpha(s) for s in range(5)}, {None})
+        self.assertNotIn("[bar]", data.shell_block(4))
 
     def test_the_fade_sets_it_and_the_blur(self):
         calls = []
@@ -3329,7 +3473,7 @@ class FileDialogs(unittest.TestCase):
         data.save_transparency(4)
         look = self.engine(["org.gnome.Nautilus"])
         look.glance()
-        self.assertEqual(data.GTK4_CSS.read_text(), data.nautilus_css(4), "today's look, for its next start")
+        self.assertTrue(data.GTK4_CSS.read_text().startswith(data.nautilus_css(4)), "today's look, for its next start")
 
     def test_service_not_running_reads_it_when_it_starts(self):
         write(self.dark, "x")

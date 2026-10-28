@@ -10,8 +10,9 @@ called OmaSkins for short.
 - **Rotation**: change theme and background on a schedule that keeps running with the app closed, with
   day and night theme sets, any theme with any background, and Next and Pause in the bar.
 - **Rounded corners**: one radius for windows, menus and popups, whatever the theme.
-- **Transparency**: five steps for every see-through window, with blur behind, and Omarchy's menus,
-  panels, Nautilus, file dialogs and Qt apps following along.
+- **Transparency**: five steps for every see-through window, with the same blur behind each of them
+  (terminals included), a gentle fade as focus moves between windows, the top bar if you want it, and
+  Omarchy's menus, panels, Nautilus, file dialogs and Qt apps following along.
 - **Share**: your whole setup in one file, to move to another machine or to get back later.
 - **Clean removal**: removing OmaSkins puts everything back the way Omarchy ships it.
 
@@ -70,7 +71,11 @@ rotation.
     without opening the page.
   - A built-in theme can be hidden from OmaSkins only (no password), or removed entirely (password;
     it's part of Omarchy's package). **Restore** under Browse brings either back.
-  - **Rounded Corners**, **Transparency** and **Qt apps** sit on this tab's top row (see below).
+  - **Rounded Corners**, **Transparency**, **Top bar** and **Qt apps** sit on this tab's top row (see
+    below).
+  - The 🔍+ on a theme's or background's picture opens it large over your desktop: the desktop blurs
+    and dims over half a second, then the picture grows out of the middle. A click anywhere, Esc or
+    switching windows closes it.
 - **Backgrounds**: your installed themes down the left edge. Pick one to see its backgrounds:
   the ones that ship with the theme, plus your own from `~/.config/omarchy/backgrounds/<theme>/`
   (marked **Yours**). The current background carries the ✓. **Add backgrounds…** copies pictures in,
@@ -123,6 +128,18 @@ rotate through.
   reload). Omarchy's menus, panels and notifications follow. Nautilus and the file dialogs make only
   their background see-through (files, icons and text stay solid), in libadwaita's grey, with the
   sidebar a little more solid. From step 3 up there is blur behind.
+  - **The same blur behind every window.** Hyprland blurs behind a window, but a toolkit that tells
+    Hyprland where to blur (GTK 4.24 and newer, foot) gets blur only where it asked. OmaSkins asks on
+    their behalf, only at the steps with blur: a marked block in `~/.config/gtk-4.0/gtk.css` (every
+    GTK4 app, Ghostty included) and, if you have foot, one in `~/.config/foot/foot.ini`. Only what's
+    behind a see-through window is blurred, never the window's own text or pictures.
+  - **Focus fades.** Moving focus between windows (mouse or keys) fades the old and new window's
+    see-through level over half a second instead of switching at once; the windows that draw their
+    own background (Nautilus, file dialogs, OmaSkins) fade along with them.
+- **Top bar** (off by default): the bar goes see-through too, one step behind the windows so it
+  stays a little darker: solid at steps 1 and 2, then at step 3 it's as see-through as windows at
+  step 2, and so on, with blur behind it. Double-clicking the bar to clear it works as before. Text
+  stays the theme's bar colour, which reads fine at every step.
 - **Qt apps** (on by default): Qt5 apps such as VLC and KeePassXC in the theme's colours,
   see-through like the rest (a video stays solid). OmaSkins builds its small Qt style on your
   machine the first time a Qt5 app is installed, with the compiler Omarchy already ships
@@ -166,8 +183,9 @@ While it's on:
 Only once you use Rounded Corners, Transparency or Qt apps:
 
 - `~/.config/hypr/omaskins.lua`, and one line loading it at the end of `~/.config/hypr/looknfeel.lua`;
-- an OmaSkins block in `~/.config/gtk-4.0/gtk.css`, `~/.config/gtk-3.0/gtk.css` and
-  `~/.config/omarchy/shell.toml` (anything else in those files is left alone);
+- an OmaSkins block in `~/.config/gtk-4.0/gtk.css`, `~/.config/gtk-3.0/gtk.css`,
+  `~/.config/omarchy/shell.toml` and (if you have foot) `~/.config/foot/foot.ini` (anything else in
+  those files is left alone);
 - the built Qt style in `~/.local/share/omaskins/qt5/`.
 
 Themes you add go where Omarchy keeps them (`~/.config/omarchy/themes/`), and backgrounds you add go
@@ -217,7 +235,8 @@ Changes go through Omarchy's own commands: `omarchy-theme-set`, `omarchy-theme-b
 `omarchy-font-set`, `omarchy-pkg-add` and `omarchy-pkg-drop` (in
 `omarchy-launch-floating-terminal-with-presentation`, where the password is typed),
 `omarchy-git-url-check`, `omarchy-notification-send` and `omarchy-shell`. Besides those: `git clone`
-for a theme, `hyprctl` for the live fade and corners, the same `pkill` signals Omarchy's font command
+for a theme, `hyprctl` for the live fade and corners, `grim` for a picture of the screen when the
+big view opens (kept in memory only, to blur it; never saved), the same `pkill` signals Omarchy's font command
 sends so open terminals re-read a font change, and one `systemctl --user try-restart` of the
 file-dialog service so a new dialog look shows. `sudo` appears only in the password steps above:
 font packages, and hiding or restoring a built-in theme.
