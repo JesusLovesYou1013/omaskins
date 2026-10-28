@@ -2511,6 +2511,31 @@ def transparency_step():
     return TRANSPARENCY_DEFAULT
 
 
+# The step a running Nautilus took its look from (it reads its stylesheet only when it starts). Until it
+# has quit, OmaSkins leaves it exactly as it is (owner, 2026-10-28): its Hyprland rule and the blur behind
+# it follow a new step once it's gone (the engine sees to that), and it gets the new look when it next opens.
+NAUTILUS_LOOK_FILE = OMASKINS_STATE / "nautilus-look"
+
+
+def nautilus_look_step():
+    """The step Nautilus's look is from: the saved one, else the step in use."""
+    try:
+        step = int(NAUTILUS_LOOK_FILE.read_text().strip())
+        if 0 <= step < len(TRANSPARENCY_STEPS):
+            return step
+    except (OSError, ValueError):
+        pass
+    return transparency_step()
+
+
+def save_nautilus_look_step(step):
+    try:
+        NAUTILUS_LOOK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        NAUTILUS_LOOK_FILE.write_text(f"{step}\n")
+    except OSError:
+        pass
+
+
 def save_transparency(step):
     if step == TRANSPARENCY_DEFAULT:
         TRANSPARENCY_FILE.unlink(missing_ok=True)

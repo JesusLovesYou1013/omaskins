@@ -45,6 +45,30 @@ def _read_toml(path):
         return {}
 
 
+def _read_shell_toml(path):
+    """shell.toml as Omarchy's shell reads it: a section may come twice, the last value wins. Strict TOML
+    refuses a repeated section, and then the whole file was lost: the text size fell back to 12 px
+    whenever OmaSkins' own block had a [bar] beside the user's (owner, 2026-10-28)."""
+    try:
+        text = Path(path).read_text()
+    except (OSError, UnicodeDecodeError):
+        return {}
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        pass
+    out, part = {}, []
+    for line in text.splitlines() + ["[]"]:   # a section header ends the part before it
+        if re.match(r"\s*\[", line) and part:
+            try:
+                out = _merge(out, tomllib.loads("\n".join(part)))
+            except tomllib.TOMLDecodeError:
+                pass   # only that section is lost, as in the shell
+            part = []
+        part.append(line)
+    return out
+
+
 def _merge(base, over):
     out = dict(base)
     for key, value in over.items():
@@ -115,7 +139,7 @@ def current_font():
 
 def load_theme():
     colors = {**FALLBACK_COLORS, **_read_toml(THEME_DIR / "colors.toml")}
-    shell = _merge(_read_toml(THEME_DIR / "shell.toml"), _read_toml(USER_SHELL_TOML))
+    shell = _merge(_read_shell_toml(THEME_DIR / "shell.toml"), _read_shell_toml(USER_SHELL_TOML))
     hypr = shell.get("hyprland", {})
     menu = shell.get("menu", {})
     ctrl = shell.get("controls", {})

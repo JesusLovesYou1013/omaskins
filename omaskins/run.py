@@ -812,8 +812,8 @@ def hypr_eval(code):
 # 2026-10-27: the desktop should turn gradually to a blur; Hyprland's blur can only fade in finished, which
 # looked like a layer laid over it). So Hyprland neither animates nor blurs it, and it stays fully solid.
 WINDOW_RULES_LUA = """
-if not omaskins_window_rules_3 then
-  omaskins_window_rules_3 = true
+if not omaskins_window_rules_4 then
+  omaskins_window_rules_4 = true
   hl.window_rule({ match = { class = "^io.github.jesuslovesyou1013.omaskins$", title = "^OmaSkins Manager$" },
                    float = true, center = true, size = { "(monitor_w*0.7)", "(monitor_h*0.75)" },
                    render_unfocused = true })
@@ -832,6 +832,45 @@ def screenshot(output):
     except (OSError, subprocess.SubprocessError):
         return None
     return shot.stdout if shot.returncode == 0 and shot.stdout else None
+
+
+# Its width: 70% of the screen, or more when its controls need it (owner, 2026-10-28: since the Top bar
+# switch, the controls scrolled sideways in a window just opened). One size rule per width, made once and
+# switched on alone; the newest rule that's on wins over the 70% above.
+WINDOW_WIDTH_LUA = """
+omaskins_widths = omaskins_widths or {}
+for w, r in pairs(omaskins_widths) do r:set_enabled(w == %(w)d) end
+if not omaskins_widths[%(w)d] then
+  omaskins_widths[%(w)d] = hl.window_rule({ match = { class = "^io.github.jesuslovesyou1013.omaskins$",
+                                                    title = "^OmaSkins Manager$" },
+                                          size = { "%(w)d", "(monitor_h*0.75)" } })
+end
+"""
+
+
+def focused_monitor_width():
+    """The focused screen's width in Hyprland's (scaled) pixels, or None."""
+    try:
+        out = subprocess.run(["hyprctl", "monitors", "-j"], capture_output=True, text=True, timeout=5,
+                             env=data.child_env()).stdout
+        m = next(m for m in json.loads(out or "[]") if m.get("focused"))
+        return round(m["width"] / (m.get("scale") or 1))
+    except (OSError, subprocess.SubprocessError, ValueError, StopIteration, KeyError, TypeError):
+        return None
+
+
+def fit_window_width(need, evaluate=None, screen=None):
+    """OmaSkins' window as wide as `need` (its controls in one row), never under 70% of the screen nor
+    over 95%. The width it'll open at, or None (Hyprland's rule above then decides)."""
+    screen = screen or focused_monitor_width()
+    if not screen:
+        return None
+    width = int(min(max(screen * 0.7, need), screen * 0.95))
+    try:
+        (evaluate or hypr_eval)(WINDOW_WIDTH_LUA % {"w": width})
+    except Exception:
+        return None
+    return width
 
 
 def ensure_window_rules(evaluate=None):
@@ -855,86 +894,13 @@ def _tags(client):
     return [t.rstrip("*") for t in client.get("tags", [])]
 
 
-def nautilus_windows():
-    """{window: [folder URIs, one per tab]} from Nautilus itself (D-Bus), {} when it isn't running."""
-    try:
-        out = subprocess.run(["gdbus", "call", "--session", "--dest", "org.freedesktop.FileManager1",
-                              "--object-path", "/org/freedesktop/FileManager1", "--method",
-                              "org.freedesktop.DBus.Properties.Get", "org.freedesktop.FileManager1",
-                              "OpenWindowsWithLocations"], capture_output=True, text=True, timeout=5,
-                             env=data.child_env())
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    found = re.findall(r"'(/org/gnome/Nautilus/window/\d+)': \[([^\]]*)\]", out.stdout)
-    return {w: re.findall(r"'([^']+)'", uris) for w, uris in found}
-
-
 def nautilus_running():
-    return bool(subprocess.run(["pgrep", "-x", "nautilus"], capture_output=True).stdout.strip())
-
-
-def nautilus_quit_idle(running=None, windows=None, quit_=None):
-    """Nautilus stays running after its last window closes and keeps the stylesheet it started with, so a new
-    window would still show the old look (2026-10-22: the blur line was ignored by a Nautilus left running).
-    With no window open, quit it: the next one starts fresh and reads it. True if it was quit."""
-    running = running or nautilus_running
-    windows = windows or nautilus_windows
-    quit_ = quit_ or (lambda: subprocess.run(["nautilus", "-q"], capture_output=True, timeout=10, env=data.child_env()))
-    if not running() or windows():   # asked only while it runs (asking would start it)
-        return False
-    quit_()
-    return True
-
-
-def nautilus_restart(windows, evaluate=None, clients=None, sleep=time.sleep, quit_=None, open_=None):
-    """Quit Nautilus and reopen each of its windows on the same folders and workspaces, so it reads its
-    stylesheet again (GTK reads it only when Nautilus starts)."""
-    evaluate = evaluate or hypr_eval
-    clients = clients or hypr_clients
-    quit_ = quit_ or (lambda: subprocess.run(["nautilus", "-q"], capture_output=True, timeout=10, env=data.child_env()))
-    open_ = open_ or (lambda uris: subprocess.Popen(["uwsm-app", "--", "nautilus", "--new-window", *uris],
-                                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                                    start_new_session=True, env=data.child_env()))
-    where = [(c.get("title", ""), c["workspace"]["name"]) for c in clients()   # to put each window back
-             if c.get("class") == "org.gnome.Nautilus"]
-    quit_()
-    for _ in range(30):
-        if not subprocess.run(["pgrep", "-x", "nautilus"], capture_output=True).stdout.strip():
-            break
-        sleep(0.1)
-    before = {c["address"] for c in clients()}
-    new = []
-    # The first window starts Nautilus; the rest only once its window is up: launched together while it
-    # starts, each launch opened two windows (owner, 2026-10-02: two windows came back as four).
-    for k, uris in enumerate(u for u in windows.values() if u):
-        open_(uris)
-        if k == 0:
-            for _ in range(50):
-                if any(c.get("class") == "org.gnome.Nautilus" and c["address"] not in before for c in clients()):
-                    break
-                sleep(0.1)
-    for _ in range(40):   # each window back on its workspace, as Nautilus opens them
-        new = [c for c in clients() if c.get("class") == "org.gnome.Nautilus" and c["address"] not in before]
-        if len(new) >= len(windows):
-            break
-        sleep(0.1)
-    # A new window has no title for a moment: wait for them (owner, 2026-10-02: one stayed where it opened).
-    for _ in range(20):
-        if all(c.get("title") for c in new):
-            break
-        sleep(0.1)
-        fresh = {c["address"]: c for c in clients()}
-        new = [fresh.get(c["address"], c) for c in new]
-    # Each old window's place is used once: two windows on the same folder (same title) each get their own.
-    unused = list(where)
-    for c in new:
-        match = next((w for w in unused if w[0] == c.get("title", "")), None) or (unused[0] if unused else None)
-        if match is None:
-            break
-        unused.remove(match)
-        ws = match[1]
-        if ws and c["workspace"]["name"] != ws:
-            evaluate(f"hl.dispatch(hl.dsp.window.move({{ workspace = '{ws}', follow = false, window = 'address:{c['address']}' }}))")
+    """True if Nautilus is running, False if not, None if that couldn't be found out."""
+    try:
+        found = subprocess.run(["pgrep", "-x", "nautilus"], capture_output=True, timeout=5).returncode
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {0: True, 1: False}.get(found)
 
 
 # Hyprland keeps every window rule until it next loads its config (no remove, but each rule can be switched
@@ -1024,7 +990,33 @@ def _lua_list(items):
     return "{ " + ", ".join(f"'{i}'" for i in items) + " }"
 
 
-def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, sleep=time.sleep):
+NAUTILUS_LATER = "File Manager will update upon restart."
+
+
+def nautilus_rule(step, evaluate=None):
+    """Nautilus out of Hyprland's fade (its own stylesheet does it), or back in it at Omarchy's default."""
+    if step == data.TRANSPARENCY_DEFAULT:
+        (evaluate or hypr_eval)(FADE_LUA + f"nautilus(false, '{data.OMARCHY_OPACITY[0]:g}', "
+                                           f"'{data.OMARCHY_OPACITY[1]:g}')")
+    else:
+        (evaluate or hypr_eval)(FADE_LUA + "nautilus(true)")
+
+
+def nautilus_settle(evaluate=None):
+    """Once Nautilus isn't running: its rule and the blur follow the step in use, and the look it'll start
+    with is noted. True if anything was changed."""
+    step, look = data.transparency_step(), data.nautilus_look_step()
+    if look == step:
+        return False
+    nautilus_rule(step, evaluate)
+    if data.transparency_values(look)[2] and not data.transparency_values(step)[2]:
+        (evaluate or hypr_eval)("hl.config({ decoration = { blur = { enabled = false } } })")   # held for it
+    data.save_nautilus_look_step(step)
+    return True
+
+
+def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, sleep=time.sleep,
+                       nautilus_now=False):
     """Fade every see-through window (Omarchy's "default-opacity" tag) to `step` over `fade` seconds,
     live, without a Hyprland reload (in this VM a reload blanks the screen): each frame moves the windows
     to the tag of the in-between level. New windows get the new values from a rule too. Then the step is
@@ -1032,6 +1024,11 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
     evaluate = evaluate or hypr_eval
     clients = clients or hypr_clients
     before, after = data.transparency_values(data.transparency_step()), data.transparency_values(step)
+    # A running Nautilus (or one that might be) keeps the look it started with, untouched, until it quits.
+    held = not nautilus_now and nautilus_running() is not False
+    look = data.nautilus_look_step() if held else step   # read before the new step is saved below
+    data.save_nautilus_look_step(look)
+    nautilus_blur = held and data.transparency_values(look)[2]
     open_windows = clients()
     windows = [c["address"] for c in open_windows if "default-opacity" in _tags(c)   # Nautilus and file
                and c.get("class") not in ("org.gnome.Nautilus", data.DIALOG_CLASS)   # dialogs do their own,
@@ -1056,14 +1053,12 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
     for address, tags in stale.items():
         for tag in tags:
             evaluate(f"hl.dispatch(hl.dsp.window.tag({{ window = 'address:{address}', tag = '-{tag}' }}))")
-    if before[2] and not after[2]:
+    if before[2] and not after[2] and not nautilus_blur:   # a see-through Nautilus keeps its blur till it quits
         evaluate("hl.config({ decoration = { blur = { enabled = false } } })")
     # Nautilus: its own stylesheet (sidebar a little more solid, icons solid) instead of Hyprland's
-    # whole-window fade; back to Hyprland's at the default step. GTK reads it only at start: reopen it.
-    if step == data.TRANSPARENCY_DEFAULT:
-        evaluate(FADE_LUA + f"nautilus(false, '{data.OMARCHY_OPACITY[0]:g}', '{data.OMARCHY_OPACITY[1]:g}')")
-    else:
-        evaluate(FADE_LUA + "nautilus(true)")
+    # whole-window fade; back to Hyprland's at the default step. Not while it runs: see nautilus_settle.
+    if not held:
+        nautilus_rule(step, evaluate)
     # Omarchy's menus, panels and notifications: the shell re-reads its file live; blur behind them with
     # the windows' blur.
     data.write_shell_block(step)
@@ -1071,13 +1066,12 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
     evaluate(FADE_LUA + f"bar_blur({'true' if data.top_bar_blur(step) else 'false'})")
     # Apps that tell Hyprland where to blur (GTK4, foot) ask for the same blur behind their windows.
     data.write_blur_requests(step)
-    if data.write_nautilus_css(step):
-        open_windows = nautilus_windows()
-        if open_windows:
-            nautilus_restart(open_windows, evaluate, clients, sleep)
-        else:
-            nautilus_quit_idle()
+    # Nautilus reads it only when it starts. OmaSkins never quits it to get there: quitting cuts off a copy
+    # or move it may be doing, even with no window open (marketplace review, 2026-10-26). A Nautilus that
+    # is running (or might be) gets the new look when it next starts, and the window says so.
+    changed = data.write_nautilus_css(step)
     update_hypr_file()
+    return NAUTILUS_LATER if held and (changed or look != step) else None
 
 
 def set_qt_apps(on):
@@ -1227,7 +1221,7 @@ def _perform(steps, progress=None, notify=None, transfer=None):
         elif kind == "apply_corners":
             apply_corners(*args)
         elif kind == "apply_transparency":
-            apply_transparency(*args)
+            note = apply_transparency(*args) or note
         elif kind == "qt_apps":
             set_qt_apps(*args)
         elif kind == "top_bar":

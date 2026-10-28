@@ -577,6 +577,18 @@ def plugin_enabled(plugin_id):
     return _ENABLED["on"]
 
 
+def nautilus_glance():
+    """A step changed while Nautilus ran: once it has quit, its rule and the blur follow (run.nautilus_settle).
+    Two small file reads while nothing is waiting; Nautilus is looked for only while something is."""
+    from . import run as _run
+    try:
+        if data.nautilus_look_step() != data.transparency_step() and _run.nautilus_running() is False:
+            if _run.nautilus_settle():
+                log("Nautilus has quit: its window rule and blur follow the Transparency step now")
+    except Exception as e:
+        log("Nautilus settle failed:", repr(e))
+
+
 class DialogLook:
     """File dialogs like Nautilus (data.dialog_css): the block rewritten within half a second of a theme or
     Transparency change; the dialog service restarted once no dialog is open, so the next one has it."""
@@ -611,12 +623,10 @@ class DialogLook:
             if sig != self.seen:
                 self.seen = sig
                 step = data.transparency_step()
-                # Nautilus's block too (an OmaSkins update may change it): read when Nautilus next starts. Only
-                # OmaSkins' slider restarts an open Nautilus (you're looking at it then).
+                # Nautilus's block too (an OmaSkins update may change it): read when Nautilus next starts.
+                # Never quit to get there: that would cut off a copy it may be doing (marketplace review).
                 if data.write_nautilus_css(step):
-                    log("Nautilus look rewritten")
-                    if _run.nautilus_quit_idle():   # one left running with no window would keep the old look
-                        log("Nautilus (no window open) quit, so it reads it when it next opens")
+                    log("Nautilus look rewritten (it reads it when it next starts)")
                 if data.write_shell_block(step):
                     log("Omarchy's menus and panels: transparency rewritten")
                 if data.write_blur_requests(step):
@@ -794,6 +804,7 @@ def run(plugin_id=None):
                         log("skip ahead failed:", repr(e))
                 qt.glance()
                 dialogs.glance()
+                nautilus_glance()
                 left = end - time.monotonic()
                 if left <= 0:
                     break

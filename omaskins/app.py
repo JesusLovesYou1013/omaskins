@@ -665,7 +665,9 @@ def sub_tabs(names, on_change):
         btn.add_css_class("subtab")
         box = Gtk.Box()
         box.append(Gtk.Label(label=name))
-        count = label("", "count")
+        # Room for three digits from the start: the counts arrive once the lists load, and the row widened
+        # then (owner's rule: nothing shifts), past the width the window was opened at.
+        count = label("", "count", width_chars=3)
         box.append(count)
         btn.set_child(box)
         if first:
@@ -728,6 +730,7 @@ def flow():
     return fb
 
 
+FIT_SLACK = 16  # px over the controls' measured width, so they never sit right against the window edge
 STRIP_GAP = 8   # empty space between the controls and the scroll bar below them (owner: no misclicks)
 
 
@@ -2322,6 +2325,7 @@ class Window(Adw.ApplicationWindow):
         # the (new) current theme; otherwise Backgrounds keeps the theme you last looked at.
         self._bg_follow_current = False
         self._running = set()
+        self._later_toast = None   # the "File Manager will update upon restart." toast showing, if any
         self.preview_rows, self._preview_queue, self._preview_busy = {}, [], False
         self._asked_aether = False
         self._previews_loaded = False   # Browse's downloaded preview fonts: loaded with the Fonts tab
@@ -2458,6 +2462,20 @@ class Window(Adw.ApplicationWindow):
         self.add_controller(keys)
         self._watch_files()
         self.load()
+
+    def fit_width(self):
+        """Before it first shows: wide enough for the controls at the top, so they don't scroll sideways in
+        a window just opened (owner, 2026-10-28). Measured without the pictures below (a row of cards is as
+        wide as all of them side by side), at your text size."""
+        self.main_stack.set_visible(False)
+        try:
+            need = self.get_content().measure(Gtk.Orientation.HORIZONTAL, -1)[1]
+        finally:
+            self.main_stack.set_visible(True)
+        width = run.fit_window_width(need + FIT_SLACK)
+        dlog("fit width: controls need", need, "-> window", width)
+        if width:
+            self.set_default_size(width, self.get_default_size()[1])
 
     # ---- builders
     def _build_themes(self):
@@ -3281,7 +3299,14 @@ class Window(Adw.ApplicationWindow):
             if isinstance(result, Exception):
                 self.toasts.add_toast(Adw.Toast(title=f"{a.label} didn't work: {result}", timeout=8))
                 return
-            if result:  # a step's note replaces the usual message (e.g. a font that isn't monospace)
+            if result and a.label == "Transparency":
+                # Nautilus gets the new look when it next starts (OmaSkins never quits it): said once, briefly,
+                # however often the slider moves.
+                if self._later_toast:
+                    self._later_toast.dismiss()
+                self._later_toast = Adw.Toast(title=result, timeout=4)
+                self.toasts.add_toast(self._later_toast)
+            elif result:  # a step's note replaces the usual message (e.g. a font that isn't monospace)
                 t = Adw.Toast(title=result, timeout=0)
                 pkg = next((st[1] for st in a.steps if st[0] == "check_mono"), None)
                 if pkg:  # it's hidden everywhere now, so offer to take it straight back out
@@ -3472,7 +3497,10 @@ class App(Adw.Application):
                 GLib.idle_add(lambda p=f.get_path(): (win.import_file(p), False)[1])
 
     def do_activate(self):
-        win = self.props.active_window or Window(self)
+        win = self.props.active_window
+        if not win:
+            win = Window(self)
+            win.fit_width()
         win.present()
         bg(share.register_file_type)   # keeps the file type and double-click opening set up (yours only)
         if _DEBUG:  # which renderer GTK really uses (the VM launcher asks for software, reports 04c/07)

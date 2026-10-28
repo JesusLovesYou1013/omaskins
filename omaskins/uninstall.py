@@ -164,7 +164,8 @@ def restore_look(run=None, log=print):
 
     def transparency():
         if data.transparency_step() != data.TRANSPARENCY_DEFAULT:
-            run.apply_transparency(data.TRANSPARENCY_DEFAULT)   # live fade; also the shell and Nautilus blocks
+            # live fade; also the shell and Nautilus blocks. Nautilus's rule too: no engine is left to do it later.
+            run.apply_transparency(data.TRANSPARENCY_DEFAULT, nautilus_now=True)
         data.save_transparency(data.TRANSPARENCY_DEFAULT)
         data.write_shell_block(data.TRANSPARENCY_DEFAULT)
         data.write_nautilus_css(data.TRANSPARENCY_DEFAULT)

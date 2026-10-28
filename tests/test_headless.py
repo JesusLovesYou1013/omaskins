@@ -55,10 +55,7 @@ def _no_windows(argv):
 _run.launch = _no_windows
 _run.hypr_eval = _no_windows      # the live Hyprland is off limits too (transparency fades, blur)
 _run.hypr_clients = _no_windows
-_run.nautilus_windows = lambda: {}   # never ask the real Nautilus what it has open...
-_NAUTILUS_RESTART = _run.nautilus_restart   # the real one, only ever driven with fakes in a test
-_run.nautilus_restart = _no_windows   # ...and never restart it
-_run.nautilus_running = lambda: False   # ...nor look for the real one (a running one would be quit)
+_run.nautilus_running = lambda: False   # never look for the real Nautilus
 _run.restart_dialog_service = _no_windows   # nor Omarchy's real dialog service
 _run.dialog_service_running = lambda: False
 data.theme_mode = lambda: "dark"   # never ask the real Omarchy (each test sets what it needs)
@@ -1502,6 +1499,28 @@ class ReadingChangesNothing(unittest.TestCase):
         data.export_plan(local[0], community, None, None)
         self.assertEqual(snapshot(HOME), before)
 
+    def test_the_window_opens_wide_enough_for_its_controls(self):
+        """Since the Top bar switch, the controls scrolled sideways in a window just opened (owner,
+        2026-10-28): it opens as wide as they need, 70% to 95% of the screen."""
+        from omaskins import run
+        sent = []
+        self.assertEqual(run.fit_window_width(1201, sent.append, screen=1680), 1201)
+        self.assertIn('size = { "1201", "(monitor_h*0.75)" }', sent[0])
+        self.assertIn("set_enabled(w == 1201)", sent[0], "only this width's rule is on")
+        self.assertEqual(run.fit_window_width(900, sent.append, screen=1680), 1176, "never under 70%")
+        self.assertEqual(run.fit_window_width(5000, sent.append, screen=1680), 1596, "never over 95%")
+        self.assertIsNone(run.fit_window_width(1201, sent.append, screen=None))
+        self.assertIsNone(run.fit_window_width(1201, _no_windows, screen=1680), "Hyprland unreachable: 70%")
+        if shutil.which("lua"):
+            lua = SANDBOX / "width.lua"
+            lua.write_text("made = 0\nhl = { window_rule = function(r) made = made + 1\n"
+                           "  return { set_enabled = function() end } end }\n"
+                           + sent[0] + sent[0] + sent[1] + "print(made)\n")
+            out = subprocess.run(["lua", str(lua)], capture_output=True, text=True).stdout.split()
+            self.assertEqual(out, ["2"], "one rule per width, made once")
+        self.assertIn('label("", "count", width_chars=3)', (ROOT / "omaskins" / "app.py").read_text(),
+                      "the Browse / Installed counts can't widen the row once the lists load")
+
     def test_the_window_floats_for_everyone_not_just_where_it_was_built(self):
         """The plugin sets its own window rules (owner, 2026-10-08): they used to live only in the owner's
         hand-edited hyprland.lua."""
@@ -1511,7 +1530,7 @@ class ReadingChangesNothing(unittest.TestCase):
         code, = sent
         for part in ('class = "^io.github.jesuslovesyou1013.omaskins$"', 'title = "^OmaSkins Manager$"',
                      "float = true", "center = true", '"(monitor_w*0.7)", "(monitor_h*0.75)"',
-                     'title = "^OmaSkins preview$"', "border_size = 0", "if not omaskins_window_rules_3 then",
+                     'title = "^OmaSkins preview$"', "border_size = 0", "if not omaskins_window_rules_4 then",
                      # the big view draws the desktop blurring itself: Hyprland neither animates nor blurs it
                      "move = { 0, 0 }", "no_anim = true", "no_blur = true", 'opacity = "1 1"'):
             self.assertIn(part, code)
@@ -1889,6 +1908,20 @@ class CommandRunner(unittest.TestCase):
         self.run._set_shell_base_size(10)
         self.assertEqual(path.read_text(), "[bar]\ny = 2\n\n[font]\nbase-size = 10\n")
         self.assertEqual(self.run.shell_base_size(), 10)
+
+    def test_a_repeated_shell_section_keeps_the_text_size(self):
+        """The user's [bar] plus OmaSkins' own [bar] (Top bar on): Omarchy's shell reads it fine, strict TOML
+        refused the whole file and the window fell back to 12 px (owner, 2026-10-28)."""
+        from omaskins import theme
+        path = HOME / "shell-twice.toml"
+        path.write_text("[font]\nbase-size = 17\n\n[bar]\nbackground-alpha = 1.0\n\n"
+                        "[menu]\nbackground-alpha = 0.65\n\n[bar]\nbackground-alpha = 0.75\n")
+        self.assertEqual(theme._read_shell_toml(path),
+                         {"font": {"base-size": 17}, "bar": {"background-alpha": 0.75},
+                          "menu": {"background-alpha": 0.65}}, "last value wins, as in the shell")
+        path.write_text("[font]\nbase-size = 15\n")
+        self.assertEqual(theme._read_shell_toml(path), {"font": {"base-size": 15}})
+        self.assertEqual(theme._read_shell_toml(HOME / "none.toml"), {})
 
     def test_only_the_two_reload_nudges_may_be_sent(self):
         self.run.check(["pkill", "-USR1", "kitty"])
@@ -2899,33 +2932,69 @@ class NautilusTransparency(unittest.TestCase):
         self.assertIn('os.environ.setdefault("GSK_RENDERER", "gl")', launcher, "the VM draws on its GPU")
         self.assertNotIn('"cairo"', launcher)
 
-    def test_an_idle_nautilus_is_quit_to_read_its_new_look(self):
-        quit_ = []
-        q = lambda: quit_.append(1)
-        self.assertTrue(_run.nautilus_quit_idle(running=lambda: True, windows=lambda: {}, quit_=q))
-        self.assertEqual(quit_, [1], "running, no window: quit")
-        self.assertFalse(_run.nautilus_quit_idle(running=lambda: True, quit_=q,
-                                                 windows=lambda: {"/org/gnome/Nautilus/window/1": ["file:///x"]}))
-        asked = []
-        self.assertFalse(_run.nautilus_quit_idle(running=lambda: False, windows=lambda: asked.append(1) or {}, quit_=q))
-        self.assertEqual((quit_, asked), ([1], []), "open windows are left alone; not running: not even asked")
-
-    def test_slider_quits_an_idle_nautilus(self):
-        idle = []
-        saved = _run.nautilus_quit_idle
-        _run.nautilus_quit_idle = lambda *a, **k: idle.append(1)
+    def test_nautilus_is_never_quit(self):
+        """Quitting Nautilus cuts off a copy or move it may be doing, window or not (marketplace review,
+        2026-10-26): OmaSkins never does it. A changed look waits for Nautilus's next start, and the slider's
+        toast says so whenever Nautilus is running, or that couldn't be found out."""
+        src = "\n".join(f.read_text() for f in (ROOT / "omaskins").glob("*.py"))
+        self.assertNotIn('"nautilus", "-q"', src)
+        self.assertNotIn("nautilus_restart", src)
+        saved = _run.nautilus_running
+        go = lambda step: _run.apply_transparency(step, evaluate=lambda c: None, clients=lambda: [],
+                                                  sleep=lambda s: None)
         try:
-            _run.apply_transparency(3, evaluate=lambda c: None, clients=lambda: [], sleep=lambda s: None)
-            self.assertEqual(idle, [1], "its stylesheet changed and no window is open")
-            _run.apply_transparency(3, evaluate=lambda c: None, clients=lambda: [], sleep=lambda s: None)
-            self.assertEqual(idle, [1], "no change: left alone")
+            _run.nautilus_running = lambda: True
+            self.assertEqual(go(3), "File Manager will update upon restart.", "its stylesheet changed")
+            _run.nautilus_running = lambda: None
+            self.assertEqual(go(4), _run.NAUTILUS_LATER, "unknown: say it")
+            _run.nautilus_running = lambda: False
+            self.assertIsNone(go(3), "not running: it reads it on start")
         finally:
-            _run.nautilus_quit_idle = saved
+            _run.nautilus_running = saved
+
+    def test_a_running_nautilus_is_left_as_it_is_until_it_quits(self):
+        """Owner, 2026-10-28: changing the step flipped an open Nautilus to Hyprland's fade (step 2) or
+        took the blur from behind it (step 1), while it still had its old see-through look. Its rule and
+        that blur now wait until it has quit; the engine does them then."""
+        saved = _run.nautilus_running
+        calls = []
+        rule = lambda c: "nautilus(true)" in c or "nautilus(false," in c   # a call, not FADE_LUA's definition
+        go = lambda step: _run.apply_transparency(step, evaluate=calls.append, clients=lambda: [],
+                                                  sleep=lambda s: None)
+        try:
+            _run.nautilus_running = lambda: False
+            go(4)
+            self.assertEqual(data.nautilus_look_step(), 4)
+            _run.nautilus_running = lambda: True
+            calls.clear()
+            go(1)
+            self.assertFalse(any(rule(c) for c in calls), "its rule left alone")
+            self.assertFalse(any("enabled = false" in c for c in calls), "its blur kept")
+            self.assertEqual(data.nautilus_look_step(), 4, "it still has step 4's look")
+            calls.clear()
+            go(0)
+            self.assertFalse(any(rule(c) or "enabled = false" in c for c in calls))
+            calls.clear()
+            self.assertTrue(_run.nautilus_settle(calls.append), "quit: the rule and blur follow")
+            self.assertTrue(any(c.endswith("nautilus(true)") for c in calls))
+            self.assertTrue(any("enabled = false" in c for c in calls), "blur held for it, now off")
+            self.assertEqual(data.nautilus_look_step(), 0)
+            self.assertFalse(_run.nautilus_settle(calls.append), "nothing waiting any more")
+            calls.clear()
+            go(4)
+            self.assertFalse(any(rule(c) for c in calls), "running again: left alone again")
+            self.assertTrue(_run.apply_transparency(1, evaluate=calls.append, clients=lambda: [],
+                                                    sleep=lambda s: None, nautilus_now=True) is None)
+            self.assertTrue(any("nautilus(false" in c for c in calls), "removal: at once")
+            self.assertIn("apply_transparency(data.TRANSPARENCY_DEFAULT, nautilus_now=True)",
+                          (ROOT / "omaskins" / "uninstall.py").read_text(), "no engine is left to do it later")
+        finally:
+            _run.nautilus_running = saved
 
     def test_the_rest_of_gtk_css_is_left_alone(self):
         write(data.GTK4_CSS, "/* mine */\nlabel { color: red; }\n")
         self.assertTrue(data.write_nautilus_css(2))
-        self.assertFalse(data.write_nautilus_css(2), "same step: no change, so no Nautilus restart")
+        self.assertFalse(data.write_nautilus_css(2), "same step: no change")
         self.assertTrue(data.write_nautilus_css(4))
         text = data.GTK4_CSS.read_text()
         self.assertEqual(text.count(data.NAUTILUS_CSS_START), 1, "one block, replaced")
@@ -2980,100 +3049,20 @@ class NautilusTransparency(unittest.TestCase):
         data.transparency_step = lambda: data.TRANSPARENCY_DEFAULT
         try:
             from omaskins import uninstall
-            uninstall.restore_look(run=types.SimpleNamespace(apply_transparency=lambda s: None), log=lambda *a: None)
+            uninstall.restore_look(run=types.SimpleNamespace(apply_transparency=lambda s, **k: None), log=lambda *a: None)
         finally:
             data.transparency_step = saved
         self.assertEqual(data.FOOT_INI.read_text().rstrip("\n"), "[main]\nfont=x")
         self.assertFalse(data.GTK4_CSS.exists() and "blur" in data.GTK4_CSS.read_text())
 
-    def test_nautilus_is_reopened_not_faded(self):
-        calls, restarted = [], []
+    def test_nautilus_is_not_faded(self):
+        calls = []
         clients = [{"address": "0xn", "class": "org.gnome.Nautilus", "tags": ["default-opacity*"]},
                    {"address": "0xa", "class": "foot", "tags": ["default-opacity*"]}]
-        saved = (_run.nautilus_windows, _run.nautilus_restart)
-        _run.nautilus_windows = lambda: {"/org/gnome/Nautilus/window/1": ["file:///home/x/Downloads"]}
-        _run.nautilus_restart = lambda windows, *a, **k: restarted.append(windows)
-        try:
-            _run.apply_transparency(2, evaluate=calls.append, clients=lambda: clients, sleep=lambda s: None)
-            self.assertTrue(any("retag({ '0xa' }" in c for c in calls))
-            self.assertFalse(any("0xn" in c for c in calls), "Nautilus isn't faded by Hyprland")
-            self.assertTrue(any(c.endswith("nautilus(true)") for c in calls), "its own: out of Hyprland's fade")
-            self.assertEqual(restarted, [{"/org/gnome/Nautilus/window/1": ["file:///home/x/Downloads"]}])
-            restarted.clear()
-            _run.apply_transparency(2, evaluate=calls.append, clients=lambda: clients, sleep=lambda s: None)
-            self.assertEqual(restarted, [], "its stylesheet didn't change: no restart")
-        finally:
-            _run.nautilus_windows, _run.nautilus_restart = saved
-
-    def test_restart_puts_windows_back(self):
-        opened, moved, quit_ = [], [], []
-        state = {"open": [{"address": "0xold", "class": "org.gnome.Nautilus", "title": "Downloads",
-                           "workspace": {"name": "1"}}]}
-
-        def clients():
-            return state["open"]
-
-        def open_(uris):
-            opened.append(uris)
-            state["open"] = state["open"] + [{"address": "0xnew", "class": "org.gnome.Nautilus", "title": "Downloads",
-                                              "workspace": {"name": "special:scratchpad"}}]
-
-        def quit_now():
-            quit_.append(1)
-            state["open"] = []
-        saved = _run.nautilus_restart
-        _run.nautilus_restart = _NAUTILUS_RESTART   # the real one, with fakes for everything it touches
-        try:
-            _run.nautilus_restart({"/w/1": ["file:///home/x/Downloads"]}, evaluate=moved.append, clients=clients,
-                                  sleep=lambda s: None, quit_=quit_now, open_=open_)
-        finally:
-            _run.nautilus_restart = saved
-        self.assertEqual((quit_, opened), ([1], [["file:///home/x/Downloads"]]))
-        self.assertEqual(moved, ["hl.dispatch(hl.dsp.window.move({ workspace = '1', follow = false, "
-                                 "window = 'address:0xnew' }))"], "back on its workspace")
-
-    def test_restart_two_windows_on_the_same_folder(self):
-        """Two "Home" windows on workspaces 1 and 2 come back on 1 and 2, not both on 1 (owner, 2026-10-02)."""
-        moved = []
-        state = {"open": [{"address": "0xa", "class": "org.gnome.Nautilus", "title": "Home", "workspace": {"name": "1"}},
-                          {"address": "0xb", "class": "org.gnome.Nautilus", "title": "Home", "workspace": {"name": "2"}}]}
-
-        def open_(uris):
-            n = len(state["open"])
-            state["open"] = state["open"] + [{"address": f"0xn{n}", "class": "org.gnome.Nautilus", "title": "Home",
-                                              "workspace": {"name": "special:scratchpad"}}]
-
-        def quit_now():
-            state["open"] = []
-        saved = _run.nautilus_restart
-        _run.nautilus_restart = _NAUTILUS_RESTART
-        try:
-            _run.nautilus_restart({"/w/1": ["file:///home/x"], "/w/2": ["file:///home/x"]}, evaluate=moved.append,
-                                  clients=lambda: state["open"], sleep=lambda s: None, quit_=quit_now, open_=open_)
-        finally:
-            _run.nautilus_restart = saved
-        self.assertEqual(sorted(m.split("workspace = '")[1][0] for m in moved), ["1", "2"])
-
-    def test_restart_puts_an_untitled_window_back_too(self):
-        """A new window without its title yet (or one that doesn't match): the workspace Nautilus was on."""
-        moved = []
-        state = {"open": [{"address": "0xold", "class": "org.gnome.Nautilus", "title": "Home", "workspace": {"name": "2"}}]}
-
-        def open_(uris):
-            state["open"] = [{"address": "0xnew", "class": "org.gnome.Nautilus", "title": "",
-                              "workspace": {"name": "special:scratchpad"}}]
-
-        def quit_now():
-            state["open"] = []
-        saved = _run.nautilus_restart
-        _run.nautilus_restart = _NAUTILUS_RESTART
-        try:
-            _run.nautilus_restart({"/w/1": ["file:///home/x"]}, evaluate=moved.append, clients=lambda: state["open"],
-                                  sleep=lambda s: None, quit_=quit_now, open_=open_)
-        finally:
-            _run.nautilus_restart = saved
-        self.assertEqual(moved, ["hl.dispatch(hl.dsp.window.move({ workspace = '2', follow = false, "
-                                 "window = 'address:0xnew' }))"])
+        _run.apply_transparency(2, evaluate=calls.append, clients=lambda: clients, sleep=lambda s: None)
+        self.assertTrue(any("retag({ '0xa' }" in c for c in calls))
+        self.assertFalse(any("0xn" in c for c in calls), "Nautilus isn't faded by Hyprland")
+        self.assertTrue(any(c.endswith("nautilus(true)") for c in calls), "its own: out of Hyprland's fade")
 
 
 class PluginEnabled(unittest.TestCase):
@@ -3687,9 +3676,10 @@ class Uninstall(unittest.TestCase):
             windows = []
 
             @staticmethod
-            def apply_transparency(step):
+            def apply_transparency(step, nautilus_now=False):
                 _run.apply_transparency(step, evaluate=lambda code: test.did.append(("eval", code)),
-                                        clients=lambda: FakeRun.windows, sleep=lambda s: None)
+                                        clients=lambda: FakeRun.windows, sleep=lambda s: None,
+                                        nautilus_now=nautilus_now)
             hypr_eval = staticmethod(lambda code: test.did.append(("eval", code)))
             hypr_clients = staticmethod(lambda: FakeRun.windows)
             dialog_service_running = staticmethod(lambda: False)

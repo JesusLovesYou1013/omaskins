@@ -127,7 +127,9 @@ rotate through.
 - **Transparency**: five steps; step 2 is exactly Omarchy's own. Windows fade live (no Hyprland
   reload). Omarchy's menus, panels and notifications follow. Nautilus and the file dialogs make only
   their background see-through (files, icons and text stay solid), in libadwaita's grey, with the
-  sidebar a little more solid. From step 3 up there is blur behind.
+  sidebar a little more solid. From step 3 up there is blur behind. Nautilus reads its look only when
+  it starts, and OmaSkins never quits it for you (that would cut off a copy it may be doing), so a
+  running Nautilus picks up a new step when it next starts; the window tells you so.
   - **The same blur behind every window.** Hyprland blurs behind a window, but a toolkit that tells
     Hyprland where to blur (GTK 4.24 and newer, foot) gets blur only where it asked. OmaSkins asks on
     their behalf, only at the steps with blur: a marked block in `~/.config/gtk-4.0/gtk.css` (every
