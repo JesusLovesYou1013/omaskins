@@ -3037,6 +3037,48 @@ class NautilusTransparency(unittest.TestCase):
         self.assertEqual([s.strip() for s, _ in rules], ["window"])
         self.assertEqual(rules[0][1].strip(), "backdrop-filter: blur(12px);")
 
+    def test_a_private_config_stays_private_when_omaskins_writes_to_it(self):
+        # Marketplace review, 2026-10-28: a 0600 foot.ini came back 0644 under umask 022 (the new copy was made
+        # readable, then swapped in). Every config OmaSkins rewrites keeps its mode, and leaves no copy behind.
+        write(data.FOOT_INI, "[main]\nfont=x\n")
+        write(data.GTK4_CSS, "/* mine */\n")
+        shell = data.HOME / ".config/omarchy/shell.toml"
+        write(shell, "[font]\nbase-size = 11\n")
+        for f in (data.FOOT_INI, data.GTK4_CSS, shell):
+            f.chmod(0o600)
+        was = os.umask(0o022)
+        try:
+            data.write_blur_requests(3)
+            data.write_nautilus_css(2)
+            _run._set_shell_base_size(12)
+        finally:
+            os.umask(was)
+        self.assertIn("blur=yes", data.FOOT_INI.read_text())
+        self.assertIn("base-size = 12", shell.read_text())
+        for f in (data.FOOT_INI, data.GTK4_CSS, shell):
+            self.assertEqual(stat.S_IMODE(f.stat().st_mode), 0o600, f.name)
+            self.assertEqual([p.name for p in f.parent.glob("*omaskins-tmp*")], [], "no copy left beside it")
+
+    def test_a_failed_config_write_leaves_the_file_and_no_copy(self):
+        from unittest import mock
+        write(data.FOOT_INI, "[main]\nfont=x\n")
+        data.FOOT_INI.chmod(0o600)
+        with mock.patch.object(data.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                data.write_blur_requests(3)
+        self.assertEqual(data.FOOT_INI.read_text(), "[main]\nfont=x\n")
+        self.assertEqual(stat.S_IMODE(data.FOOT_INI.stat().st_mode), 0o600)
+        self.assertEqual([p.name for p in data.FOOT_INI.parent.iterdir()], ["foot.ini"])
+
+    def test_a_new_config_gets_the_usual_mode(self):
+        data.GTK4_CSS.unlink(missing_ok=True)
+        was = os.umask(0o022)
+        try:
+            data.write_nautilus_css(2)
+        finally:
+            os.umask(was)
+        self.assertEqual(stat.S_IMODE(data.GTK4_CSS.stat().st_mode), 0o644)
+
     def test_no_foot_no_foot_block(self):
         data.FOOT_INI.unlink(missing_ok=True)
         data.write_blur_requests(3)

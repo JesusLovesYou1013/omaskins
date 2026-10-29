@@ -140,10 +140,7 @@ def strip_require(looknfeel=None):
         text += "\n"
     if text == "\n".join(lines):
         return False
-    tmp = looknfeel.with_name(".looknfeel.lua.omaskins-tmp")
-    tmp.write_text(text)
-    shutil.copymode(looknfeel, tmp)
-    tmp.replace(looknfeel)
+    data.replace_file(looknfeel, text)
     return True
 
 

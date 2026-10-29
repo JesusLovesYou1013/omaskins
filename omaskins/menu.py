@@ -56,10 +56,7 @@ def add_row(launcher):
     new_text = "\n".join(new) + "\n"
     if new_text == text:
         return False
-    MENU_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = MENU_FILE.with_name(".omarchy-menu.jsonc.omaskins-tmp")
-    tmp.write_text(new_text)
-    tmp.replace(MENU_FILE)
+    data.replace_file(MENU_FILE, new_text)
     return True
 
 
@@ -71,7 +68,5 @@ def remove_row():
     new_text = "\n".join(_without_block(text.splitlines())) + "\n"
     if new_text == text:
         return False
-    tmp = MENU_FILE.with_name(".omarchy-menu.jsonc.omaskins-tmp")
-    tmp.write_text(new_text)
-    tmp.replace(MENU_FILE)
+    data.replace_file(MENU_FILE, new_text)
     return True

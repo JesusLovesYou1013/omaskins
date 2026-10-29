@@ -684,10 +684,7 @@ def _set_shell_base_size(px):
         done = True
     if not done:
         out += ([""] if out else []) + ["[font]", f"base-size = {px}"]
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".omaskins-tmp")
-    tmp.write_text("\n".join(out) + "\n")
-    tmp.replace(path)
+    data.replace_file(path, "\n".join(out) + "\n")
 
 
 def _sub_in(path, pattern, repl):

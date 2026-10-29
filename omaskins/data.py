@@ -21,6 +21,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 import time
 import tomllib
 import urllib.request
@@ -2314,6 +2315,38 @@ def _sidebar_layer(base):
     return round((target - base) / (1 - base), 3) if base < 1 else 0
 
 
+def _umask():
+    """This process's umask, read without changing it (os.umask can only be read by setting it)."""
+    try:
+        for line in Path("/proc/self/status").read_text().splitlines():
+            if line.startswith("Umask:"):
+                return int(line.split()[1], 8)
+    except (OSError, ValueError):
+        pass
+    return 0o022
+
+
+def replace_file(path, text):
+    """Swap new text in for a whole config file, so nothing ever reads half of it. The new copy is private from
+    the moment it exists and takes the old file's mode (a new file gets the usual one): a private file stays
+    private. A failed write leaves no copy behind."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except FileNotFoundError:
+        mode = 0o666 & ~_umask()
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".omaskins-tmp")   # 0600
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            os.fchmod(f.fileno(), mode)
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+
+
 def _write_css_block(path, start_mark, end_mark, block):
     """Put one OmaSkins block in a GTK stylesheet (replacing it where it stands), leaving anything else in the file
     alone; an empty block removes it (and the file too, if nothing else was ever in it). True if changed."""
@@ -2336,10 +2369,7 @@ def _write_css_block(path, start_mark, end_mark, block):
     if new == text:
         return False
     if new.strip():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(".gtk.css.omaskins-tmp")
-        tmp.write_text(new)
-        tmp.replace(path)
+        replace_file(path, new)
     else:
         path.unlink(missing_ok=True)
     return True
