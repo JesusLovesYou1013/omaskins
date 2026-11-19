@@ -2739,8 +2739,10 @@ print(#rules, on, table.concat(names, " "), seen, own)
     def test_fade_to_step_3(self):
         write(HOME / ".config/hypr/looknfeel.lua", "-- looknfeel\n")
         self.fade(2)
-        self.assertEqual(self.calls[0], data.TRANSPARENCY_BLUR, "blur from step 3 up (owner, 2026-10-02)")
-        self.assertTrue(all("0xc" not in c for c in self.calls), "only windows Omarchy makes see-through")
+        self.assertTrue(self.calls[0].endswith("every_window(true)"), "every window tagged before they're read")
+        self.assertEqual(self.calls[1], data.TRANSPARENCY_BLUR, "blur from step 3 up (owner, 2026-10-02)")
+        self.assertIn('require, "default.hypr.glass"', data.TRANSPARENCY_BLUR, "Omarchy's Glassy blur (2026-11-19)")
+        self.assertTrue(all("0xc" not in c for c in self.calls), "only windows with the tag (carve-outs have none)")
         rules, on, names, seen = self.hyprland()
         self.assertEqual(seen, "0.8500 0.8000", "ends on step 3's values, for new windows too")
         self.assertEqual(names, "", "no fade tags left on any window")
@@ -2773,11 +2775,12 @@ print(#rules, on, table.concat(names, " "), seen, own)
     def test_blur_on_the_strong_steps_and_back_to_omarchys_own(self):
         write(HOME / ".config/hypr/looknfeel.lua", "-- looknfeel\n")
         self.fade(4)
-        self.assertEqual(self.calls[0], data.TRANSPARENCY_BLUR, "blur first, then the fade")
+        self.assertEqual(self.calls[1], data.TRANSPARENCY_BLUR, "blur first, then the fade")
         self.calls.clear()
         self.windows[0]["tags"] += ["omaskins-t1-10*"]   # left by the fade before 2026-10-02
         self.fade(1)
-        self.assertTrue(any("blur = { enabled = false }" in c for c in self.calls), "blur off again")
+        self.assertIn(data.BLUR_OFF, self.calls, "blur off again (Omarchy's own: not Glassy here)")
+        self.assertTrue(any(c.endswith("every_window(false)") for c in self.calls), "windows back to Omarchy's")
         self.assertIn("hl.dispatch(hl.dsp.window.tag({ window = 'address:0xa', tag = '-omaskins-t1-10' }))", self.calls,
                       "old tags cleared")
         self.assertFalse(data.TRANSPARENCY_FILE.exists())
@@ -2789,20 +2792,37 @@ print(#rules, on, table.concat(names, " "), seen, own)
         lua = SANDBOX / "reader.lua"
         data.save_transparency(3)
         lua.write_text("o = { window = function(m, r) print('rule', m.class or m.tag, r.tag or r.opacity, r.tag and r.opacity or '') end }\n"
+                       "local made = {}\n"
                        "hl = { config = function(c) print('blur', c.decoration.blur.enabled) end,\n"
-                       "       layer_rule = function(r) print('layer blur', r.match.namespace ~= nil) end }\n"
-                       + data.TRANSPARENCY_LUA)
-        out = subprocess.run(["lua", str(lua)], capture_output=True, text=True,
-                             env=dict(os.environ, XDG_CONFIG_HOME=str(HOME / ".config"))).stdout
-        self.assertEqual(out.split("\n")[:4], ["rule\t^io.github.jesuslovesyou1013.omaskins$\t-default-opacity\t1 1",
-                                               "rule\t^org.gnome.Nautilus$\t-default-opacity\t1 1",
-                                               "rule\tdefault-opacity\t0.75 0.68\t", "blur\ttrue"],
-                         "OmaSkins out of the whole-window fade (it fades only its background), then the step")
+                       "       layer_rule = function(r) print('layer blur', r.match.namespace ~= nil) end,\n"
+                       "       window_rule = function(r)\n"
+                       "         r.set_enabled = function(self, on) print('switch', self.match.class or self.match.tag, self.tag, on) end\n"
+                       "         made[#made + 1] = (r.match.class or r.match.tag) .. ' ' .. r.tag\n"
+                       "         return r end }\n"
+                       + data.TRANSPARENCY_LUA + "\nprint('made', table.concat(made, ' | '))\n")
+        run_lua = lambda: subprocess.run(["lua", str(lua)], capture_output=True, text=True,
+                                         env=dict(os.environ, XDG_CONFIG_HOME=str(HOME / ".config"))).stdout
+        out = run_lua()
+        lines = out.split("\n")
+        self.assertEqual(lines[:4], ["switch\t.*\t+default-opacity\ttrue",
+                                     "rule\t^org.gnome.Nautilus$\t-default-opacity\t1 1",
+                                     "rule\tdefault-opacity\t0.75 0.68\t", "blur\ttrue"],
+                         "every window, Nautilus does its own, then the step")
+        made = lines[-2]
+        self.assertTrue(made.startswith("made\t.* +default-opacity | "), "the switch rule first")
+        self.assertIn("pip -default-opacity", made, "carve-outs made after them, so they win")
+        self.assertTrue(made.endswith("^io.github.jesuslovesyou1013.omaskins$ -default-opacity"), "OmaSkins does its own")
+        data.save_transparency(0)
+        self.assertIn("blur\tfalse", run_lua(), "step 1: no blur at all, every window solid")
         data.save_transparency(1)
-        out = subprocess.run(["lua", str(lua)], capture_output=True, text=True,
-                             env=dict(os.environ, XDG_CONFIG_HOME=str(HOME / ".config"))).stdout
-        self.assertEqual(out.strip(), "rule\t^io.github.jesuslovesyou1013.omaskins$\t-default-opacity\t1 1",
-                         "no file: only OmaSkins' own opt-out; every other window as Omarchy and the theme have it")
+        self.assertEqual(run_lua().split("\n")[:1], ["switch\t.*\t+default-opacity\tfalse"],
+                         "no file: every window as Omarchy and the theme have it")
+        self.assertNotIn("rule", run_lua(), "and nothing else set")
+
+    def test_every_carve_out_is_a_lua_match(self):
+        for m in data.SOLID_WINDOWS:
+            self.assertTrue(set(m) <= {"class", "tag", "title"}, m)
+            self.assertTrue(all("]]" not in v for v in m.values()), "fits a Lua long string")
 
     def test_shared_and_applied_by_an_import(self):
         from omaskins import share
@@ -3534,7 +3554,9 @@ class FileDialogs(unittest.TestCase):
             self.skipTest("no lua")
         lua = SANDBOX / "dialogs.lua"
         lua.write_text("o = { window = function(m, r) print('rule', m.class or m.tag) end }\n"
-                       "hl = { config = function() end }\n" + data.TRANSPARENCY_LUA)
+                       "hl = { config = function() end, layer_rule = function() end,\n"
+                       "       window_rule = function() return { set_enabled = function() end } end }\n"
+                       + data.TRANSPARENCY_LUA)
         run_lua = lambda: subprocess.run(["lua", str(lua)], capture_output=True, text=True,
                                          env=dict(os.environ, XDG_CONFIG_HOME=str(HOME / ".config"))).stdout
         data.save_transparency(4)

@@ -932,6 +932,7 @@ local function default_rule(a, b)
     F.own[#F.own + 1] = hl.window_rule({ match = { tag = "omaskins-qt" }, opacity = "1 1" })
   end
 end
+""" + data.EVERY_WINDOW_LUA + """
 local function nautilus(own, a, b)
   F.nautilus = F.nautilus or {}
   local key = own and "own" or "omarchy"
@@ -1007,14 +1008,15 @@ def nautilus_settle(evaluate=None):
         return False
     nautilus_rule(step, evaluate)
     if data.transparency_values(look)[2] and not data.transparency_values(step)[2]:
-        (evaluate or hypr_eval)("hl.config({ decoration = { blur = { enabled = false } } })")   # held for it
+        (evaluate or hypr_eval)(data.blur_lua(step))   # held for it
     data.save_nautilus_look_step(step)
     return True
 
 
 def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, sleep=time.sleep,
                        nautilus_now=False):
-    """Fade every see-through window (Omarchy's "default-opacity" tag) to `step` over `fade` seconds,
+    """Fade every see-through window (the "default-opacity" tag: every window but the carve-outs, or at the
+    default step Omarchy's own) to `step` over `fade` seconds,
     live, without a Hyprland reload (in this VM a reload blanks the screen): each frame moves the windows
     to the tag of the in-between level. New windows get the new values from a rule too. Then the step is
     saved for the next time Hyprland loads (omaskins.lua reads it; saving it doesn't make Hyprland reload)."""
@@ -1026,6 +1028,10 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
     look = data.nautilus_look_step() if held else step   # read before the new step is saved below
     data.save_nautilus_look_step(look)
     nautilus_blur = held and data.transparency_values(look)[2]
+    # Every window at OmaSkins' own steps (data.SOLID_WINDOWS): tagged before the windows are read, so they
+    # fade too; at the default step they go back to Omarchy once the fade is done.
+    if step != data.TRANSPARENCY_DEFAULT or data.transparency_step() != data.TRANSPARENCY_DEFAULT:
+        evaluate(FADE_LUA + "every_window(true)")
     open_windows = clients()
     windows = [c["address"] for c in open_windows if "default-opacity" in _tags(c)   # Nautilus and file
                and c.get("class") not in ("org.gnome.Nautilus", data.DIALOG_CLASS)   # dialogs do their own,
@@ -1050,8 +1056,9 @@ def apply_transparency(step, fade=1.5, frames=10, evaluate=None, clients=None, s
     for address, tags in stale.items():
         for tag in tags:
             evaluate(f"hl.dispatch(hl.dsp.window.tag({{ window = 'address:{address}', tag = '-{tag}' }}))")
-    if before[2] and not after[2] and not nautilus_blur:   # a see-through Nautilus keeps its blur till it quits
-        evaluate("hl.config({ decoration = { blur = { enabled = false } } })")
+    evaluate(FADE_LUA + f"every_window({'false' if step == data.TRANSPARENCY_DEFAULT else 'true'})")
+    if not after[2] and not nautilus_blur:   # a see-through Nautilus keeps its blur till it quits
+        evaluate(data.blur_lua(step))
     # Nautilus: its own stylesheet (sidebar a little more solid, icons solid) instead of Hyprland's
     # whole-window fade; back to Hyprland's at the default step. Not while it runs: see nautilus_settle.
     if not held:

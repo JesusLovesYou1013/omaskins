@@ -10,7 +10,7 @@ called OmaSkins for short.
 - **Rotation**: change theme and background on a schedule that keeps running with the app closed, with
   day and night theme sets, any theme with any background, and Next and Pause in the bar.
 - **Rounded corners**: one radius for windows, menus and popups, whatever the theme.
-- **Transparency**: five steps for every see-through window, with the same blur behind each of them
+- **Transparency**: five steps for every window, with the same blur behind each of them
   (terminals included), a gentle fade as focus moves between windows, the top bar if you want it, and
   Omarchy's menus, panels, Nautilus, file dialogs and Qt apps following along.
 - **Share**: your whole setup in one file, to move to another machine or to get back later.
@@ -124,8 +124,13 @@ rotate through.
 
 - **Rounded Corners**: one radius for windows, menus and popups, whatever the theme. Off means each
   theme's own corners.
-- **Transparency**: five steps; step 2 is exactly Omarchy's own. Windows fade live (no Hyprland
-  reload). Omarchy's menus, panels and notifications follow. Nautilus and the file dialogs make only
+- **Transparency**: five steps. Step 1 makes every window solid, with no blur. Step 2 is exactly
+  Omarchy's own, including its Window Opacity menu (Opaque, Transparent or Glassy). Steps 3 to 5 make
+  every window more see-through, apart from a few kept solid (video and media players, browsers,
+  picture-in-picture, games, Steam, virtual machines, DaVinci Resolve), with Omarchy's Glassy blur
+  behind them. Windows fade live (no Hyprland reload). Omarchy's menus, panels and notifications follow.
+  Apps that draw their own see-through background (OmaShow, OmaMake, OmaSkins' Qt style) keep their
+  text and pictures solid. Nautilus and the file dialogs make only
   their background see-through (files, icons and text stay solid), in libadwaita's grey, with the
   sidebar a little more solid. From step 3 up there is blur behind. Nautilus reads its look only when
   it starts, and OmaSkins never quits it for you (that would cut off a copy it may be doing), so a

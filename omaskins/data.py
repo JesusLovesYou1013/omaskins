@@ -2102,9 +2102,11 @@ FOCUS_FADE_LUA = f"""
 # --------------------------------------------------------------------------- transparency
 #
 # Five steps (owner, 2026-10-02): off, Omarchy's own default, then three stronger ones; unfocused windows a
-# bit more see-through than the focused one. Only the windows Omarchy itself makes see-through (its
-# "default-opacity" tag); apps it keeps solid stay solid. Step 2 = exactly Omarchy's (and each theme's) own
-# values: OmaSkins sets nothing. Blur behind from step 3 up (owner, 2026-10-02), so text stays easy to read.
+# bit more see-through than the focused one. Step 2 = exactly Omarchy's (and each theme's) own: OmaSkins sets
+# nothing, and Omarchy's Window Opacity menu (Opaque / Transparent / Glassy) works as it does without
+# OmaSkins. Step 1 makes every window solid, with no blur. Blur behind from step 3 up (owner, 2026-10-02), so
+# text stays easy to read: Omarchy's own Glassy blur (owner, 2026-11-19); the slider moves only how
+# see-through the windows are.
 # OmaSkins itself is left out of Hyprland's whole-window fade: it makes only its own background see-through
 # (same values), so theme and background previews, text and buttons stay solid.
 # The step lives in ~/.config/omaskins/transparency, which omaskins.lua reads when Hyprland loads; changing
@@ -2115,7 +2117,72 @@ TRANSPARENCY_DEFAULT = 1
 # Steps 3-5 one notch stronger than first tried (owner, 2026-10-02: the blur made it less obvious), then 10
 # points apart instead of 5 (owner, 2026-10-02: step 4 = the old step 5, which is what they use).
 TRANSPARENCY_STEPS = ((1.0, 1.0, False), None, (0.85, 0.80, True), (0.75, 0.68, True), (0.65, 0.56, True))
-TRANSPARENCY_BLUR = "hl.config({ decoration = { blur = { enabled = true, size = 5, passes = 2 } } })"
+# Omarchy's Glassy blur (default/hypr/glass.lua: darker, a little grain, more colour); before Omarchy 4.5
+# there's none, and the plain blur OmaSkins used until then.
+TRANSPARENCY_BLUR = ('do local ok, glass = pcall(require, "default.hypr.glass") if ok and type(glass) == "function" '
+                     'then glass() else hl.config({ decoration = { blur = { enabled = true, size = 5, passes = 2 } } }) '
+                     'end end')
+BLUR_OFF = "hl.config({ decoration = { blur = { enabled = false } } })"
+# Omarchy's Glassy choices (its Window Opacity menu, and the bar's): each is a file Hyprland loads.
+OMARCHY_GLASSY = [Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy/toggles/hypr" / name
+                  for name in ("window-glassy.lua", "bar-glassy.lua")]
+
+
+def blur_lua(step):
+    """Hyprland's blur at a step: Omarchy's Glassy one where the step has blur, Omarchy's own choice at the
+    default step, none at all at step 1 (every window solid)."""
+    if step == TRANSPARENCY_DEFAULT:
+        return TRANSPARENCY_BLUR if any(p.exists() for p in OMARCHY_GLASSY) else BLUR_OFF
+    return TRANSPARENCY_BLUR if transparency_values(step)[2] else BLUR_OFF
+
+
+# Omarchy 4.5 (2026-11-15) made window transparency opt-in: only terminals, Nautilus, Omawrite, 1Password and
+# windows given its "transparent" tag are see-through (its "transparent-window" tag), and the "default-opacity"
+# tag every window had is gone, so OmaSkins' steps reached no window but its own. Owner, 2026-11-19: step 2
+# leaves that to Omarchy; every other step is every window again, as before, except the carve-outs. So at
+# those steps OmaSkins tags every window "default-opacity" itself: one rule, switched on and off, never piled
+# up. Omarchy's own tag can't be taken off (its rule puts it back), so its Opaque and Glassy menu choices,
+# loaded after OmaSkins, still win for the windows it tags.
+# Carve-outs stay solid: the apps Omarchy 4.0 kept solid (media, picture-in-picture, browsers, games, VMs,
+# DaVinci Resolve), plus any the owner names (hard to read and so on). Not a setting.
+SOLID_WINDOWS = (
+    {"class": "^(zoom|vlc|mpv|org.kde.kdenlive|com.obsproject.Studio|com.github.PintaProject.Pinta|imv"
+              "|org.gnome.NautilusPreviewer)$"},
+    {"tag": "pip"},
+    {"tag": "chromium-based-browser"},
+    {"tag": "firefox-based-browser"},
+    {"class": r"(^.+-youtube\.com__.*$|^.+-app\.zoom\.us__wc_home.*$)"},
+    {"class": "com.libretro.RetroArch"},
+    {"class": "^WebcamOverlay-(small|medium|large)$"},
+    {"class": "qemu"},
+    {"class": ".*[Rr]esolve.*"},
+    {"class": "steam.*"},
+)
+
+
+def _lua_match(m):
+    return "{ " + ", ".join(f"{k} = [[{v}]]" for k, v in m.items()) + " }"
+
+
+EVERY_WINDOW_LUA = """
+local function every_window(on)
+  if not omaskins_every then
+    omaskins_every = {
+      hl.window_rule({ match = { class = ".*" }, tag = "+default-opacity" }),
+    }
+    -- Made after it, so they win (the newest rule decides); always on, as they only take a tag off.
+    for _, m in ipairs({ """ + ", ".join(_lua_match(m) for m in SOLID_WINDOWS) + """ }) do
+      hl.window_rule({ match = m, tag = "-default-opacity" })
+    end
+    -- OmaSkins makes only its own background see-through (its previews stay solid), so Hyprland leaves its
+    -- windows out of the whole-window fade.
+    hl.window_rule({ match = { class = "^io.github.jesuslovesyou1013.omaskins$" }, tag = "-default-opacity", opacity = "1 1" })
+  end
+  for _, r in ipairs(omaskins_every) do
+    r:set_enabled(on)
+  end
+end
+"""
 # Omarchy's own menus, panels (the bar's dropdowns) and notifications: the shell draws them itself, so
 # Hyprland's window fade never reaches them. The shell has its own setting for each (`background-alpha`,
 # solid by default), read live from your ~/.config/omarchy/shell.toml, where Omarchy's text size also lives
@@ -2179,10 +2246,6 @@ def write_shell_block(step):
 
 
 TRANSPARENCY_LUA = """
--- OmaSkins makes only its own background see-through (its previews stay solid), so Hyprland leaves its
--- windows out of the whole-window fade.
-o.window({ class = "^io.github.jesuslovesyou1013.omaskins$" }, { tag = "-default-opacity", opacity = "1 1" })
-
 -- Transparency (OmaSkins): the step chosen in OmaSkins, read from ~/.config/omaskins/transparency, so
 -- changing it never needs a Hyprland reload. No file: Omarchy's and the theme's own transparency.
 local omaskins_t = nil
@@ -2194,8 +2257,15 @@ if type(io) == "table" and type(io.open) == "function" and type(os) == "table" a
     f:close()
   end
 end
+local omaskins_a, omaskins_b, omaskins_blur = nil, nil, nil
 if type(omaskins_t) == "string" then
-  local a, b, blur = omaskins_t:match("^([%d.]+) ([%d.]+) (%a+)$")
+  omaskins_a, omaskins_b, omaskins_blur = omaskins_t:match("^([%d.]+) ([%d.]+) (%a+)$")
+end
+-- Every window at OmaSkins' own steps, Omarchy's choice at its default (see SOLID_WINDOWS in OmaSkins).
+""" + EVERY_WINDOW_LUA + """
+every_window(omaskins_a ~= nil)
+do
+  local a, b, blur = omaskins_a, omaskins_b, omaskins_blur
   if a then
     -- Nautilus does its own (sidebar a little more solid, its icons solid): see NAUTILUS_CSS in OmaSkins.
     o.window({ class = "^org.gnome.Nautilus$" }, { tag = "-default-opacity", opacity = "1 1" })
@@ -2210,6 +2280,9 @@ if type(omaskins_t) == "string" then
       end
     end
     o.window({ tag = "default-opacity" }, { opacity = a .. " " .. b })
+    if blur ~= "blur" then
+      """ + BLUR_OFF + """   -- step 1: every window solid, so no blur either (Omarchy's included)
+    end
     if blur == "blur" then
       """ + TRANSPARENCY_BLUR + """
       """ + SHELL_BLUR_RULE + """
